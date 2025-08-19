@@ -4,356 +4,535 @@ from pathlib import Path
 import random
 import numpy as np
 import torch
-from torch.utils.data import Dataset
-from scipy.signal import butter, filtfilt, resample
+from torch.utils.data import Dataset, DataLoader
+from scipy.signal import butter, filtfilt, resample, sosfiltfilt
+from scipy import signal as scipy_signal
 from typing import Optional, Tuple, List, Dict
 import pandas as pd
 from collections import defaultdict
+import wfdb
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
-class FolderPerParticipant(Dataset):
+class MIMICWaveformDataset(Dataset):
     """
-    Dataset adapter for BUT PPG database structure.
+    Dataset for MIMIC-IV waveforms implementing participant-level positive pairs
+    as described in the Apple paper: "Large-scale Training of Foundation Models for Wearable Biosignals"
 
-    BUT PPG structure:
-    - Folders named: 100001, 100002, etc.
-    - First 3 digits = participant ID (100, 101, 102...)
-    - Last 3 digits = recording number (001, 002, 003...)
+    Key features aligned with paper:
+    1. Participant-level positive pairs (different segments from same participant)
+    2. PPG: 60 seconds @ 64Hz (3840 samples)
+    3. ECG: 30 seconds @ 128Hz (3840 samples)
+    4. Z-score normalization per segment
+    5. Train/val/test split at participant level (80/10/10)
 
-    Each folder contains:
-    - {ID}_PPG.npy: PPG signal
-    - {ID}_ECG.npy: ECG signal
+    MIMIC-IV Structure:
+    data/mimic4wdb/physionet.org/files/mimic4wdb/0.1.0/waves/
+    └── p100/p10039708/85940419/
+        ├── 85940419.hea (multi-segment header)
+        ├── 85940419_0000.hea (layout header)
+        ├── 85940419_0001.hea (segment headers)
+        ├── 85940419_0001e.dat (signal data)
+        └── 85940419n.csv.gz (numerics)
     """
 
     def __init__(
             self,
-            root: str,
-            segment_len: Optional[int] = None,
+            index_csv: str,  # Path to waveform_index.csv from download script
+            data_root: str,  # Path to waves directory
             modality: str = 'ppg',  # 'ppg' or 'ecg'
-            dataset_type: str = 'but_ppg',  # 'but_ppg' or 'paper'
+            labels_csv: Optional[str] = None,  # Path to labels.csv for downstream
             *,
-            preprocess: bool = True,
-            native_fs: Optional[int] = None,
+            # Paper-specific parameters
+            segment_len_seconds: Optional[float] = None,
             target_fs: Optional[int] = None,
+
+            # Preprocessing
+            preprocess: bool = True,
             band_lo: Optional[float] = None,
             band_hi: Optional[float] = None,
-            min_recordings_per_participant: int = 2,  # BUT PPG has fewer recordings per participant
+
+            # Dataset construction
+            min_segments_per_participant: int = 4,  # Paper requirement
+            max_segments_per_participant: int = 100,  # For memory efficiency
             return_participant_id: bool = False,
-            quality_csv: Optional[str] = None,  # Path to quality-hr-ann.csv
-            use_only_good_quality: bool = True
+
+            # Split
+            split: str = 'train',  # 'train', 'val', 'test'
+            train_ratio: float = 0.8,
+            val_ratio: float = 0.1,
+            random_seed: int = 42
     ):
-        self.root = Path(root)
+        self.data_root = Path(data_root)
         self.modality = modality.lower()
-        self.dataset_type = dataset_type.lower()
         self.preprocess = preprocess
-        self.min_recordings_per_participant = min_recordings_per_participant
+        self.min_segments_per_participant = min_segments_per_participant
+        self.max_segments_per_participant = max_segments_per_participant
         self.return_participant_id = return_participant_id
-        self.use_only_good_quality = use_only_good_quality
+        self.split = split
+        self.random_seed = random_seed
 
-        # Set dataset-specific parameters
-        if dataset_type == 'but_ppg':
-            if modality == 'ppg':
-                # BUT PPG: 30Hz, 10 seconds
-                self.native_fs = native_fs or 30
-                self.target_fs = target_fs or 30  # Keep original
-                self.segment_len = segment_len or 300  # 10s * 30Hz
-                self.band_lo = band_lo or 0.5
-                self.band_hi = band_hi or 5.0
-            else:  # ECG
-                # BUT ECG: 1000Hz, 10 seconds
-                self.native_fs = native_fs or 1000
-                self.target_fs = target_fs or 128  # Downsample for efficiency
-                self.segment_len = segment_len or 1280  # 10s * 128Hz after resampling
-                self.band_lo = band_lo or 0.5
-                self.band_hi = band_hi or 40.0
-        else:  # paper settings
-            if modality == 'ppg':
-                self.native_fs = native_fs or 256
-                self.target_fs = target_fs or 64
-                self.segment_len = segment_len or 3840
-                self.band_lo = band_lo or 0.4
-                self.band_hi = band_hi or 8.0
-            else:  # ECG
-                self.native_fs = native_fs or 512
-                self.target_fs = target_fs or 128
-                self.segment_len = segment_len or 3840
-                self.band_lo = band_lo or 0.5
-                self.band_hi = band_hi or 40.0
+        # Set parameters according to paper (Table 1 in paper)
+        if modality == 'ppg':
+            # Paper: 60 seconds @ 64Hz for PPG, 4 channels
+            self.segment_len_seconds = segment_len_seconds or 60.0
+            self.target_fs = target_fs or 64
+            self.segment_len = int(self.segment_len_seconds * self.target_fs)  # 3840
+            self.band_lo = band_lo or 0.4
+            self.band_hi = band_hi or 8.0
+            # MIMIC PPG signal names
+            self.signal_names = ['PLETH', 'PPG']
+            self.n_channels = 1  # MIMIC has 1, paper has 4
+        else:  # ECG
+            # Paper: 30 seconds @ 128Hz for ECG, 1 channel
+            self.segment_len_seconds = segment_len_seconds or 30.0
+            self.target_fs = target_fs or 128
+            self.segment_len = int(self.segment_len_seconds * self.target_fs)  # 3840
+            self.band_lo = band_lo or 0.5
+            self.band_hi = band_hi or 40.0
+            # MIMIC ECG signal names
+            self.signal_names = ['II', 'V', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'ECG', 'I', 'III']
+            self.n_channels = 1  # Paper uses single lead
 
-        # Load quality annotations if provided
-        self.quality_labels = {}
-        if quality_csv and Path(quality_csv).exists():
-            self._load_quality_labels(quality_csv)
+        # Load index
+        self.index_df = pd.read_csv(index_csv)
 
-        # Initialize filter
-        self._init_filter()
+        # Filter for modality
+        if modality == 'ppg':
+            self.index_df = self.index_df[self.index_df['has_ppg'] == True]
+        else:
+            self.index_df = self.index_df[self.index_df['has_ecg'] == True]
 
-        # Build participant-recording mapping
+        # Remove records with missing paths
+        self.index_df = self.index_df.dropna(subset=['record_dir'])
+
+        # Load labels if provided (for downstream tasks)
+        self.labels_df = None
+        if labels_csv and Path(labels_csv).exists():
+            self.labels_df = pd.read_csv(labels_csv)
+            print(f"Loaded labels for downstream tasks: {list(self.labels_df.columns)[:5]}...")
+
+        # Build participant index
         self._build_participant_index()
 
-        # Create segment pairs
+        # Split dataset
+        self._create_splits(train_ratio, val_ratio)
+
+        # Build segment pairs for current split
         self._build_segment_pairs()
 
-    def _load_quality_labels(self, csv_path: str):
-        """Load quality labels from CSV file."""
-        df = pd.read_csv(csv_path, header=None, names=['recording_id', 'quality', 'hr'])
-        for _, row in df.iterrows():
-            # Ensure recording_id is string and padded
-            rec_id = str(int(row['recording_id'])).zfill(6)
-            self.quality_labels[rec_id] = {
-                'quality': int(row['quality']),
-                'hr': float(row['hr'])
-            }
-        print(f"Loaded quality labels for {len(self.quality_labels)} recordings")
-
-    def _init_filter(self):
-        """Initialize bandpass filter coefficients."""
-        if self.preprocess and self.band_lo and self.band_hi:
-            nyq = self.native_fs / 2
-
-            # Adjust frequencies if they exceed Nyquist
-            if self.band_lo >= nyq or self.band_hi >= nyq:
-                print(f"Adjusting filter frequencies for Nyquist limit ({nyq}Hz)")
-                self.band_hi = min(self.band_hi, nyq * 0.9)
-                self.band_lo = min(self.band_lo, self.band_hi * 0.01)
-
-            self.filter_b, self.filter_a = butter(
-                N=4,
-                Wn=[self.band_lo / nyq, self.band_hi / nyq],
-                btype='band'
-            )
-            self.use_bandpass = True
-        else:
-            self.use_bandpass = False
+        print(f"\n{modality.upper()} Dataset initialized for {split}:")
+        print(f"  Participants: {len(self.split_participants)}")
+        print(f"  Total segments: {len(self.split_segments)}")
+        print(f"  Positive pairs: {len(self.segment_pairs)}")
+        print(f"  Segment: {self.segment_len_seconds}s @ {self.target_fs}Hz = {self.segment_len} samples")
+        print(f"  Bandpass filter: {self.band_lo}-{self.band_hi} Hz")
 
     def _build_participant_index(self):
-        """
-        Parse BUT PPG structure to map participants to their recordings.
-        """
-        self.participant_recordings = defaultdict(list)
-        self.all_recordings = []
-        self.participants = []
+        """Build mapping of participants to their recordings."""
+        self.participant_segments = defaultdict(list)
+        self.all_segments = []
 
-        # Scan all directories
-        for folder in sorted(self.root.iterdir()):
-            if not folder.is_dir():
-                continue
+        for _, row in self.index_df.iterrows():
+            subject_id = row['subject_id']
+            record_id = row['record_id']
+            record_dir = row['record_dir']
 
-            recording_id = folder.name
+            # Check duration if available
+            duration = row.get('duration_sec', None)
+            if duration and duration < self.segment_len_seconds:
+                continue  # Skip short recordings
 
-            # Extract participant ID (first 3 digits)
-            try:
-                participant_id = recording_id[:3]
-            except:
-                continue
+            segment_info = {
+                'subject_id': int(subject_id),
+                'record_id': str(record_id),
+                'record_dir': str(record_dir),
+                'duration': duration
+            }
 
-            # Check if required files exist
-            if self.modality == 'ppg':
-                signal_file = folder / f"{recording_id}_PPG.npy"
-            else:  # ECG
-                signal_file = folder / f"{recording_id}_ECG.npy"
+            self.participant_segments[int(subject_id)].append(segment_info)
+            self.all_segments.append(segment_info)
 
-            if not signal_file.exists():
-                continue
+        # Filter participants with minimum segments
+        self.valid_participants = []
+        for subject_id, segments in self.participant_segments.items():
+            if len(segments) >= self.min_segments_per_participant:
+                # Limit segments per participant
+                if len(segments) > self.max_segments_per_participant:
+                    self.participant_segments[subject_id] = random.sample(
+                        segments, self.max_segments_per_participant
+                    )
+                self.valid_participants.append(subject_id)
 
-            # Filter by quality if labels are available
-            if self.use_only_good_quality and self.quality_labels:
-                if recording_id not in self.quality_labels:
-                    continue
-                if self.quality_labels[recording_id]['quality'] == 0:
-                    continue  # Skip poor quality
+        print(f"\nData Statistics:")
+        print(f"  Total participants: {len(self.participant_segments)}")
+        print(f"  Participants with >={self.min_segments_per_participant} segments: {len(self.valid_participants)}")
+        print(f"  Total segments: {len(self.all_segments)}")
 
-            self.participant_recordings[participant_id].append(recording_id)
-            self.all_recordings.append(recording_id)
+    def _create_splits(self, train_ratio: float, val_ratio: float):
+        """Create train/val/test splits at participant level (as per paper Section 4.1)."""
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
 
-        # Filter participants with minimum recordings
-        for pid, recordings in self.participant_recordings.items():
-            if len(recordings) >= self.min_recordings_per_participant:
-                self.participants.append(pid)
+        # Shuffle participants
+        participants = self.valid_participants.copy()
+        random.shuffle(participants)
 
-        print(f"BUT PPG Dataset Summary:")
-        print(f"  Total recordings: {len(self.all_recordings)}")
-        print(f"  Total participants: {len(self.participant_recordings)}")
-        print(f"  Participants with >= {self.min_recordings_per_participant} recordings: {len(self.participants)}")
+        n_total = len(participants)
+        n_train = int(n_total * train_ratio)
+        n_val = int(n_total * val_ratio)
 
-        # Show distribution
-        recordings_counts = [len(recs) for recs in self.participant_recordings.values()]
-        if recordings_counts:
-            print(f"  Recordings per participant: min={min(recordings_counts)}, "
-                  f"max={max(recordings_counts)}, avg={np.mean(recordings_counts):.1f}")
+        # Split participants (not segments!) as per paper
+        train_participants = participants[:n_train]
+        val_participants = participants[n_train:n_train + n_val]
+        test_participants = participants[n_train + n_val:]
+
+        # Assign current split
+        if self.split == 'train':
+            self.split_participants = train_participants
+        elif self.split == 'val':
+            self.split_participants = val_participants
+        else:  # test
+            self.split_participants = test_participants
+
+        # Get segments for current split
+        self.split_segments = []
+        for subject_id in self.split_participants:
+            self.split_segments.extend(self.participant_segments[subject_id])
 
     def _build_segment_pairs(self):
-        """Create all possible pairs from same participant."""
+        """Create positive pairs from same participant (Section 3.1 of paper)."""
         self.segment_pairs = []
 
-        for pid in self.participants:
-            recordings = self.participant_recordings[pid]
-            n_recordings = len(recordings)
+        for subject_id in self.split_participants:
+            segments = self.participant_segments[subject_id]
+            n_segments = len(segments)
 
-            # Create all possible pairs
-            for i in range(n_recordings):
-                for j in range(i + 1, n_recordings):
-                    self.segment_pairs.append((pid, recordings[i], recordings[j]))
+            # Create all possible pairs within participant
+            # This is the key difference from segment-level pairing
+            for i in range(n_segments):
+                for j in range(i + 1, n_segments):
+                    self.segment_pairs.append((segments[i], segments[j], subject_id))
 
-        print(f"  Created {len(self.segment_pairs)} positive pairs")
-
-        # If too few pairs, allow same recording with different augmentations
-        if len(self.segment_pairs) < 100:
-            print(f"  WARNING: Only {len(self.segment_pairs)} pairs available!")
-            print(f"  Consider using segment-level augmentation or reducing min_recordings_per_participant")
+            # If only one segment, pair with itself (will be augmented differently)
+            if n_segments == 1:
+                self.segment_pairs.append((segments[0], segments[0], subject_id))
 
     def __len__(self):
-        # If no valid pairs, return number of recordings for fallback mode
-        if len(self.segment_pairs) == 0:
-            return len(self.all_recordings)
         return len(self.segment_pairs)
 
     def __getitem__(self, idx):
-        """Get a positive pair or single recording with augmentation."""
+        """Get a positive pair from the same participant."""
+        seg1_info, seg2_info, subject_id = self.segment_pairs[idx]
 
-        # If we have valid pairs
-        if len(self.segment_pairs) > 0:
-            pid, rec1_id, rec2_id = self.segment_pairs[idx % len(self.segment_pairs)]
+        # Load segments
+        seg1 = self._load_and_process_segment(seg1_info)
+        seg2 = self._load_and_process_segment(seg2_info)
 
-            # Load both recordings
-            seg1 = self._load_recording(rec1_id)
-            seg2 = self._load_recording(rec2_id)
+        if self.return_participant_id:
+            # Also return labels if available
+            labels = {}
+            if self.labels_df is not None:
+                participant_labels = self.labels_df[
+                    self.labels_df['subject_id'] == subject_id
+                    ]
+                if not participant_labels.empty:
+                    labels = participant_labels.iloc[0].to_dict()
 
-            if self.return_participant_id:
-                return seg1, seg2, pid
-            return seg1, seg2
+            return seg1, seg2, subject_id, labels
 
-        # Fallback: return same recording twice (will be augmented differently)
-        else:
-            rec_id = self.all_recordings[idx % len(self.all_recordings)]
-            seg = self._load_recording(rec_id)
+        return seg1, seg2
 
-            if self.return_participant_id:
-                pid = rec_id[:3]
-                return seg, seg.clone(), pid
-            return seg, seg.clone()
+    def _load_and_process_segment(self, segment_info: dict) -> torch.Tensor:
+        """Load and process a segment from MIMIC-IV."""
+        record_dir = segment_info['record_dir']
+        record_id = segment_info['record_id']
 
-    def _load_recording(self, recording_id: str) -> torch.Tensor:
-        """Load and preprocess a single recording."""
-        folder = self.root / recording_id
+        # Full path to record
+        # Structure: data_root/p100/p10039708/85940419/85940419
+        record_path = self.data_root / record_dir / record_id
 
-        # Load appropriate signal
-        if self.modality == 'ppg':
-            signal_file = folder / f"{recording_id}_PPG.npy"
-        else:  # ECG
-            signal_file = folder / f"{recording_id}_ECG.npy"
+        try:
+            # Read WFDB record - handle multi-segment records
+            try:
+                # Try reading as regular record first
+                record = wfdb.rdrecord(str(record_path))
+            except:
+                # If fails, might be multi-segment, read just the header
+                header = wfdb.rdheader(str(record_path))
+                if hasattr(header, 'seg_name') and header.seg_name:
+                    # Read first segment
+                    seg_path = self.data_root / record_dir / header.seg_name[0]
+                    record = wfdb.rdrecord(str(seg_path))
+                else:
+                    raise
 
-        signal = np.load(signal_file).astype(np.float32)
+            # Find appropriate signal
+            signal_idx = None
+            signal_name_used = None
+            for sig_name in self.signal_names:
+                for idx, rec_sig_name in enumerate(record.sig_name):
+                    if sig_name.upper() in rec_sig_name.upper():
+                        signal_idx = idx
+                        signal_name_used = rec_sig_name
+                        break
+                if signal_idx is not None:
+                    break
 
-        # Ensure correct shape [C, L]
-        if signal.ndim == 1:
-            signal = signal[np.newaxis, :]
+            if signal_idx is None:
+                # Fallback: use first available signal
+                signal_idx = 0
+                signal_name_used = record.sig_name[0] if record.sig_name else "Unknown"
 
-        # Preprocess if needed
+            # Get signal
+            signal = record.p_signal[:, signal_idx:signal_idx + 1].T  # Shape: [1, N]
+            fs = record.fs
+
+            # Process signal
+            signal = self._preprocess_signal(signal, fs)
+
+            # Extract random window of required length
+            signal = self._extract_window(signal)
+
+            return torch.from_numpy(signal).float()
+
+        except Exception as e:
+            print(f"Error loading {record_path}: {e}")
+            # Return zeros as fallback
+            return torch.zeros((self.n_channels, self.segment_len), dtype=torch.float32)
+
+    def _preprocess_signal(self, signal: np.ndarray, original_fs: int) -> np.ndarray:
+        """Preprocess signal according to paper specifications (Section 4.1)."""
+
+        # Remove NaN/Inf
+        signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+
         if self.preprocess:
-            signal = self._apply_preprocessing(signal)
+            # 1. Bandpass filter (before resampling for better results)
+            if original_fs > 0:
+                nyq = original_fs / 2
+                if self.band_hi < nyq:
+                    # Use SOS format for numerical stability
+                    sos = scipy_signal.butter(
+                        4, [self.band_lo, self.band_hi],
+                        btype='band', fs=original_fs, output='sos'
+                    )
+                    signal = scipy_signal.sosfiltfilt(sos, signal, axis=1)
 
-        # Adjust length
-        signal = self._crop_or_pad(signal, self.segment_len)
+            # 2. Resample to target frequency
+            if original_fs != self.target_fs and original_fs > 0:
+                n_samples = signal.shape[1]
+                n_resampled = int(n_samples * self.target_fs / original_fs)
 
-        return torch.from_numpy(signal).float()
+                # Ensure we have enough samples
+                if n_resampled > 10:  # Arbitrary minimum
+                    signal_resampled = np.zeros((signal.shape[0], n_resampled))
+                    for i in range(signal.shape[0]):
+                        signal_resampled[i] = resample(signal[i], n_resampled)
+                    signal = signal_resampled
 
-    def _apply_preprocessing(self, signal: np.ndarray) -> np.ndarray:
-        """Apply preprocessing pipeline."""
-        # Bandpass filter
-        if self.use_bandpass:
-            signal = filtfilt(self.filter_b, self.filter_a, signal, axis=-1)
+            # 3. Z-score normalization (as per paper)
+            # "temporal channel-wise z-scoring for each segment"
+            mean = np.mean(signal, axis=1, keepdims=True)
+            std = np.std(signal, axis=1, keepdims=True) + 1e-8
+            signal = (signal - mean) / std
 
-        # Resample if needed
-        if self.target_fs != self.native_fs:
-            C, L = signal.shape
-            new_length = int(L * self.target_fs / self.native_fs)
+        return signal.astype(np.float32)
 
-            resampled = np.zeros((C, new_length), dtype=np.float32)
-            for c in range(C):
-                resampled[c] = resample(signal[c], new_length)
-            signal = resampled
+    def _extract_window(self, signal: np.ndarray) -> np.ndarray:
+        """Extract a window of the required length."""
+        _, n_samples = signal.shape
 
-        # Z-score normalization
-        eps = 1e-8
-        for c in range(signal.shape[0]):
-            mean = np.mean(signal[c])
-            std = np.std(signal[c]) + eps
-            signal[c] = (signal[c] - mean) / std
-
-        return signal
-
-    def _crop_or_pad(self, signal: np.ndarray, target_length: int) -> np.ndarray:
-        """Crop or pad to target length."""
-        C, L = signal.shape
-
-        if L > target_length:
-            # Center crop for consistency
-            start = (L - target_length) // 2
-            signal = signal[:, start:start + target_length]
-        elif L < target_length:
-            # Pad equally on both sides
-            pad_total = target_length - L
-            pad_left = pad_total // 2
-            pad_right = pad_total - pad_left
-            signal = np.pad(signal, ((0, 0), (pad_left, pad_right)), mode='constant')
+        if n_samples > self.segment_len:
+            # Random crop (helps with augmentation diversity)
+            start = random.randint(0, n_samples - self.segment_len)
+            signal = signal[:, start:start + self.segment_len]
+        elif n_samples < self.segment_len:
+            # Pad with zeros
+            pad_len = self.segment_len - n_samples
+            signal = np.pad(signal, ((0, 0), (0, pad_len)), mode='constant')
 
         return signal
 
     def get_statistics(self) -> dict:
         """Get dataset statistics."""
         return {
-            'total_participants': len(self.participant_recordings),
-            'valid_participants': len(self.participants),
-            'total_recordings': len(self.all_recordings),
-            'total_pairs': len(self.segment_pairs),
+            'split': self.split,
             'modality': self.modality,
+            'total_participants': len(self.split_participants),
+            'total_segments': len(self.split_segments),
+            'total_pairs': len(self.segment_pairs),
             'sampling_rate': self.target_fs,
-            'segment_length': self.segment_len
+            'segment_length_sec': self.segment_len_seconds,
+            'segment_length_samples': self.segment_len,
+            'n_channels': self.n_channels
         }
 
 
-# Utility function for BUT PPG
-def create_but_ppg_dataset(
-        root: str,
-        modality: str = 'ppg',
-        quality_csv: Optional[str] = None,
-        min_recordings: int = 2,
-        **kwargs
-) -> FolderPerParticipant:
+def create_dataloaders(
+        index_csv: str,
+        data_root: str,
+        labels_csv: Optional[str] = None,
+        batch_size: int = 256,  # Paper uses 256
+        num_workers: int = 4,
+        **dataset_kwargs
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Create dataset specifically for BUT PPG database.
+    Create train/val/test dataloaders for MIMIC-IV.
 
-    Args:
-        root: Path to PPG folder containing recording directories
-        modality: 'ppg' or 'ecg'
-        quality_csv: Path to quality-hr-ann.csv file
-        min_recordings: Minimum recordings per participant
+    Returns:
+        train_loader, val_loader, test_loader
     """
-    return FolderPerParticipant(
-        root=root,
-        modality=modality,
-        dataset_type='but_ppg',
-        min_recordings_per_participant=min_recordings,
-        quality_csv=quality_csv,
-        **kwargs
+
+    # Create datasets for each split
+    train_dataset = MIMICWaveformDataset(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
+        split='train',
+        **dataset_kwargs
     )
 
+    val_dataset = MIMICWaveformDataset(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
+        split='val',
+        **dataset_kwargs
+    )
 
-# Test function
-if __name__ == "__main__":
-    # Test with mock data structure
-    dataset = create_but_ppg_dataset(
-        root="data/PPG",  # Adjust to your path
+    test_dataset = MIMICWaveformDataset(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
+        split='test',
+        **dataset_kwargs
+    )
+
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True  # For stable batch norm
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+# ============= TEST FUNCTIONS =============
+
+def test_data_loading():
+    """Test data loading functionality."""
+    print("=" * 50)
+    print("Testing MIMIC-IV Data Loading")
+    print("=" * 50)
+
+    # Paths - adjust these to your setup
+    index_csv = "data/outputs/waveform_index.csv"
+    data_root = "data/mimic4wdb/physionet.org/files/mimic4wdb/0.1.0/waves"
+    labels_csv = "data/outputs/labels.csv"
+
+    # Test PPG dataset
+    print("\n1. Testing PPG Dataset:")
+    ppg_dataset = MIMICWaveformDataset(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
         modality='ppg',
-        quality_csv='quality-hr-ann.csv',  # Optional
-        min_recordings=2
+        split='train',
+        min_segments_per_participant=2  # Lower for testing
     )
 
-    print(f"\nDataset created successfully!")
-    print(f"Statistics: {dataset.get_statistics()}")
+    if len(ppg_dataset) > 0:
+        seg1, seg2 = ppg_dataset[0]
+        print(f"   PPG pair shapes: {seg1.shape}, {seg2.shape}")
+        print(f"   Expected shape: (1, 3840)")
+        assert seg1.shape == (1, 3840), f"Wrong PPG shape: {seg1.shape}"
+        print("   ✓ PPG test passed!")
 
-    if len(dataset) > 0:
-        # Test loading a pair
-        seg1, seg2 = dataset[0]
-        print(f"\nSample pair shapes: {seg1.shape}, {seg2.shape}")
+    # Test ECG dataset
+    print("\n2. Testing ECG Dataset:")
+    ecg_dataset = MIMICWaveformDataset(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
+        modality='ecg',
+        split='train',
+        min_segments_per_participant=2
+    )
+
+    if len(ecg_dataset) > 0:
+        seg1, seg2 = ecg_dataset[0]
+        print(f"   ECG pair shapes: {seg1.shape}, {seg2.shape}")
+        print(f"   Expected shape: (1, 3840)")
+        assert seg1.shape == (1, 3840), f"Wrong ECG shape: {seg1.shape}"
+        print("   ✓ ECG test passed!")
+
+    # Test with participant ID return
+    print("\n3. Testing with participant ID and labels:")
+    dataset_with_ids = MIMICWaveformDataset(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
+        modality='ppg',
+        split='train',
+        return_participant_id=True,
+        min_segments_per_participant=2
+    )
+
+    if len(dataset_with_ids) > 0:
+        seg1, seg2, pid, labels = dataset_with_ids[0]
+        print(f"   Participant ID: {pid}")
+        print(f"   Labels keys: {list(labels.keys())[:5] if labels else 'No labels'}")
+        print("   ✓ ID/labels test passed!")
+
+    # Test dataloaders
+    print("\n4. Testing DataLoader creation:")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        index_csv=index_csv,
+        data_root=data_root,
+        labels_csv=labels_csv,
+        batch_size=8,  # Small for testing
+        num_workers=0,  # No multiprocessing for testing
+        modality='ppg',
+        min_segments_per_participant=2
+    )
+
+    # Test one batch
+    for batch in train_loader:
+        seg1_batch, seg2_batch = batch
+        print(f"   Batch shapes: {seg1_batch.shape}, {seg2_batch.shape}")
+        print(f"   Expected: (8, 1, 3840), (8, 1, 3840)")
+        assert seg1_batch.shape[0] == 8, "Wrong batch size"
+        print("   ✓ DataLoader test passed!")
+        break
+
+    print("\n" + "=" * 50)
+    print("All tests passed successfully!")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    # Run tests
+    test_data_loading()

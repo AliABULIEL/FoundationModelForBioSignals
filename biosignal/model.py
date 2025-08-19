@@ -1,7 +1,10 @@
+# biosignal/model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+import numpy as np
 
 
 class SqueezeExcitation1D(nn.Module):
@@ -113,11 +116,12 @@ class EfficientNet1D(nn.Module):
     """
     1D EfficientNet encoder following the paper's specifications.
     Paper mentions: 16 MBConv blocks with SE for PPG/ECG encoding.
+    Paper reports: 3.3M parameters for PPG, 2.5M for ECG
     """
 
     def __init__(
             self,
-            in_channels: int = 1,  # 1 for ECG, 4 for PPG
+            in_channels: int = None,  # Will be set based on modality
             embedding_dim: int = 256,  # Paper uses 256-D embeddings
             width_multiplier: float = 1.0,
             depth_multiplier: float = 1.0,
@@ -129,11 +133,12 @@ class EfficientNet1D(nn.Module):
 
         self.modality = modality.lower()
 
-        # Adjust channels based on modality
+        # Set channels based on modality - IMPORTANT CHANGE for MIMIC-IV
         if self.modality == 'ppg':
-            in_channels = 4  # PPG has 4 channels in the paper
+            # Paper has 4 channels, but MIMIC-IV PPG has only 1 channel
+            in_channels = in_channels or 1  # Changed from 4 to 1 for MIMIC
         else:
-            in_channels = 1  # ECG is single channel
+            in_channels = in_channels or 1  # ECG is single channel
 
         # Stem: Initial convolution
         stem_channels = self._make_divisible(32 * width_multiplier)
@@ -145,20 +150,22 @@ class EfficientNet1D(nn.Module):
 
         # Build MBConv blocks following paper's 16-block architecture
         # Configuration: (num_blocks, out_channels, kernel_size, stride, expansion)
-        # Paper mentions 16 blocks total
+        # Adjusted to get closer to paper's parameter count
         block_configs = [
             # Stage 1
-            (2, 16, 3, 1, 1),  # No expansion for first stage
+            (1, 16, 3, 1, 1),  # No expansion for first stage
             # Stage 2
             (2, 24, 3, 2, 6),  # Downsample
             # Stage 3
-            (3, 40, 5, 2, 6),  # Downsample
+            (2, 40, 5, 2, 6),  # Downsample
             # Stage 4
             (3, 80, 3, 2, 6),  # Downsample
             # Stage 5
-            (4, 112, 5, 1, 6),
+            (3, 112, 5, 1, 6),
             # Stage 6
-            (2, 192, 5, 2, 6),  # Downsample
+            (3, 160, 5, 2, 6),  # Downsample
+            # Stage 7
+            (2, 192, 5, 1, 6),
         ]
 
         # Apply depth multiplier
@@ -214,7 +221,7 @@ class EfficientNet1D(nn.Module):
         self._initialize_weights()
 
         # Print model statistics to match paper
-        self._print_model_stats(total_blocks_built)
+        self._print_model_stats(total_blocks_built, in_channels)
 
     def _make_divisible(self, channels: float, divisor: int = 8) -> int:
         """Ensure channel count is divisible by divisor."""
@@ -241,16 +248,18 @@ class EfficientNet1D(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _print_model_stats(self, num_blocks: int):
+    def _print_model_stats(self, num_blocks: int, in_channels: int):
         """Print model statistics to verify it matches the paper."""
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"EfficientNet1D for {self.modality.upper()}:")
+        print(f"\nEfficientNet1D for {self.modality.upper()}:")
+        print(f"  Input channels: {in_channels}")
         print(f"  Total blocks: {num_blocks} (paper specifies 16)")
         print(f"  Total parameters: {total_params / 1e6:.2f}M")
         if self.modality == 'ppg':
-            print(f"  Expected: ~3.3M parameters")
+            print(f"  Paper reports: ~3.3M parameters (with 4 channels)")
+            print(f"  Note: Using 1 channel for MIMIC-IV PPG")
         else:
-            print(f"  Expected: ~2.5M parameters")
+            print(f"  Paper reports: ~2.5M parameters")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -258,9 +267,11 @@ class EfficientNet1D(nn.Module):
 
         Args:
             x: Input tensor [batch_size, channels, length]
+               PPG: [batch_size, 1, 3840]  # 60s @ 64Hz
+               ECG: [batch_size, 1, 3840]  # 30s @ 128Hz
 
         Returns:
-            Embedding tensor [batch_size, embedding_dim]
+            Embedding tensor [batch_size, 256]
         """
         # Stem
         x = self.stem(x)
@@ -294,7 +305,7 @@ class ProjectionHead(nn.Module):
             input_dim: int = 256,  # Embedding dimension
             hidden_dim: int = 1024,  # Paper specifies 1024
             output_dim: int = 128,  # Paper specifies 128
-            use_bn: bool = True
+            use_bn: bool = True  # Paper mentions batch norm is necessary for BYOL
     ):
         super().__init__()
 
@@ -331,6 +342,8 @@ class BiosignalFoundationModel(nn.Module):
     ):
         super().__init__()
 
+        self.modality = modality
+
         # Encoder (EfficientNet1D)
         self.encoder = EfficientNet1D(
             embedding_dim=embedding_dim,
@@ -345,10 +358,6 @@ class BiosignalFoundationModel(nn.Module):
             hidden_dim=1024,  # Paper specification
             output_dim=projection_dim
         )
-
-        # For momentum encoder (will be copied, not trained directly)
-        self.momentum_encoder = None
-        self.momentum_projection = None
 
     def forward(
             self,
@@ -379,12 +388,14 @@ class BiosignalFoundationModel(nn.Module):
 
     def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """Get embedding without projection (for downstream tasks)."""
-        return self.encoder(x)
+        with torch.no_grad():
+            return self.encoder(x)
 
 
 def create_model_pair(modality: str = 'ecg', **kwargs) -> Tuple[BiosignalFoundationModel, BiosignalFoundationModel]:
     """
     Create online and momentum model pair for training.
+    Following paper's momentum training approach.
 
     Returns:
         Tuple of (online_model, momentum_model)
@@ -398,14 +409,107 @@ def create_model_pair(modality: str = 'ecg', **kwargs) -> Tuple[BiosignalFoundat
     # Copy weights
     momentum_model.load_state_dict(online_model.state_dict())
 
-    # Freeze momentum model
+    # Freeze momentum model (will be updated via EMA)
     for param in momentum_model.parameters():
         param.requires_grad = False
 
     return online_model, momentum_model
 
 
-# Backward compatibility
 def create_encoder(modality: str = 'ecg', **kwargs) -> EfficientNet1D:
     """Create just the encoder for evaluation."""
     return EfficientNet1D(modality=modality, **kwargs)
+
+
+# ============= TEST FUNCTIONS =============
+
+def test_model_architecture():
+    """Test model architecture and verify shapes."""
+    print("=" * 50)
+    print("Testing Model Architecture")
+    print("=" * 50)
+
+    # Test PPG model
+    print("\n1. Testing PPG Model:")
+    ppg_model = BiosignalFoundationModel(modality='ppg')
+
+    # Create dummy PPG input: [batch_size=2, channels=1, length=3840]
+    ppg_input = torch.randn(2, 1, 3840)  # 60s @ 64Hz
+
+    # Test forward pass
+    ppg_embedding = ppg_model(ppg_input, return_embedding=True)
+    ppg_projection = ppg_model(ppg_input, return_embedding=False)
+
+    print(f"   Input shape: {ppg_input.shape}")
+    print(f"   Embedding shape: {ppg_embedding.shape} (expected: [2, 256])")
+    print(f"   Projection shape: {ppg_projection.shape} (expected: [2, 128])")
+
+    assert ppg_embedding.shape == (2, 256), f"Wrong embedding shape: {ppg_embedding.shape}"
+    assert ppg_projection.shape == (2, 128), f"Wrong projection shape: {ppg_projection.shape}"
+    print("   ✓ PPG model test passed!")
+
+    # Test ECG model
+    print("\n2. Testing ECG Model:")
+    ecg_model = BiosignalFoundationModel(modality='ecg')
+
+    # Create dummy ECG input: [batch_size=2, channels=1, length=3840]
+    ecg_input = torch.randn(2, 1, 3840)  # 30s @ 128Hz
+
+    # Test forward pass
+    ecg_embedding = ecg_model(ecg_input, return_embedding=True)
+    ecg_projection = ecg_model(ecg_input, return_embedding=False)
+
+    print(f"   Input shape: {ecg_input.shape}")
+    print(f"   Embedding shape: {ecg_embedding.shape} (expected: [2, 256])")
+    print(f"   Projection shape: {ecg_projection.shape} (expected: [2, 128])")
+
+    assert ecg_embedding.shape == (2, 256), f"Wrong embedding shape: {ecg_embedding.shape}"
+    assert ecg_projection.shape == (2, 128), f"Wrong projection shape: {ecg_projection.shape}"
+    print("   ✓ ECG model test passed!")
+
+    # Test model pair creation
+    print("\n3. Testing Model Pair Creation:")
+    online_model, momentum_model = create_model_pair(modality='ecg')
+
+    # Check that weights are initially the same
+    online_embedding = online_model(ecg_input, return_embedding=True)
+    momentum_embedding = momentum_model(ecg_input, return_embedding=True)
+
+    print(f"   Online embedding shape: {online_embedding.shape}")
+    print(f"   Momentum embedding shape: {momentum_embedding.shape}")
+    print(f"   Initial weight difference: {(online_embedding - momentum_embedding).abs().max().item():.6f}")
+
+    # Check that momentum model is frozen
+    momentum_trainable = sum(p.requires_grad for p in momentum_model.parameters())
+    print(f"   Momentum model trainable params: {momentum_trainable} (expected: 0)")
+
+    assert momentum_trainable == 0, "Momentum model should be frozen"
+    print("   ✓ Model pair test passed!")
+
+    # Test encoder only
+    print("\n4. Testing Encoder Only:")
+    encoder = create_encoder(modality='ecg')
+    encoder_output = encoder(ecg_input)
+
+    print(f"   Encoder output shape: {encoder_output.shape} (expected: [2, 256])")
+    assert encoder_output.shape == (2, 256), f"Wrong encoder output shape: {encoder_output.shape}"
+    print("   ✓ Encoder test passed!")
+
+    # Print parameter counts
+    print("\n5. Model Statistics:")
+    ppg_params = sum(p.numel() for p in ppg_model.parameters())
+    ecg_params = sum(p.numel() for p in ecg_model.parameters())
+
+    print(f"   PPG model parameters: {ppg_params / 1e6:.2f}M")
+    print(f"   ECG model parameters: {ecg_params / 1e6:.2f}M")
+    print(f"   Note: Paper reports 3.3M for PPG (4ch), 2.5M for ECG (1ch)")
+    print(f"   MIMIC-IV has 1ch for both PPG and ECG")
+
+    print("\n" + "=" * 50)
+    print("All tests passed successfully!")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    # Run tests
+    test_model_architecture()
