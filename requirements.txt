@@ -1,0 +1,72 @@
+# Biosignal Foundation Model Requirements
+# Python 3.8+ required
+
+# ============= Core Dependencies =============
+# Deep Learning
+torch>=2.0.0  # PyTorch - will auto-detect CUDA/MPS
+torchaudio>=2.0.0  # Audio processing utilities
+torchvision>=0.15.0  # Vision utilities (for potential future use)
+
+# Scientific Computing
+numpy>=1.21.0,<1.24.0  # Numerical computing (version cap for compatibility)
+scipy>=1.7.0  # Signal processing
+scikit-learn>=1.0.0  # Machine learning utilities
+pandas>=1.3.0  # Data manipulation
+
+# ============= Biosignal Processing =============
+wfdb>=4.0.0  # Reading WFDB format (MIT-BIH, PhysioNet)
+# neurokit2>=0.2.0  # Optional: Advanced biosignal processing
+
+# ============= Visualization =============
+matplotlib>=3.4.0  # Plotting
+seaborn>=0.11.0  # Statistical visualization
+plotly>=5.0.0  # Optional: Interactive plots
+
+# ============= Training Utilities =============
+tqdm>=4.62.0  # Progress bars
+tensorboard>=2.7.0  # Training visualization
+# wandb>=0.12.0  # Optional: Experiment tracking (uncomment if needed)
+
+# ============= Configuration =============
+pyyaml>=5.4.0  # YAML configuration files
+jsonschema>=3.2.0  # JSON validation
+
+# ============= Development Tools =============
+ipython>=7.30.0  # Interactive Python
+jupyter>=1.0.0  # Jupyter notebooks
+jupyterlab>=3.0.0  # JupyterLab environment
+ipywidgets>=7.6.0  # Jupyter widgets
+
+# ============= Testing & Quality =============
+pytest>=6.2.0  # Testing framework
+pytest-cov>=2.12.0  # Coverage reporting
+black>=22.0.0  # Code formatting
+flake8>=4.0.0  # Linting
+mypy>=0.900  # Type checking
+
+# ============= Performance Optimization =============
+numba>=0.55.0  # JIT compilation for numerical code
+# cupy>=10.0.0  # GPU arrays (uncomment for CUDA systems)
+
+# ============= Data Management =============
+h5py>=3.0.0  # HDF5 file support
+# pyarrow>=6.0.0  # Optional: Parquet file support
+# fastparquet>=0.8.0  # Optional: Alternative parquet support
+
+# ============= Utilities =============
+python-dotenv>=0.19.0  # Environment variables
+click>=8.0.0  # Command line interface
+rich>=10.0.0  # Rich terminal output
+tabulate>=0.8.9  # Table formatting
+
+# ============= Apple Silicon (M1/M2) Specific =============
+# These are automatically handled by pip on Apple Silicon
+# tensorflow-macos>=2.9.0  # If you need TensorFlow
+# tensorflow-metal>=0.5.0  # GPU acceleration for TensorFlow on M1/M2
+
+# ============= Optional Advanced Features =============
+# Uncomment if needed:
+# ray>=2.0.0  # Distributed computing
+# optuna>=3.0.0  # Hyperparameter optimization
+# mlflow>=1.20.0  # ML lifecycle management
+# dvc>=2.10.0  # Data version control

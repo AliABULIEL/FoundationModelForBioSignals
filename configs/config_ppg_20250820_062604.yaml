@@ -1,0 +1,119 @@
+dataset:
+  acc:
+    band_high: 20.0
+    band_low: 0.1
+    channels: 3
+    original_fs: 100
+    segment_length: 60
+    target_fs: 100
+  data_dir: data/but_ppg/dataset
+  ecg:
+    band_high: 40.0
+    band_low: 0.5
+    original_fs: 1000
+    segment_length: 30
+    target_fs: 128
+  name: BUT_PPG
+  ppg:
+    band_high: 8.0
+    band_low: 0.4
+    original_fs: 30
+    segment_length: 60
+    target_fs: 64
+  quality_file: quality-hr-ann.csv
+  subject_file: subject-info.csv
+device:
+  backend: mps
+  mixed_precision: false
+evaluation:
+  cv_folds: 5
+  metrics:
+    classification:
+    - auc
+    - pauc_0.1
+    - accuracy
+    - f1
+    regression:
+    - mae
+    - rmse
+    - r2
+  ridge_alpha: 1.0
+  tasks:
+  - age_classification
+  - age_regression
+  - sex_classification
+  - bmi_classification
+  - bmi_regression
+  - bp_classification
+  - spo2_prediction
+  - hr_estimation
+  - activity_classification
+  - step_counting
+  - fall_detection
+model:
+  depth_multiplier: 1.0
+  drop_path_rate: 0.2
+  dropout_rate: 0.2
+  embedding_dim: 256
+  n_blocks: 16
+  name: EfficientNet1D
+  projection_dim: 128
+  width_multiplier: 1.0
+paper_benchmarks:
+  acc:
+    activity_classification_auc: 0.9
+    fall_detection_auc: 0.95
+    step_counting_mae: 5.0
+  ecg:
+    age_classification_auc: 0.916
+    age_regression_mae: 6.33
+    bmi_classification_auc: 0.797
+    bmi_regression_mae: 3.72
+    sex_classification_auc: 0.951
+  ppg:
+    age_classification_auc: 0.976
+    age_regression_mae: 3.19
+    bmi_classification_auc: 0.918
+    bmi_regression_mae: 2.54
+    sex_classification_auc: 0.993
+seed: 42
+ssl:
+  augmentations_acc:
+    channel_permute: 0.25
+    cutout: 0.3
+    gaussian_noise: 0.2
+    magnitude_warp: 0.2
+    time_warp: 0.1
+  augmentations_ecg:
+    channel_permute: 0.0
+    cutout: 0.8
+    gaussian_noise: 0.5
+    magnitude_warp: 0.5
+    time_warp: 0.3
+  augmentations_ppg:
+    channel_permute: 0.0
+    cutout: 0.4
+    gaussian_noise: 0.25
+    magnitude_warp: 0.25
+    time_warp: 0.15
+  lambda_koleo: 0.1
+  momentum_rate: 0.99
+  temperature: 0.04
+training:
+  batch_size: 64
+  checkpoint_dir: data/outputs/checkpoints
+  gradient_accumulation_steps: 1
+  learning_rate: 0.001
+  log_freq: 10
+  lr_gamma: 0.1
+  lr_step_size: 30
+  num_epochs: 20
+  num_workers: 4
+  optimizer: adam
+  pin_memory: false
+  save_freq: 30
+  scheduler: step
+  use_amp: false
+  use_wandb: false
+  wandb_project: biosignal-foundation
+  weight_decay: 0.0001

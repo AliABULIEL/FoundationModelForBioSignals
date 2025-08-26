@@ -1,0 +1,39 @@
+dataset:
+  data_dir: data/dummy_test
+  ppg:
+    band_high: 8.0
+    band_low: 0.4
+    original_fs: 30
+    segment_length: 60
+    target_fs: 64
+device:
+  backend: mps
+model:
+  depth_multiplier: 0.5
+  drop_path_rate: 0.1
+  dropout_rate: 0.1
+  embedding_dim: 256
+  n_blocks: 4
+  width_multiplier: 0.5
+seed: 42
+ssl:
+  augmentations_ppg:
+    channel_permute: 0.0
+    cutout: 0.4
+    gaussian_noise: 0.25
+    magnitude_warp: 0.25
+    time_warp: 0.15
+  lambda_koleo: 0.1
+  momentum_rate: 0.99
+  temperature: 0.04
+training:
+  batch_size: 4
+  checkpoint_dir: data/outputs/test
+  gradient_accumulation_steps: 1
+  learning_rate: 0.001
+  num_epochs: 2
+  num_workers: 0
+  optimizer: adam
+  save_freq: 1
+  use_amp: false
+  weight_decay: 0.0001

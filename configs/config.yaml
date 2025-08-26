@@ -4,7 +4,7 @@
 # Dataset settings
 dataset:
   name: "BUT_PPG"
-  data_dir: "../data/but_ppg/dataset"
+  data_dir: "data/but_ppg/dataset"
   quality_file: "quality-hr-ann.csv"
   subject_file: "subject-info.csv"
 
@@ -25,10 +25,11 @@ dataset:
 
   acc:
     original_fs: 100     # Hz (BUT PPG)
-    target_fs: 100       # Hz (keep original)
+    target_fs: 100       # Hz (keep original for ACC)
     segment_length: 60   # seconds
-    band_low: 0.1        # Hz
-    band_high: 20.0      # Hz
+    band_low: 0.1        # Hz (capture low-frequency motion)
+    band_high: 20.0      # Hz (human motion typically < 20Hz)
+    channels: 3          # 3-axis accelerometer (x, y, z)
 
 # Model architecture (Apple paper specifications)
 model:
@@ -54,27 +55,27 @@ ssl:
     magnitude_warp: 0.25
     gaussian_noise: 0.25
     time_warp: 0.15
-    channel_permute: 0.0  # Single channel for BUT PPG
+    channel_permute: 0.0  # Single channel for PPG
 
   augmentations_ecg:
     cutout: 0.8
     magnitude_warp: 0.5
     gaussian_noise: 0.5
     time_warp: 0.3
-    channel_permute: 0.0
+    channel_permute: 0.0  # Single channel for ECG
 
   augmentations_acc:
     cutout: 0.3
     magnitude_warp: 0.2
     gaussian_noise: 0.2
     time_warp: 0.1
-    channel_permute: 0.25  # 3-axis ACC
+    channel_permute: 0.25  # Important for 3-axis ACC (rotation invariance)
 
 # Training parameters
 training:
   # Batch and epochs
   batch_size: 64         # Smaller for M1 (paper uses 256)
-  num_epochs: 100        # Paper uses 300, we'll use less for testing
+  num_epochs: 30        # Paper uses 300, we'll use less for testing
 
   # Optimizer
   optimizer: "adam"
@@ -91,13 +92,17 @@ training:
   pin_memory: false      # Not needed for MPS
 
   # Checkpointing
-  save_freq: 10
+  save_freq: 30
   checkpoint_dir: "data/outputs/checkpoints"
 
   # Logging
   log_freq: 10
   use_wandb: false
   wandb_project: "biosignal-foundation"
+
+  # Mixed precision (for faster training)
+  use_amp: false         # Set to true if using CUDA
+  gradient_accumulation_steps: 1  # Increase for larger effective batch size
 
 # Evaluation parameters
 evaluation:
@@ -111,6 +116,9 @@ evaluation:
     - "bp_classification"      # Hypertensive vs normal
     - "spo2_prediction"
     - "hr_estimation"
+    - "activity_classification"  # For ACC: activity type classification
+    - "step_counting"            # For ACC: step count estimation
+    - "fall_detection"           # For ACC: fall detection
 
   # Linear probe
   ridge_alpha: 1.0
@@ -144,3 +152,10 @@ paper_benchmarks:
     bmi_classification_auc: 0.797
     age_regression_mae: 6.33
     bmi_regression_mae: 3.72
+
+  acc:
+    # ACC benchmarks would be different - these are placeholders
+    # Real benchmarks would come from your experiments
+    activity_classification_auc: 0.90  # Example
+    step_counting_mae: 5.0             # Example
+    fall_detection_auc: 0.95           # Example
