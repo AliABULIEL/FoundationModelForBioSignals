@@ -1,0 +1,146 @@
+# configs/config.yaml
+# Configuration for Biosignal Foundation Model Training
+
+# Dataset settings
+dataset:
+  name: "BUT_PPG"
+  data_dir: "../data/but_ppg/dataset"
+  quality_file: "quality-hr-ann.csv"
+  subject_file: "subject-info.csv"
+
+  # Signal parameters (following Apple paper)
+  ppg:
+    original_fs: 30      # Hz (BUT PPG)
+    target_fs: 64        # Hz (Apple paper)
+    segment_length: 60   # seconds
+    band_low: 0.4        # Hz
+    band_high: 8.0       # Hz
+
+  ecg:
+    original_fs: 1000    # Hz (BUT PPG)
+    target_fs: 128       # Hz (Apple paper)
+    segment_length: 30   # seconds
+    band_low: 0.5        # Hz
+    band_high: 40.0      # Hz
+
+  acc:
+    original_fs: 100     # Hz (BUT PPG)
+    target_fs: 100       # Hz (keep original)
+    segment_length: 60   # seconds
+    band_low: 0.1        # Hz
+    band_high: 20.0      # Hz
+
+# Model architecture (Apple paper specifications)
+model:
+  name: "EfficientNet1D"
+  embedding_dim: 256
+  projection_dim: 128
+  n_blocks: 16           # Paper specifies 16 MBConv blocks
+  width_multiplier: 1.0
+  depth_multiplier: 1.0
+  dropout_rate: 0.2
+  drop_path_rate: 0.2
+
+# SSL training parameters (Apple paper)
+ssl:
+  # Loss function
+  temperature: 0.04      # InfoNCE temperature
+  lambda_koleo: 0.1      # KoLeo regularization weight
+  momentum_rate: 0.99    # Momentum encoder update rate
+
+  # Augmentations (paper Table 1)
+  augmentations_ppg:
+    cutout: 0.4
+    magnitude_warp: 0.25
+    gaussian_noise: 0.25
+    time_warp: 0.15
+    channel_permute: 0.0  # Single channel for BUT PPG
+
+  augmentations_ecg:
+    cutout: 0.8
+    magnitude_warp: 0.5
+    gaussian_noise: 0.5
+    time_warp: 0.3
+    channel_permute: 0.0
+
+  augmentations_acc:
+    cutout: 0.3
+    magnitude_warp: 0.2
+    gaussian_noise: 0.2
+    time_warp: 0.1
+    channel_permute: 0.25  # 3-axis ACC
+
+# Training parameters
+training:
+  # Batch and epochs
+  batch_size: 64         # Smaller for M1 (paper uses 256)
+  num_epochs: 100        # Paper uses 300, we'll use less for testing
+
+  # Optimizer
+  optimizer: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Learning rate schedule
+  scheduler: "step"
+  lr_step_size: 30
+  lr_gamma: 0.1
+
+  # Data loading
+  num_workers: 4         # For M1 chip
+  pin_memory: false      # Not needed for MPS
+
+  # Checkpointing
+  save_freq: 10
+  checkpoint_dir: "data/outputs/checkpoints"
+
+  # Logging
+  log_freq: 10
+  use_wandb: false
+  wandb_project: "biosignal-foundation"
+
+# Evaluation parameters
+evaluation:
+  # Downstream tasks
+  tasks:
+    - "age_classification"    # >50 vs ≤50
+    - "age_regression"
+    - "sex_classification"    # M vs F
+    - "bmi_classification"     # >30 vs ≤30
+    - "bmi_regression"
+    - "bp_classification"      # Hypertensive vs normal
+    - "spo2_prediction"
+    - "hr_estimation"
+
+  # Linear probe
+  ridge_alpha: 1.0
+  cv_folds: 5
+
+  # Metrics
+  metrics:
+    classification: ["auc", "pauc_0.1", "accuracy", "f1"]
+    regression: ["mae", "rmse", "r2"]
+
+# Device settings
+device:
+  backend: "mps"         # For M1 chip (mps, cuda, or cpu)
+  mixed_precision: false # MPS doesn't fully support amp yet
+
+# Reproducibility
+seed: 42
+
+# Paper benchmark results (for comparison)
+paper_benchmarks:
+  ppg:
+    age_classification_auc: 0.976
+    sex_classification_auc: 0.993
+    bmi_classification_auc: 0.918
+    age_regression_mae: 3.19
+    bmi_regression_mae: 2.54
+
+  ecg:
+    age_classification_auc: 0.916
+    sex_classification_auc: 0.951
+    bmi_classification_auc: 0.797
+    age_regression_mae: 6.33
+    bmi_regression_mae: 3.72
