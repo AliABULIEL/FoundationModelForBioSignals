@@ -45,8 +45,8 @@ model:
 # SSL training parameters (Apple paper)
 ssl:
   # Loss function
-  temperature: 0.04      # InfoNCE temperature
-  lambda_koleo: 0.1      # KoLeo regularization weight
+  temperature: 0.1      # InfoNCE temperature
+  lambda_koleo: 0.01      # KoLeo regularization weight
   momentum_rate: 0.99    # Momentum encoder update rate
 
   # Augmentations (paper Table 1)
@@ -79,7 +79,7 @@ training:
 
   # Optimizer
   optimizer: "adam"
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.0001
 
   # Learning rate schedule

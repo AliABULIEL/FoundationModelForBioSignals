@@ -308,8 +308,8 @@ def main():
                         help='Path for downsampled dataset')
 
     # Downsampling parameters
-    parser.add_argument('--segment_duration', type=float, default=15.0,
-                        help='Segment duration in seconds (default: 15s, original: 60s)')
+    parser.add_argument('--segment_duration', type=float, default=5.0,
+                        help='Segment duration in seconds (default: 5s, original: 60s)')
     parser.add_argument('--target_fs', type=int, default=32,
                         help='Target sampling frequency in Hz (default: 32Hz, original: 64Hz for PPG)')
     parser.add_argument('--max_participants', type=int, default=30,

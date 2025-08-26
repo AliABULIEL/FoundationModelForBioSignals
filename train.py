@@ -206,7 +206,7 @@ class Trainer:
         )
 
         # Learning rate scheduler with warmup
-        self.warmup_epochs = 5
+        self.warmup_epochs = 0
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
             T_max=training_config['num_epochs'] - self.warmup_epochs,
