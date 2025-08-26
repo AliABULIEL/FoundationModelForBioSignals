@@ -59,6 +59,8 @@ click>=8.0.0  # Command line interface
 rich>=10.0.0  # Rich terminal output
 tabulate>=0.8.9  # Table formatting
 
+wfdb
+
 # ============= Apple Silicon (M1/M2) Specific =============
 # These are automatically handled by pip on Apple Silicon
 # tensorflow-macos>=2.9.0  # If you need TensorFlow

@@ -93,7 +93,7 @@ class BUTPPGDataset(Dataset):
         self.band_high = self.signal_params['band_high']
 
         if self.downsample:
-            self.segment_length_sec = 10  # ← Changed to 10 seconds
+            self.segment_length_sec = self.config['downsample']["segment_length_sec"]  # ← Changed to 10 seconds
             original_length = self.signal_params['segment_length']
             print(f"  ⚡ Downsampling enabled: {original_length}s → {self.segment_length_sec}s segments")
         else:
