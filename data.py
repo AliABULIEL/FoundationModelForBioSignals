@@ -600,10 +600,11 @@ class BUTPPGDataset(Dataset):
         return max(1, len(self.segment_pairs))  # Return at least 1 to avoid errors
 
     def __getitem__(self, idx):
-        """Get a positive pair - NO RETRIES for speed.
-        FIXED VERSION: Returns proper labels even when signals fail to load.
         """
-        # Handle empty dataset
+        FIXED VERSION: Returns positive pairs from SAME participant as per paper.
+        Minimal changes to existing implementation.
+        """
+        # Handle empty dataset (keep your existing logic)
         if len(self.segment_pairs) == 0:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             if self.return_labels or self.return_participant_id:
@@ -615,27 +616,42 @@ class BUTPPGDataset(Dataset):
             else:
                 return zero_seg, zero_seg
 
-        # Use modulo to handle index overflow
+        # Use modulo to handle index overflow (keep existing)
         idx = idx % len(self.segment_pairs)
         pair_info = self.segment_pairs[idx]
 
-        # Get participant ID and info FIRST (before loading signals)
+        # Get participant ID and info (keep existing)
         participant_id = pair_info['participant_id']
         participant_info = self._get_participant_info(participant_id) if self.return_labels else None
 
-        # Use idx as seed for reproducibility
+        # Use idx as seed for reproducibility (keep existing)
         np.random.seed(idx + self.random_seed)
 
-        # Load both signals (no retries!)
-        signal1 = self._load_signal(pair_info['record1'])
-        signal2 = self._load_signal(pair_info['record2'])
+        # CRITICAL FIX: Ensure both segments come from same participant
+        # Instead of using record1 and record2 directly, ensure they're from same participant
 
-        # If either fails, return zeros BUT WITH PROPER LABELS
+        # Get all records for this participant
+        participant_records = self.participant_records[participant_id]
+
+        # If participant has multiple records, use different ones
+        if len(participant_records) >= 2:
+            # Select two different records from same participant
+            rec_indices = np.random.choice(len(participant_records), 2, replace=False)
+            record1 = participant_records[rec_indices[0]]
+            record2 = participant_records[rec_indices[1]]
+        else:
+            # Use same record but will create different segments
+            record1 = participant_records[0]
+            record2 = participant_records[0]
+
+        # Load both signals (rest stays the same)
+        signal1 = self._load_signal(record1)
+        signal2 = self._load_signal(record2)
+
+        # If either fails, return zeros with labels (keep existing)
         if signal1 is None or signal2 is None:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-
             if self.return_labels or self.return_participant_id:
-                # Use the actual participant info we got earlier!
                 if self.return_participant_id:
                     return zero_seg, zero_seg, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
                 else:
@@ -644,21 +660,19 @@ class BUTPPGDataset(Dataset):
                 return zero_seg, zero_seg
 
         # Create segments
-        if pair_info['record1'] == pair_info['record2']:
-            # Same record: create different segments
+        if record1 == record2:
+            # Same record: create different segments with different seeds
             seg1 = self._create_segments(signal1, seed=idx)
-            seg2 = self._create_segments(signal2, seed=idx + 1000000)
+            seg2 = self._create_segments(signal2, seed=idx + 1000000)  # Different seed
         else:
-            # Different records: random segments
+            # Different records from same participant: can use same seed
             seg1 = self._create_segments(signal1, seed=idx)
-            seg2 = self._create_segments(signal2, seed=idx)
+            seg2 = self._create_segments(signal2, seed=idx + 1)  # Slightly different
 
-        # If segment creation fails, return zeros BUT WITH PROPER LABELS
+        # Rest of the method stays exactly the same...
         if seg1 is None or seg2 is None:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-
             if self.return_labels or self.return_participant_id:
-                # Use the actual participant info!
                 if self.return_participant_id:
                     return zero_seg, zero_seg, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
                 else:
@@ -666,13 +680,12 @@ class BUTPPGDataset(Dataset):
             else:
                 return zero_seg, zero_seg
 
-        # Convert to tensors
+        # Convert to tensors (keep existing)
         seg1_tensor = torch.from_numpy(seg1).float()
         seg2_tensor = torch.from_numpy(seg2).float()
 
-        # Return based on configuration - THIS PART WAS ALREADY CORRECT
+        # Return based on configuration (keep existing)
         if self.return_labels or self.return_participant_id:
-            # No need to call _get_participant_info again, we already have it
             if self.return_participant_id:
                 return seg1_tensor, seg2_tensor, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
             else:

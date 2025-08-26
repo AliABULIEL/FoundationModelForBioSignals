@@ -28,8 +28,8 @@ class RegularizedInfoNCE(nn.Module):
 
     def __init__(
             self,
-            temperature: float = 0.07,
-            lambda_koleo: float = 0.05,
+            temperature: float = 0.04,
+            lambda_koleo: float = 0.1,
             normalize: bool = True
     ):
         super().__init__()

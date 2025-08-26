@@ -48,8 +48,8 @@ model:
 # SSL training parameters (Apple paper)
 ssl:
   # Loss function
-  temperature: 0.1      # InfoNCE temperature
-  lambda_koleo: 0.01      # KoLeo regularization weight
+  temperature: 0.04     # InfoNCE temperature
+  lambda_koleo: 0.1      # KoLeo regularization weight
   momentum_rate: 0.99    # Momentum encoder update rate
 
   # Augmentations (paper Table 1)
