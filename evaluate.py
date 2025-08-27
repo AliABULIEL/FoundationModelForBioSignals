@@ -179,10 +179,10 @@ class DownstreamEvaluator:
                 'threshold': 50,
                 'label_key': 'age'
             },
-            # 'age_regression': {
-            #     'type': 'regression',
-            #     'label_key': 'age'
-            # },
+            'age_regression': {
+                'type': 'regression',
+                'label_key': 'age'
+            },
             'sex_classification': {
                 'type': 'classification',
                 'label_key': 'sex'
@@ -192,10 +192,10 @@ class DownstreamEvaluator:
                 'threshold': 30,
                 'label_key': 'bmi'
             },
-            # 'bmi_regression': {
-            #     'type': 'regression',
-            #     'label_key': 'bmi'
-            # },
+            'bmi_regression': {
+                'type': 'regression',
+                'label_key': 'bmi'
+            },
             'bp_classification': {
                 'type': 'classification',
                 'threshold': 140,
@@ -214,6 +214,7 @@ class DownstreamEvaluator:
         if self.device_manager.is_cuda:
             mem_stats = self.device_manager.memory_stats()
             print(f"  GPU memory available: {mem_stats.get('free', 0):.2f} GB")
+
 
     def _load_encoder(self):
         """Load pre-trained encoder - UNCHANGED."""
@@ -847,6 +848,147 @@ class DownstreamEvaluator:
 
         return normalized_pauc
 
+    def leave_one_participant_out_evaluation(
+            self,
+            dataset: BUTPPGDataset,
+            task_name: str
+    ) -> Dict:
+        """Fast leave-one-participant-out evaluation."""
+
+        if task_name not in self.tasks:
+            raise ValueError(f"Unknown task: {task_name}")
+
+        task_info = self.tasks[task_name]
+        label_key = task_info['label_key']
+
+        # Get all participants
+        all_participants = list(dataset.participant_records.keys())
+        n_participants = len(all_participants)
+
+        print(f"\nLeave-One-Out Evaluation: {task_name}")
+        print(f"Total participants: {n_participants}")
+
+        # Pre-extract ALL embeddings once (OPTIMIZATION)
+        print("Pre-extracting all embeddings...")
+        all_embeddings_dict = {}
+        all_labels_dict = {}
+
+        for pid in tqdm(all_participants, desc="Extracting embeddings"):
+            records = dataset.participant_records[pid]
+            pid_embeddings = []
+
+            for record in records[:5]:  # Limit records per participant
+                signal = dataset._load_signal(record)
+                if signal is not None:
+                    segment = dataset._create_segments(signal)
+                    if segment is not None:
+                        with torch.no_grad():
+                            seg_tensor = torch.from_numpy(segment).float().unsqueeze(0).to(self.device)
+                            embedding = self.encoder(seg_tensor).cpu().numpy()[0]
+                            pid_embeddings.append(embedding)
+
+            if pid_embeddings:
+                # Average embeddings for participant
+                all_embeddings_dict[pid] = np.mean(pid_embeddings, axis=0)
+
+                # Get label
+                info = dataset._get_participant_info(pid)
+                if label_key in info and info[label_key] != -1:
+                    value = info[label_key]
+                    if task_info['type'] == 'classification' and 'threshold' in task_info:
+                        label = 1 if value > task_info['threshold'] else 0
+                    else:
+                        label = value
+                    all_labels_dict[pid] = label
+
+        # Filter participants with valid labels
+        valid_participants = [pid for pid in all_participants if pid in all_labels_dict]
+        print(f"Valid participants with labels: {len(valid_participants)}")
+
+        if len(valid_participants) < 3:
+            print("Too few participants for evaluation")
+            return {}
+
+        # Run leave-one-out
+        results = []
+
+        for test_pid in valid_participants:
+            # Train set = all except test participant
+            train_pids = [pid for pid in valid_participants if pid != test_pid]
+
+            X_train = np.array([all_embeddings_dict[pid] for pid in train_pids])
+            y_train = np.array([all_labels_dict[pid] for pid in train_pids])
+
+            X_test = all_embeddings_dict[test_pid].reshape(1, -1)
+            y_test = np.array([all_labels_dict[test_pid]])
+
+            # Train model
+            if task_info['type'] == 'classification':
+                from sklearn.linear_model import LogisticRegression
+                model = LogisticRegression(max_iter=1000, class_weight='balanced')
+
+                # Check if we have both classes in train
+                if len(np.unique(y_train)) < 2:
+                    continue
+
+                model.fit(X_train, y_train)
+                y_pred_proba = model.predict_proba(X_test)[:, 1]
+                results.append({
+                    'y_true': y_test[0],
+                    'y_pred_proba': y_pred_proba[0],
+                    'y_pred': int(y_pred_proba[0] > 0.5)
+                })
+            else:
+                from sklearn.linear_model import Ridge
+                model = Ridge(alpha=1.0)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+                results.append({
+                    'y_true': y_test[0],
+                    'y_pred': y_pred[0]
+                })
+
+        # Calculate metrics
+        if not results:
+            return {}
+
+        if task_info['type'] == 'classification':
+            y_true = [r['y_true'] for r in results]
+            y_pred_proba = [r['y_pred_proba'] for r in results]
+            y_pred = [r['y_pred'] for r in results]
+
+            from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+
+            try:
+                auc = roc_auc_score(y_true, y_pred_proba)
+            except:
+                auc = 0.0
+
+            acc = accuracy_score(y_true, y_pred)
+            f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
+
+            return {
+                'auc': auc,
+                'accuracy': acc,
+                'f1': f1,
+                'cv_type': 'leave-one-participant-out',
+                'n_samples': len(results)
+            }
+        else:
+            y_true = np.array([r['y_true'] for r in results])
+            y_pred = np.array([r['y_pred'] for r in results])
+
+            from sklearn.metrics import mean_absolute_error, r2_score
+
+            mae = mean_absolute_error(y_true, y_pred)
+            r2 = r2_score(y_true, y_pred)
+
+            return {
+                'mae': mae,
+                'r2': r2,
+                'cv_type': 'leave-one-participant-out',
+                'n_samples': len(results)
+            }
     def evaluate_all_tasks(
             self,
             dataset: BUTPPGDataset,
