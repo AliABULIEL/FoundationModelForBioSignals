@@ -242,9 +242,10 @@ def main():
             data_dir = organize_data(extract_dir)
         else:
             success = extract_database(zip_path, extract_dir)
+            data_dir = organize_data(extract_dir)
             if not success:
                 return False
-            data_dir = organize_data(extract_dir)
+
 
         # Step 3: Verify
         print(f"\n✅ Step 3: Verifying dataset...")
