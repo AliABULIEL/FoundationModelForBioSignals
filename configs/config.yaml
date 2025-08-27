@@ -37,9 +37,9 @@ dataset:
 # Model architecture (Apple paper specifications)
 model:
   name: "EfficientNet1D"
-  embedding_dim: 256
+  embedding_dim: 128
   projection_dim: 128
-  n_blocks: 16           # Paper specifies 16 MBConv blocks
+  n_blocks: 8           # Paper specifies 16 MBConv blocks
   width_multiplier: 1.0
   depth_multiplier: 1.0
   dropout_rate: 0.2
