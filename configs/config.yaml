@@ -52,7 +52,7 @@ simsiam:
 
   # Training parameters optimized for small datasets
   batch_size: 32         # Can work with smaller batches than InfoNCE
-  learning_rate: 0.0001 # Higher than InfoNCE since no momentum
+  learning_rate: 0.00005 # Higher than InfoNCE since no momentum
   weight_decay: 0.0001   # Less regularization than InfoNCE
 
   # No temperature or momentum needed for SimSiam
@@ -60,16 +60,16 @@ simsiam:
 
   # Augmentations can be stronger since no negatives
   augmentations_ppg:
-    cutout: 0.6         # Stronger than InfoNCE
-    magnitude_warp: 0.4
-    gaussian_noise: 0.4
-    time_warp: 0.3
+    cutout: 0.8         # Stronger than InfoNCE
+    magnitude_warp: 0.6
+    gaussian_noise: 0.6
+    time_warp: 0.5
     channel_permute: 0.0
 
   augmentations_ecg:
     cutout: 0.95        # Even stronger augmentation
-    magnitude_warp: 0.7
-    gaussian_noise: 0.7
+    magnitude_warp: 0.8
+    gaussian_noise: 0.8
     time_warp: 0.5
     channel_permute: 0.0
 
@@ -84,13 +84,13 @@ simsiam:
 # SSL training parameters (Apple paper)
 ssl:
   # Loss function
-  temperature: 0.04    # InfoNCE temperature
-  lambda_koleo: 0.1      # KoLeo regularization weight
+  temperature: 0.07    # InfoNCE temperature
+  lambda_koleo: 0.01      # KoLeo regularization weight
   momentum_rate: 0.99    # Momentum encoder update rate
 
   # Augmentations (paper Table 1)
   augmentations_ppg:
-    cutout: 0.8
+    cutout: 0.7
     magnitude_warp: 0.5
     gaussian_noise: 0.5
     time_warp: 0.3
@@ -118,8 +118,8 @@ training:
 
   # Optimizer
   optimizer: "adam"
-  learning_rate: 0.00001
-  weight_decay: 0.001
+  learning_rate: 0.0001
+  weight_decay: 0.00001
 
   # Learning rate schedule
   scheduler: "step"
@@ -127,7 +127,7 @@ training:
   lr_gamma: 0.1
 
   # Data loading
-  num_workers: 4         # For M1 chip
+  num_workers: 8         # For M1 chip
   pin_memory: false      # Not needed for MPS
 
   # Checkpointing

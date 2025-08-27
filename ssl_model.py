@@ -58,15 +58,22 @@ class RegularizedInfoNCE(nn.Module):
         koleo_2 = self.koleo_loss(z2)
         loss_koleo = (koleo_1 + koleo_2) / 2
 
-        total_loss = loss_contrastive + self.lambda_koleo * loss_koleo
+        var_loss = 0
+        z_concat = torch.cat([z1, z2], dim=0)
+        std = torch.sqrt(z_concat.var(dim=0) + 1e-04)
+        var_loss = torch.mean(F.relu(1 - std))  # Penalize low variance
+
+        total_loss = loss_contrastive + self.lambda_koleo * loss_koleo + 0.1 * var_loss
 
         metrics = {
             'loss': total_loss.item(),
             'loss_contrastive': loss_contrastive.item(),
             'loss_koleo': loss_koleo.item(),
             'loss_12': loss_12.item(),
-            'loss_21': loss_21.item()
+            'loss_21': loss_21.item(),
+            'loss_variance' : var_loss.item()
         }
+
 
         return total_loss, metrics
 

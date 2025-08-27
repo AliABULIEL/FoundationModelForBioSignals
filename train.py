@@ -721,7 +721,7 @@ def test_training():
             'optimizer': 'adam'
         },
         'model': {
-            'embedding_dim': 256,
+            'embedding_dim': 128,
             'n_blocks': 4,  # Smaller for testing
             'width_multiplier': 0.5,
             'depth_multiplier': 0.5,
@@ -729,27 +729,27 @@ def test_training():
             'drop_path_rate': 0.1
         },
         'ssl': {
-            'temperature': 0.04,
-            'lambda_koleo': 0.1,
+            'temperature': 0.07,
+            'lambda_koleo': 0.01,
             'momentum_rate': 0.99,
             'augmentations_ppg': {
-                'cutout': 0.4,
-                'magnitude_warp': 0.25,
-                'gaussian_noise': 0.25,
-                'time_warp': 0.15,
+                'cutout': 0.7,
+                'magnitude_warp': 0.5,
+                'gaussian_noise': 0.5,
+                'time_warp': 0.3,
                 'channel_permute': 0.0
             },
             'augmentations_ecg': {
-                'cutout': 0.8,
-                'magnitude_warp': 0.5,
-                'gaussian_noise': 0.5,
-                'time_warp': 0.3
+                'cutout': 0.9,
+                'magnitude_warp': 0.7,
+                'gaussian_noise': 0.7,
+                'time_warp': 0.6
             },
             'augmentations_acc': {
-                'cutout': 0.3,
-                'magnitude_warp': 0.2,
-                'gaussian_noise': 0.2,
-                'time_warp': 0.1,
+                'cutout': 0.6,
+                'magnitude_warp': 0.4,
+                'gaussian_noise': 0.4,
+                'time_warp': 0.2,
                 'channel_permute': 0.25
             }
         },
