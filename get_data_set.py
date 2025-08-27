@@ -235,16 +235,16 @@ def main():
         # Step 2: Extract
         print(f"\n📦 Step 2: Extracting database...")
         extract_dir = RAW_DIR / "extracted"
-
-        if extract_dir.exists() and any(extract_dir.iterdir()):
-            print("  ✓ Already extracted")
-            # Find the data directory
-            data_dir = organize_data(extract_dir)
-        else:
-            success = extract_database(zip_path, extract_dir)
-            data_dir = organize_data(extract_dir)
-            if not success:
-                return False
+        data_dir = organize_data(extract_dir)
+        # if extract_dir.exists() and any(extract_dir.iterdir()):
+        #     print("  ✓ Already extracted")
+        #     # Find the data directory
+        #     data_dir = organize_data(extract_dir)
+        # else:
+        #     success = extract_database(zip_path, extract_dir)
+        #     data_dir = organize_data(extract_dir)
+        #     if not success:
+        #         return False
 
 
         # Step 3: Verify
