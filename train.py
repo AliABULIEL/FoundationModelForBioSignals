@@ -159,23 +159,28 @@ class Trainer:
             config_path='configs/config.yaml',
             modality=modality
         )
-
+        self.model = create_ssl_model(
+                encoder=foundation_model.encoder,
+                projection_head=foundation_model.projection_head,
+                config_path='configs/config.yaml',
+                ssl_method=self.ssl_method
+            )
         # Create SSL model (it will use global device manager internally)
-        if self.ssl_method == 'simsiam':
-
-            self.model = create_simsiam_model(
-            encoder=foundation_model.encoder,
-            projection_head=foundation_model.projection_head,
-            config_path='configs/config.yaml'
-        )
-            print(f"  Using SimSiam SSL model")
-        else:
-
-            self.model = create_ssl_model(
-            encoder=foundation_model.encoder,
-            projection_head=foundation_model.projection_head,
-            config_path='configs/config.yaml'
-        )
+        # if self.ssl_method == 'simsiam':
+        #
+        #     self.model = create_simsiam_model(
+        #     encoder=foundation_model.encoder,
+        #     projection_head=foundation_model.projection_head,
+        #     config_path='configs/config.yaml'
+        # )
+        #     print(f"  Using SimSiam SSL model")
+        # else:
+        #
+        #     self.model = create_ssl_model(
+        #     encoder=foundation_model.encoder,
+        #     projection_head=foundation_model.projection_head,
+        #     config_path='configs/config.yaml'
+        # )
         #     print(f"  Using InfoNCE SSL model")
         # self.model = create_ssl_model(
         #     encoder=foundation_model.encoder,

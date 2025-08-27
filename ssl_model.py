@@ -114,7 +114,10 @@ class SSLModel(nn.Module):
             ssl_method: str = 'infonce'
     ):
         super().__init__()
+        # self.device_manager = get_device_manager()
+        # self.device = self.device_manager.device
         self.ssl_method = ssl_method
+        # self.to(self.device)
 
         if Path(config_path).exists():
             with open(config_path, 'r') as f:
@@ -123,12 +126,12 @@ class SSLModel(nn.Module):
             config = {}
 
         self.encoder = encoder
-
         # CRITICAL: Check actual input size
         with torch.no_grad():
             # Use actual segment size from your data
             dummy_size = 640 if config.get('downsample', {}).get('segment_length_sec') == 10 else 3840
-            dummy = torch.randn(1, 1, dummy_size)
+            device = next(encoder.parameters()).device
+            dummy = torch.randn(1, 1, dummy_size).to(device)
             embedding_dim = encoder(dummy).shape[1]
 
         if ssl_method == 'simsiam':
@@ -158,6 +161,7 @@ class SSLModel(nn.Module):
             self.momentum_encoder = None
             self.momentum_projection = None
             self.momentum_rate = 0.0
+
 
         else:  # infonce
             ssl_config = config.get('ssl', {})
