@@ -28,7 +28,7 @@ from data import create_dataloaders
 from model import BiosignalFoundationModel
 from augment import ContrastiveAugmentation
 from device import DeviceManager, get_device_manager
-from simsam_model import create_simsiam_model
+# from simsam_model import create_simsiam_model
 from ssl_model import create_ssl_model
 
 
