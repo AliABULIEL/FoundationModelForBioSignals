@@ -165,7 +165,7 @@ class Trainer:
 
             self.model = create_simsiam_model(
             encoder=foundation_model.encoder,
-            projection_head=foundation_model.encode,
+            projection_head=foundation_model.projection_head,
             config_path='configs/config.yaml'
         )
             print(f"  Using SimSiam SSL model")
@@ -173,7 +173,7 @@ class Trainer:
 
             self.model = create_ssl_model(
             encoder=foundation_model.encoder,
-            projection_head=foundation_model.encode,
+            projection_head=foundation_model.projection_head,
             config_path='configs/config.yaml'
         )
         #     print(f"  Using InfoNCE SSL model")
