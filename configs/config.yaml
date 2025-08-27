@@ -13,26 +13,26 @@ dataset:
 
   # Signal parameters (following Apple paper)
   ppg:
-    original_fs: 30      # Hz (BUT PPG)
-    target_fs: 64        # Hz (Apple paper)
-    segment_length: 60   # seconds
+    original_fs: 30      # Hz (actual from BUT PPG)
+    target_fs: 64        # Hz (can keep for consistency)
+    segment_length: 10   # seconds (actual data length)
     band_low: 0.4        # Hz
     band_high: 8.0       # Hz
 
   ecg:
-    original_fs: 1000    # Hz (BUT PPG)
-    target_fs: 128       # Hz (Apple paper)
-    segment_length: 30   # seconds
+    original_fs: 100     # Hz (actual from BUT PPG)
+    target_fs: 128       # Hz (can keep for consistency)
+    segment_length: 10   # seconds (actual data length)
     band_low: 0.5        # Hz
     band_high: 40.0      # Hz
 
   acc:
-    original_fs: 100     # Hz (BUT PPG)
-    target_fs: 100       # Hz (keep original for ACC)
-    segment_length: 60   # seconds
-    band_low: 0.1        # Hz (capture low-frequency motion)
-    band_high: 20.0      # Hz (human motion typically < 20Hz)
-    channels: 3          # 3-axis accelerometer (x, y, z)
+    original_fs: 100     # Hz (actual from BUT PPG)
+    target_fs: 100       # Hz (keep original)
+    segment_length: 10   # seconds (actual data length)
+    band_low: 0.1        # Hz
+    band_high: 20.0      # Hz
+    channels: 3
 
 # Model architecture (Apple paper specifications)
 model:

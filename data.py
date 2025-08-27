@@ -425,7 +425,7 @@ class BUTPPGDataset(Dataset):
             return None
 
     def _preprocess_signal(self, signal_data: np.ndarray) -> Optional[np.ndarray]:
-        """Preprocess signal according to paper specifications."""
+        """Preprocess signal - FIXED for BUT PPG's actual format."""
         try:
             # Remove NaN/Inf
             signal_data = np.nan_to_num(signal_data, nan=0.0, posinf=0.0, neginf=0.0)
@@ -434,37 +434,28 @@ class BUTPPGDataset(Dataset):
             if signal_data.ndim == 1:
                 signal_data = signal_data[np.newaxis, :]
 
-            # Check minimum length
-            if signal_data.shape[1] < 50:  # Too short to process
+            # Check minimum length (at least 1 second of data)
+            min_samples = self.original_fs  # At least 1 second
+            if signal_data.shape[1] < min_samples:
                 return None
 
-            # 1. Bandpass filter (with safety checks)
-            nyquist = self.original_fs / 2
-            if self.band_high < nyquist * 0.95:
-                try:
-                    filter_order = 4
-                    critical_freqs = [self.band_low, self.band_high]
-                    sos = scipy_signal.butter(
-                        filter_order, critical_freqs,
-                        btype='band', fs=self.original_fs, output='sos'
-                    )
-
-                    # Check if signal is long enough for filter
-                    min_padlen = 3 * max(len(s) for s in sos)
-
-                    if signal_data.shape[1] > min_padlen:
+            # 1. Bandpass filter (only if we have enough samples)
+            if signal_data.shape[1] >= 100:  # Need reasonable length for filtering
+                nyquist = self.original_fs / 2
+                if self.band_high < nyquist * 0.95:
+                    try:
+                        sos = scipy_signal.butter(
+                            4, [self.band_low, self.band_high],
+                            btype='band', fs=self.original_fs, output='sos'
+                        )
                         signal_data = scipy_signal.sosfiltfilt(sos, signal_data, axis=1)
-
-                except Exception:
-                    pass  # Skip filtering if it fails
+                    except:
+                        pass  # Skip filtering if it fails
 
             # 2. Resample to target frequency
             if self.original_fs != self.target_fs:
                 n_samples = signal_data.shape[1]
                 n_resampled = int(n_samples * self.target_fs / self.original_fs)
-
-                if n_resampled < 10:  # Too few samples
-                    return None
 
                 resampled = np.zeros((signal_data.shape[0], n_resampled))
                 for i in range(signal_data.shape[0]):
@@ -479,11 +470,12 @@ class BUTPPGDataset(Dataset):
 
             return signal_data.astype(np.float32)
 
-        except Exception:
+        except Exception as e:
+            print(f"Preprocessing error: {e}")
             return None
 
     def _create_segments(self, signal_data: np.ndarray, seed: Optional[int] = None) -> np.ndarray:
-        """Create segment of required length."""
+        """Create segment of required length - FIXED for BUT PPG."""
         if signal_data is None:
             return None
 
@@ -493,15 +485,27 @@ class BUTPPGDataset(Dataset):
 
         n_samples = signal_data.shape[1]
 
-        if n_samples < self.segment_length:
-            # Too short - try to extend by repeating
-            if n_samples < self.segment_length // 4:
-                return None  # Too short to extend
+        # For BUT PPG with 10-second data:
+        # After resampling PPG: 30Hz→64Hz gives 640 samples
+        # After resampling ECG: 100Hz→128Hz gives 1280 samples
 
-            # Repeat and concatenate
+        if n_samples < self.segment_length:
+            # If we need more samples, tile the signal
             n_repeats = (self.segment_length // n_samples) + 1
             extended = np.tile(signal_data, (1, n_repeats))
-            return extended[:, :self.segment_length]
+
+            # Take exactly segment_length samples
+            segment = extended[:, :self.segment_length]
+
+            # Add small random noise to break exact repetition
+            if n_repeats > 1:
+                noise = np.random.randn(*segment.shape) * 0.001
+                segment = segment + noise
+
+            return segment
+        elif n_samples == self.segment_length:
+            # Perfect match
+            return signal_data
         else:
             # Random crop if longer
             max_start = n_samples - self.segment_length
@@ -933,6 +937,242 @@ def test_participant_info_loading():
         print("✓ TEST PASSED: All participant info retrieved successfully!")
         return True
 
+
+def test_zero_signal_diagnostic():
+    """Diagnose why signals are returning zeros and fix the issue."""
+    print("\n" + "=" * 70)
+    print("ZERO SIGNAL DIAGNOSTIC TEST")
+    print("=" * 70)
+
+    from pathlib import Path
+    import wfdb
+
+    data_dir = Path("data/but_ppg/dataset")
+
+    # Step 1: Understand the actual file structure
+    print("\n1. Analyzing File Structure:")
+    print("-" * 40)
+
+    # Find actual WFDB files
+    hea_files = list(data_dir.glob("**/*.hea"))[:5]
+
+    if not hea_files:
+        print("❌ No .hea files found!")
+        return False
+
+    print(f"Found {len(list(data_dir.glob('**/*.hea')))} .hea files")
+    print("\nSample files:")
+    for hea_file in hea_files:
+        print(f"  {hea_file.relative_to(data_dir)}")
+
+    # Step 2: Test loading a real file
+    print("\n2. Testing Direct WFDB Loading:")
+    print("-" * 40)
+
+    test_file = hea_files[0]
+    print(f"Testing: {test_file.relative_to(data_dir)}")
+
+    # Try loading without extension
+    record_path = str(test_file).replace('.hea', '')
+
+    try:
+        record = wfdb.rdrecord(record_path)
+        print(f"✓ Successfully loaded!")
+        print(f"  Channels: {record.sig_name}")
+        print(f"  Shape: {record.p_signal.shape}")
+        print(f"  Sampling rate: {record.fs} Hz")
+        print(f"  Signal range: [{record.p_signal.min():.4f}, {record.p_signal.max():.4f}]")
+
+        # Check if it's zero
+        if np.all(record.p_signal == 0):
+            print("  ⚠️ WARNING: Signal is all zeros in the file itself!")
+        else:
+            print(f"  ✓ Signal has valid data (mean={record.p_signal.mean():.4f})")
+
+    except Exception as e:
+        print(f"❌ Failed to load: {e}")
+        return False
+
+    # Step 3: Test the dataset's loading logic
+    print("\n3. Testing Dataset's _load_signal Method:")
+    print("-" * 40)
+
+    dataset = BUTPPGDataset(
+        data_dir=str(data_dir),
+        modality='ppg',
+        split='train',
+        use_cache=False
+    )
+
+    if not dataset.participant_records:
+        print("❌ No participant records found!")
+        return False
+
+    # Get a record ID
+    first_participant = list(dataset.participant_records.keys())[0]
+    first_record_id = dataset.participant_records[first_participant][0]
+
+    print(f"Testing record ID: {first_record_id}")
+
+    # Check what the method expects vs what exists
+    expected_path = data_dir / first_record_id / f"{first_record_id}_PPG"
+    print(f"Expected path: {expected_path}")
+    print(f"Expected .hea file: {expected_path}.hea")
+    print(f"File exists: {expected_path.with_suffix('.hea').exists()}")
+
+    if not expected_path.with_suffix('.hea').exists():
+        # Find the actual structure
+        print("\n⚠️ File not at expected location!")
+        print("Checking alternative locations:")
+
+        # Check if files are directly in record directory
+        alt_path1 = data_dir / first_record_id / "PPG"
+        print(f"  {alt_path1}.hea exists: {alt_path1.with_suffix('.hea').exists()}")
+
+        # Check if there's a different naming pattern
+        record_dir = data_dir / first_record_id
+        if record_dir.exists():
+            ppg_files = list(record_dir.glob("*PPG*.hea"))
+            if ppg_files:
+                print(f"  Found PPG files: {[f.name for f in ppg_files]}")
+
+                # Try loading the first one
+                actual_ppg = str(ppg_files[0]).replace('.hea', '')
+                try:
+                    record = wfdb.rdrecord(actual_ppg)
+                    print(f"  ✓ Can load from: {ppg_files[0].name}")
+                    print(f"    Signal shape: {record.p_signal.shape}")
+                except Exception as e:
+                    print(f"  ❌ Failed to load: {e}")
+
+    # Step 4: Test with fixed loading
+    print("\n4. Testing Fixed Signal Loading:")
+    print("-" * 40)
+
+    def load_signal_fixed(record_id: str, data_dir: Path, modality: str = 'ppg'):
+        """Fixed signal loading that handles actual file structure."""
+        record_dir = data_dir / record_id
+
+        if not record_dir.exists():
+            print(f"  Directory doesn't exist: {record_dir}")
+            return None
+
+        # Try different naming patterns
+        patterns = [
+            f"{record_id}_{modality.upper()}",  # 100001_PPG
+            modality.upper(),  # PPG
+            f"{modality.lower()}",  # ppg
+            f"*{modality.upper()}*"  # anything with PPG
+        ]
+
+        for pattern in patterns:
+            if '*' in pattern:
+                # Glob pattern
+                files = list(record_dir.glob(f"{pattern}.hea"))
+                if files:
+                    record_path = str(files[0]).replace('.hea', '')
+            else:
+                record_path = record_dir / pattern
+                if not record_path.with_suffix('.hea').exists():
+                    continue
+                record_path = str(record_path)
+
+            try:
+                record = wfdb.rdrecord(record_path)
+                signal = record.p_signal
+
+                # Check if valid
+                if signal.shape[0] > 0 and not np.all(signal == 0):
+                    print(f"  ✓ Loaded with pattern '{pattern}'")
+                    print(f"    Shape: {signal.shape}, Mean: {signal.mean():.4f}")
+                    return signal
+
+            except:
+                continue
+
+        print(f"  ❌ Failed to load with any pattern")
+        return None
+
+    # Test the fixed loading
+    signal = load_signal_fixed(first_record_id, data_dir)
+
+    if signal is not None:
+        print("\n✅ SOLUTION FOUND!")
+        print("The issue is in the file naming pattern.")
+        print("Update _load_signal method to use the correct pattern.")
+    else:
+        print("\n❌ Could not determine correct loading pattern")
+
+    # Step 5: Verify the complete pipeline
+    print("\n5. Testing Complete Pipeline:")
+    print("-" * 40)
+
+    # Test getting a batch
+    seg1, seg2 = dataset[0]
+
+    print(f"Segment 1: shape={seg1.shape}, zeros={torch.all(seg1 == 0).item()}")
+    print(f"Segment 2: shape={seg2.shape}, zeros={torch.all(seg2 == 0).item()}")
+
+    if torch.all(seg1 == 0):
+        print("❌ Still getting zeros - loading fix needed!")
+        return False
+    else:
+        print("✓ Pipeline working correctly!")
+        return True
+
+    return True
+
+
+def test_no_zeros_guarantee():
+    """Test to ensure no zero signals are produced."""
+    print("\n" + "=" * 70)
+    print("TESTING: NO ZEROS GUARANTEE")
+    print("=" * 70)
+
+    dataset = BUTPPGDataset(
+        data_dir="data/but_ppg/dataset",
+        modality='ppg',
+        split='train',
+        use_cache=False
+    )
+
+    print(f"Testing {min(100, len(dataset))} samples...")
+
+    zero_count = 0
+    valid_count = 0
+
+    for i in range(min(100, len(dataset))):
+        seg1, seg2 = dataset[i]
+
+        if torch.all(seg1 == 0) or torch.all(seg2 == 0):
+            zero_count += 1
+            if zero_count <= 3:  # Show first 3 failures
+                print(f"  Sample {i}: ❌ Zero signal detected")
+        else:
+            valid_count += 1
+            if valid_count <= 3:  # Show first 3 successes
+                print(f"  Sample {i}: ✓ Valid (mean={seg1.mean():.4f})")
+
+    print(f"\nResults:")
+    print(f"  Valid signals: {valid_count}")
+    print(f"  Zero signals: {zero_count}")
+
+    if zero_count > 0:
+        print(f"\n❌ FAILED: {zero_count} zero signals found!")
+        print("\nThis means the model will receive zero inputs and won't learn.")
+        return False
+    else:
+        print("\n✅ PASSED: No zero signals!")
+        return True
+
+
 if __name__ == "__main__":
     test_data_loading()
     test_participant_info_loading()
+
+    print("\n" + "=" * 70)
+
+    # First diagnose the issue
+    if test_zero_signal_diagnostic():
+        # Then verify no zeros
+        test_no_zeros_guarantee()
