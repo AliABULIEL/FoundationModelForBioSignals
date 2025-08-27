@@ -86,8 +86,8 @@ class SimSiamLoss(nn.Module):
             z2 = F.normalize(z2, dim=1)
 
         # Original SimSiam (negative cosine similarity)
-        loss1 = -F.cosine_similarity(p1, z2.detach(), dim=1).mean()
-        loss2 = -F.cosine_similarity(p2, z1.detach(), dim=1).mean()
+        loss1 = (1 - F.cosine_similarity(p1, z2.detach(), dim=1)).mean()
+        loss2 = (1 - F.cosine_similarity(p2, z1.detach(), dim=1)).mean()
 
         # CRITICAL FIX: Make loss positive
         total_loss = torch.abs((loss1 + loss2) / 2)
