@@ -136,8 +136,8 @@ class SSLModel(nn.Module):
 
         if ssl_method == 'simsiam':
             simsiam_config = config.get('simsiam', {})
-            proj_dim = simsiam_config.get('projection_dim', 512)
-            pred_dim = simsiam_config.get('prediction_dim', 128)
+            proj_dim = simsiam_config.get('projection_dim', 2048)
+            pred_dim = simsiam_config.get('prediction_dim', 512)
 
             self.projection_head = nn.Sequential(
                 nn.Linear(embedding_dim, proj_dim, bias=False),
