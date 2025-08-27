@@ -218,10 +218,12 @@ class DownstreamEvaluator:
     def _load_encoder(self):
         """Load pre-trained encoder - UNCHANGED."""
         modality = 'ppg'
+        model_config = self.config.get('model', {})
+        embedding_dim = model_config.get('embedding_dim', 128)
 
         self.encoder = EfficientNet1D(
             in_channels=1 if modality != 'acc' else 3,
-            embedding_dim=256,
+            embedding_dim=embedding_dim,
             modality=modality
         )
 
@@ -242,6 +244,8 @@ class DownstreamEvaluator:
         self.encoder.eval()
 
         print(f"Encoder loaded from {self.encoder_path}")
+        print(f"  Embedding dim: {embedding_dim} (from config)")
+        print(f"  Modality: {modality}")
 
     @torch.no_grad()
     def extract_embeddings(
