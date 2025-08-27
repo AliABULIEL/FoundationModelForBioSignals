@@ -242,33 +242,183 @@ class BUTPPGDataset(Dataset):
             self.split_records.extend(self.participant_records[participant_id])
 
     def _build_segment_pairs(self):
-        """Build positive pairs from same participant."""
+        """Build positive pairs efficiently - avoiding combinatorial explosion."""
         self.segment_pairs = []
+        self.participant_pairs = defaultdict(list)  # Track which pairs belong to which participant
+
+        # Configuration for pair generation
+        max_pairs_per_participant = 100  # Limit to prevent explosion
+        min_recordings_for_pairs = 2  # Need at least 2 recordings to make pairs
+
+        total_possible_pairs = 0
+        total_created_pairs = 0
 
         for participant_id in self.split_participants:
             records = self.participant_records[participant_id]
+            n_records = len(records)
 
-            if len(records) >= 2:
-                # Multiple recordings: create pairs
-                for i in range(len(records)):
-                    for j in range(i + 1, len(records)):
+            if n_records < min_recordings_for_pairs:
+                # Skip participants with too few recordings
+                continue
+
+            # Calculate how many pairs we could theoretically create
+            n_possible_pairs = (n_records * (n_records - 1)) // 2
+            total_possible_pairs += n_possible_pairs
+
+            # Decide how many pairs to actually create
+            if n_possible_pairs <= max_pairs_per_participant:
+                # If under limit, create all possible pairs
+                for i in range(n_records):
+                    for j in range(i + 1, n_records):
+                        pair_idx = len(self.segment_pairs)
                         self.segment_pairs.append({
                             'participant_id': participant_id,
                             'record1': records[i],
                             'record2': records[j]
                         })
-            elif len(records) == 1:
-                # Single recording: will split into two segments
-                self.segment_pairs.append({
-                    'participant_id': participant_id,
-                    'record1': records[0],
-                    'record2': records[0]  # Same record, different segments
-                })
+                        self.participant_pairs[participant_id].append(pair_idx)
+                        total_created_pairs += 1
+            else:
+                # Sample a subset of pairs to avoid explosion
+                # Use a set to avoid duplicate pairs
+                created_pairs = set()
 
-        # Shuffle pairs
+                # Strategy: Create diverse pairs by ensuring each recording appears at least once
+                # First, create a chain of pairs ensuring all recordings are used
+                for i in range(n_records - 1):
+                    pair = (i, i + 1)
+                    created_pairs.add(pair)
+
+                # Add random pairs until we reach the limit
+                while len(created_pairs) < max_pairs_per_participant:
+                    idx1 = np.random.randint(0, n_records)
+                    idx2 = np.random.randint(0, n_records)
+
+                    if idx1 != idx2:
+                        # Ensure consistent ordering
+                        pair = (min(idx1, idx2), max(idx1, idx2))
+                        created_pairs.add(pair)
+
+                # Convert pairs to segment_pairs format
+                for idx1, idx2 in created_pairs:
+                    pair_idx = len(self.segment_pairs)
+                    self.segment_pairs.append({
+                        'participant_id': participant_id,
+                        'record1': records[idx1],
+                        'record2': records[idx2]
+                    })
+                    self.participant_pairs[participant_id].append(pair_idx)
+                    total_created_pairs += 1
+
+        # Shuffle pairs for random batching
         if self.segment_pairs:
             np.random.seed(self.random_seed)
             np.random.shuffle(self.segment_pairs)
+
+        # Print statistics
+        print(f"  Pair generation statistics:")
+        print(f"    Total possible pairs: {total_possible_pairs:,}")
+        print(f"    Created pairs: {total_created_pairs:,}")
+        print(f"    Reduction ratio: {total_created_pairs / max(1, total_possible_pairs):.2%}")
+        print(f"    Participants with pairs: {len(self.participant_pairs)}")
+
+    def __len__(self):
+        """Return dataset length."""
+        return len(self.segment_pairs) if self.segment_pairs else 1
+
+    def __getitem__(self, idx):
+        """Get a positive pair with better error handling."""
+        # Handle empty dataset
+        if len(self.segment_pairs) == 0:
+            # This should rarely happen with proper initialization
+            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
+            if self.return_labels or self.return_participant_id:
+                empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
+                if self.return_participant_id:
+                    return zero_seg, zero_seg, "unknown", empty_info
+                else:
+                    return zero_seg, zero_seg, empty_info
+            else:
+                return zero_seg, zero_seg
+
+        # Try up to 3 different pairs if loading fails
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            # Get a pair index
+            pair_idx = (idx + attempt) % len(self.segment_pairs)
+            pair_info = self.segment_pairs[pair_idx]
+
+            participant_id = pair_info['participant_id']
+            record1 = pair_info['record1']
+            record2 = pair_info['record2']
+
+            # Load both signals
+            signal1 = self._load_signal(record1)
+            signal2 = self._load_signal(record2)
+
+            # If both signals loaded successfully, process them
+            if signal1 is not None and signal2 is not None:
+                # Get participant info if needed
+                participant_info = self._get_participant_info(participant_id) if self.return_labels else None
+
+                # Since signals are already the right length after preprocessing
+                seg1 = signal1
+                seg2 = signal2
+
+                # Add tiny noise in training for diversity
+                if self.split == 'train':
+                    noise_scale = 0.001
+                    seg1 = seg1 + np.random.randn(*seg1.shape) * noise_scale
+                    seg2 = seg2 + np.random.randn(*seg2.shape) * noise_scale
+
+                # Convert to tensors
+                seg1_tensor = torch.from_numpy(seg1).float()
+                seg2_tensor = torch.from_numpy(seg2).float()
+
+                # Return successful pair
+                if self.return_labels or self.return_participant_id:
+                    if self.return_participant_id:
+                        return seg1_tensor, seg2_tensor, participant_id, participant_info or {'age': -1, 'sex': -1,
+                                                                                              'bmi': -1}
+                    else:
+                        return seg1_tensor, seg2_tensor, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
+                else:
+                    return seg1_tensor, seg2_tensor
+
+            # If loading failed, mark these records as failed
+            if signal1 is None:
+                self._failed_records.add(record1)
+            if signal2 is None:
+                self._failed_records.add(record2)
+
+        # All attempts failed - this should be very rare
+        print(f"Warning: Failed to load any valid pair after {max_attempts} attempts at idx {idx}")
+
+        # As last resort, return a valid but repeated signal from cache
+        if self.signal_cache:
+            # Get any valid signal from cache
+            cached_signal = next(iter(self.signal_cache.values()))
+            seg_tensor = torch.from_numpy(cached_signal).float()
+
+            if self.return_labels or self.return_participant_id:
+                empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
+                if self.return_participant_id:
+                    return seg_tensor, seg_tensor, participant_id, empty_info
+                else:
+                    return seg_tensor, seg_tensor, empty_info
+            else:
+                return seg_tensor, seg_tensor
+
+        # Absolute fallback - should never reach here
+        zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
+        if self.return_labels or self.return_participant_id:
+            empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
+            if self.return_participant_id:
+                return zero_seg, zero_seg, "unknown", empty_info
+            else:
+                return zero_seg, zero_seg, empty_info
+        else:
+            return zero_seg, zero_seg
 
     def _filter_valid_pairs(self):
         """Pre-filter pairs to remove records that don't exist."""
@@ -600,137 +750,7 @@ class BUTPPGDataset(Dataset):
 
         return {'age': -1, 'sex': -1, 'bmi': -1}
 
-    def __len__(self):
-        return max(1, len(self.segment_pairs))  # Return at least 1 to avoid errors
 
-    def __getitem__(self, idx):
-        """
-        Returns positive pairs from SAME participant with no overlap when downsampling.
-        """
-        # Handle empty dataset
-        if len(self.segment_pairs) == 0:
-            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels or self.return_participant_id:
-                empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
-                if self.return_participant_id:
-                    return zero_seg, zero_seg, "unknown", empty_info
-                else:
-                    return zero_seg, zero_seg, empty_info
-            else:
-                return zero_seg, zero_seg
-
-        # Use modulo to handle index overflow
-        idx = idx % len(self.segment_pairs)
-        pair_info = self.segment_pairs[idx]
-
-        # Get participant ID and info
-        participant_id = pair_info['participant_id']
-        participant_info = self._get_participant_info(participant_id) if self.return_labels else None
-
-        # Use idx as seed for reproducibility
-        np.random.seed(idx + self.random_seed)
-
-        # Get all records for this participant
-        participant_records = self.participant_records[participant_id]
-
-        # If participant has multiple records, use different ones
-        if len(participant_records) >= 2:
-            # Select two different records from same participant
-            rec_indices = np.random.choice(len(participant_records), 2, replace=False)
-            record1 = participant_records[rec_indices[0]]
-            record2 = participant_records[rec_indices[1]]
-        else:
-            # Use same record but will create different segments
-            record1 = participant_records[0]
-            record2 = participant_records[0]
-
-        # Load both signals
-        signal1 = self._load_signal(record1)
-        signal2 = self._load_signal(record2)
-
-        # If either fails, return zeros with labels
-        if signal1 is None or signal2 is None:
-            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels or self.return_participant_id:
-                if self.return_participant_id:
-                    return zero_seg, zero_seg, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-                else:
-                    return zero_seg, zero_seg, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-            else:
-                return zero_seg, zero_seg
-
-        # Create segments - FIXED to ensure no overlap
-        if record1 == record2:
-            # Same record: ensure non-overlapping segments
-            signal_length = signal1.shape[1]
-
-            if self.downsample:
-                # For downsampling: divide into non-overlapping chunks
-                n_possible_segments = signal_length // self.segment_length
-
-                if n_possible_segments >= 2:
-                    # Pick two different non-overlapping segment indices
-                    segment_indices = np.random.choice(n_possible_segments,
-                                                       min(2, n_possible_segments),
-                                                       replace=False)
-
-                    # Extract non-overlapping segments
-                    start1 = segment_indices[0] * self.segment_length
-                    seg1 = signal1[:, start1:start1 + self.segment_length]
-
-                    start2 = segment_indices[1] * self.segment_length
-                    seg2 = signal2[:, start2:start2 + self.segment_length]
-                else:
-                    # Signal too short for 2 non-overlapping segments
-                    # Use the whole segment twice (not ideal but safe)
-                    seg1 = signal1[:, :self.segment_length]
-                    seg2 = signal2[:, :self.segment_length]
-            else:
-                # Original behavior: random crops with different seeds
-                # Ensure minimum gap between segments
-                max_start = signal_length - self.segment_length
-
-                if max_start > self.segment_length:
-                    # Enough space for non-overlapping segments
-                    start1 = np.random.randint(0, max_start - self.segment_length + 1)
-                    seg1 = signal1[:, start1:start1 + self.segment_length]
-
-                    # Second segment starts after first one ends
-                    min_start2 = start1 + self.segment_length
-                    start2 = np.random.randint(min_start2, max_start + 1)
-                    seg2 = signal2[:, start2:start2 + self.segment_length]
-                else:
-                    # Not enough space, use different seeds and hope for the best
-                    seg1 = self._create_segments(signal1, seed=idx)
-                    seg2 = self._create_segments(signal2, seed=idx + 1000000)
-        else:
-            # Different records from same participant: can use random crops
-            seg1 = self._create_segments(signal1, seed=idx)
-            seg2 = self._create_segments(signal2, seed=idx + 1)
-
-        # Handle None returns from segment creation
-        if seg1 is None or seg2 is None:
-            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels or self.return_participant_id:
-                if self.return_participant_id:
-                    return zero_seg, zero_seg, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-                else:
-                    return zero_seg, zero_seg, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-            else:
-                return zero_seg, zero_seg
-
-        # Convert to tensors
-        seg1_tensor = torch.from_numpy(seg1).float()
-        seg2_tensor = torch.from_numpy(seg2).float()
-
-        # Return based on configuration
-        if self.return_labels or self.return_participant_id:
-            if self.return_participant_id:
-                return seg1_tensor, seg2_tensor, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-            else:
-                return seg1_tensor, seg2_tensor, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-        else:
-            return seg1_tensor, seg2_tensor
 
 
 def create_dataloaders(
