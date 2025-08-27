@@ -179,10 +179,10 @@ class DownstreamEvaluator:
                 'threshold': 50,
                 'label_key': 'age'
             },
-            'age_regression': {
-                'type': 'regression',
-                'label_key': 'age'
-            },
+            # 'age_regression': {
+            #     'type': 'regression',
+            #     'label_key': 'age'
+            # },
             'sex_classification': {
                 'type': 'classification',
                 'label_key': 'sex'
@@ -192,19 +192,19 @@ class DownstreamEvaluator:
                 'threshold': 30,
                 'label_key': 'bmi'
             },
-            'bmi_regression': {
-                'type': 'regression',
-                'label_key': 'bmi'
-            },
+            # 'bmi_regression': {
+            #     'type': 'regression',
+            #     'label_key': 'bmi'
+            # },
             'bp_classification': {
                 'type': 'classification',
                 'threshold': 140,
                 'label_key': 'bp_systolic'
             },
-            'spo2_regression': {
-                'type': 'regression',
-                'label_key': 'spo2'
-            }
+            # 'spo2_regression': {
+            #     'type': 'regression',
+            #     'label_key': 'spo2'
+            # }
         }
 
         # Results storage

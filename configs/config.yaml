@@ -3,7 +3,7 @@
 
 
 downsample:
-  segment_length_sec: 5
+  segment_length_sec: 10
 # Dataset settings
 dataset:
   name: "BUT_PPG"
@@ -54,24 +54,24 @@ ssl:
 
   # Augmentations (paper Table 1)
   augmentations_ppg:
-    cutout: 0.4
-    magnitude_warp: 0.25
-    gaussian_noise: 0.25
-    time_warp: 0.15
-    channel_permute: 0.0  # Single channel for PPG
-
-  augmentations_ecg:
     cutout: 0.8
     magnitude_warp: 0.5
     gaussian_noise: 0.5
     time_warp: 0.3
+    channel_permute: 0.0  # Single channel for PPG
+
+  augmentations_ecg:
+    cutout: 0.9
+    magnitude_warp: 0.8
+    gaussian_noise: 0.8
+    time_warp: 0.6
     channel_permute: 0.0  # Single channel for ECG
 
   augmentations_acc:
-    cutout: 0.3
-    magnitude_warp: 0.2
-    gaussian_noise: 0.2
-    time_warp: 0.1
+    cutout: 0.6
+    magnitude_warp: 0.4
+    gaussian_noise: 0.4
+    time_warp: 0.2
     channel_permute: 0.25  # Important for 3-axis ACC (rotation invariance)
 
 # Training parameters
@@ -82,8 +82,8 @@ training:
 
   # Optimizer
   optimizer: "adam"
-  learning_rate: 0.0001
-  weight_decay: 0.0001
+  learning_rate: 0.00001
+  weight_decay: 0.001
 
   # Learning rate schedule
   scheduler: "step"
