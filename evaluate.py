@@ -215,7 +215,6 @@ class DownstreamEvaluator:
             mem_stats = self.device_manager.memory_stats()
             print(f"  GPU memory available: {mem_stats.get('free', 0):.2f} GB")
 
-
     def _load_encoder(self):
         """Load pre-trained encoder - UNCHANGED."""
         modality = 'ppg'
@@ -260,7 +259,7 @@ class DownstreamEvaluator:
         # Check if we already have embeddings for this dataset
         dataset_id = id(dataset)
         if (self._current_dataset_id == dataset_id and
-            self._cached_embeddings is not None):
+                self._cached_embeddings is not None):
             print("  ✓ Reusing cached embeddings for current dataset")
             return self._cached_embeddings, self._cached_labels, self._cached_pids
 
@@ -456,8 +455,8 @@ class DownstreamEvaluator:
                 print(f"    [{i}]: {all_labels[i]}")
 
             valid_count = sum(1 for label in all_labels
-                            if isinstance(label, dict) and
-                            any(v != -1 for v in label.values()))
+                              if isinstance(label, dict) and
+                              any(v != -1 for v in label.values()))
             print(f"  - Labels with valid values: {valid_count}/{len(all_labels)}")
         else:
             print(f"\nDEBUG 6: WARNING - No labels collected!")
@@ -504,7 +503,7 @@ class DownstreamEvaluator:
 
         # OPTIMIZATION: Pre-allocate arrays
         aggregated_embeddings = np.zeros((len(unique_pids), embeddings.shape[1]),
-                                        dtype=np.float32)
+                                         dtype=np.float32)
         aggregated_labels = []
 
         print(f"  Aggregating {len(unique_pids)} unique participants")
@@ -756,6 +755,124 @@ class DownstreamEvaluator:
             'n_samples': total_samples
         }
 
+    def _evaluate_task_leave_one_out(self, task_name: str, dataset: BUTPPGDataset) -> Dict:
+        """
+        Internal method for leave-one-out evaluation of a specific task.
+        Uses cached embeddings for speed.
+        """
+        task_info = self.tasks[task_name]
+        label_key = task_info['label_key']
+
+        # Use cached embeddings from extract_embeddings
+        if self._cached_embeddings is None:
+            print("ERROR: No cached embeddings found")
+            return {}
+
+        # Prepare data
+        X = self._cached_embeddings
+        y_list = self._cached_labels
+        participant_ids = self._cached_pids
+
+        # Extract labels
+        y = []
+        valid_indices = []
+
+        for i, label_dict in enumerate(y_list):
+            if isinstance(label_dict, dict) and label_key in label_dict:
+                value = label_dict[label_key]
+                if value != -1:
+                    if task_info['type'] == 'classification' and 'threshold' in task_info:
+                        y_val = 1 if value > task_info['threshold'] else 0
+                    else:
+                        y_val = value
+                    y.append(y_val)
+                    valid_indices.append(i)
+
+        if len(y) < 3:
+            print(f"  Too few valid samples ({len(y)}) for leave-one-out")
+            return {}
+
+        X_valid = X[valid_indices]
+        y_valid = np.array(y)
+        pids_valid = participant_ids[valid_indices]
+
+        print(f"  Leave-one-out with {len(y_valid)} participants")
+
+        # Run leave-one-out cross-validation
+        predictions = []
+        actuals = []
+        scores = []
+
+        for i in range(len(X_valid)):
+            # Leave one out
+            train_mask = np.ones(len(X_valid), dtype=bool)
+            train_mask[i] = False
+
+            X_train = X_valid[train_mask]
+            y_train = y_valid[train_mask]
+            X_test = X_valid[i:i + 1]
+            y_test = y_valid[i:i + 1]
+
+            # For classification, check if we have both classes
+            if task_info['type'] == 'classification':
+                if len(np.unique(y_train)) < 2:
+                    continue
+
+            # Train probe
+            probe = LinearProbe(task_type=task_info['type'])
+            probe.fit(X_train, y_train)
+
+            if task_info['type'] == 'classification':
+                y_score = probe.predict(X_test)[0]
+                y_pred = (y_score > 0).astype(int)
+
+                scores.append(y_score)
+                predictions.append(y_pred)
+                actuals.append(y_test[0])
+            else:
+                y_pred = probe.predict(X_test)[0]
+                predictions.append(y_pred)
+                actuals.append(y_test[0])
+
+        # Calculate metrics
+        if len(actuals) == 0:
+            return {}
+
+        if task_info['type'] == 'classification':
+            from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+
+            try:
+                auc_score = roc_auc_score(actuals, scores) if len(np.unique(actuals)) > 1 else 0.0
+            except:
+                auc_score = 0.0
+
+            acc = accuracy_score(actuals, predictions)
+            f1 = f1_score(actuals, predictions, average='binary', zero_division=0)
+
+            return {
+                'auc': auc_score,
+                'auc_std': 0.0,
+                'accuracy': acc,
+                'accuracy_std': 0.0,
+                'f1': f1,
+                'f1_std': 0.0,
+                'cv_type': 'leave-one-out',
+                'n_samples': len(actuals)
+            }
+        else:
+            from sklearn.metrics import mean_absolute_error, r2_score
+
+            mae = mean_absolute_error(actuals, predictions)
+            r2 = r2_score(actuals, predictions) if len(actuals) > 1 else 0.0
+
+            return {
+                'mae': mae,
+                'mae_std': 0.0,
+                'r2': r2,
+                'r2_std': 0.0,
+                'cv_type': 'leave-one-out',
+                'n_samples': len(actuals)
+            }
     def _evaluate_regression(self, X, y, n_splits=5):
         """Original regression evaluation - UNCHANGED."""
         total_samples = len(y)
@@ -848,236 +965,148 @@ class DownstreamEvaluator:
 
         return normalized_pauc
 
-    def leave_one_participant_out_evaluation(
-            self,
-            dataset: BUTPPGDataset,
-            task_name: str
-    ) -> Dict:
-        """Fast leave-one-participant-out evaluation."""
-
-        if task_name not in self.tasks:
-            raise ValueError(f"Unknown task: {task_name}")
-
-        task_info = self.tasks[task_name]
-        label_key = task_info['label_key']
-
-        # Get all participants
-        all_participants = list(dataset.participant_records.keys())
-        n_participants = len(all_participants)
-
-        print(f"\nLeave-One-Out Evaluation: {task_name}")
-        print(f"Total participants: {n_participants}")
-
-        # Pre-extract ALL embeddings once (OPTIMIZATION)
-        print("Pre-extracting all embeddings...")
-        all_embeddings_dict = {}
-        all_labels_dict = {}
-
-        for pid in tqdm(all_participants, desc="Extracting embeddings"):
-            records = dataset.participant_records[pid]
-            pid_embeddings = []
-
-            for record in records[:5]:  # Limit records per participant
-                signal = dataset._load_signal(record)
-                if signal is not None:
-                    segment = dataset._create_segments(signal)
-                    if segment is not None:
-                        with torch.no_grad():
-                            seg_tensor = torch.from_numpy(segment).float().unsqueeze(0).to(self.device)
-                            embedding = self.encoder(seg_tensor).cpu().numpy()[0]
-                            pid_embeddings.append(embedding)
-
-            if pid_embeddings:
-                # Average embeddings for participant
-                all_embeddings_dict[pid] = np.mean(pid_embeddings, axis=0)
-
-                # Get label
-                info = dataset._get_participant_info(pid)
-                if label_key in info and info[label_key] != -1:
-                    value = info[label_key]
-                    if task_info['type'] == 'classification' and 'threshold' in task_info:
-                        label = 1 if value > task_info['threshold'] else 0
-                    else:
-                        label = value
-                    all_labels_dict[pid] = label
-
-        # Filter participants with valid labels
-        valid_participants = [pid for pid in all_participants if pid in all_labels_dict]
-        print(f"Valid participants with labels: {len(valid_participants)}")
-
-        if len(valid_participants) < 3:
-            print("Too few participants for evaluation")
-            return {}
-
-        # Run leave-one-out
-        results = []
-
-        for test_pid in valid_participants:
-            # Train set = all except test participant
-            train_pids = [pid for pid in valid_participants if pid != test_pid]
-
-            X_train = np.array([all_embeddings_dict[pid] for pid in train_pids])
-            y_train = np.array([all_labels_dict[pid] for pid in train_pids])
-
-            X_test = all_embeddings_dict[test_pid].reshape(1, -1)
-            y_test = np.array([all_labels_dict[test_pid]])
-
-            # Train model
-            if task_info['type'] == 'classification':
-                from sklearn.linear_model import LogisticRegression
-                model = LogisticRegression(max_iter=1000, class_weight='balanced')
-
-                # Check if we have both classes in train
-                if len(np.unique(y_train)) < 2:
-                    continue
-
-                model.fit(X_train, y_train)
-                y_pred_proba = model.predict_proba(X_test)[:, 1]
-                results.append({
-                    'y_true': y_test[0],
-                    'y_pred_proba': y_pred_proba[0],
-                    'y_pred': int(y_pred_proba[0] > 0.5)
-                })
-            else:
-                from sklearn.linear_model import Ridge
-                model = Ridge(alpha=1.0)
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                results.append({
-                    'y_true': y_test[0],
-                    'y_pred': y_pred[0]
-                })
-
-        # Calculate metrics
-        if not results:
-            return {}
-
-        if task_info['type'] == 'classification':
-            y_true = [r['y_true'] for r in results]
-            y_pred_proba = [r['y_pred_proba'] for r in results]
-            y_pred = [r['y_pred'] for r in results]
-
-            from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
-
-            try:
-                auc = roc_auc_score(y_true, y_pred_proba)
-            except:
-                auc = 0.0
-
-            acc = accuracy_score(y_true, y_pred)
-            f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
-
-            return {
-                'auc': auc,
-                'accuracy': acc,
-                'f1': f1,
-                'cv_type': 'leave-one-participant-out',
-                'n_samples': len(results)
-            }
-        else:
-            y_true = np.array([r['y_true'] for r in results])
-            y_pred = np.array([r['y_pred'] for r in results])
-
-            from sklearn.metrics import mean_absolute_error, r2_score
-
-            mae = mean_absolute_error(y_true, y_pred)
-            r2 = r2_score(y_true, y_pred)
-
-            return {
-                'mae': mae,
-                'r2': r2,
-                'cv_type': 'leave-one-participant-out',
-                'n_samples': len(results)
-            }
     def evaluate_all_tasks(
             self,
             dataset: BUTPPGDataset,
-            save_path: Optional[str] = None
+            save_path: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Evaluate all tasks - OPTIMIZED to reuse embeddings."""
-        results = []
+        """
+        Evaluate all tasks using specified evaluation methods.
+
+        Args:
+            dataset: Dataset to evaluate
+            save_path: Path to save results
+            evaluation_modes: List of modes ['standard', 'leave_one_out'] or None for auto
+        """
+        all_results = []
 
         print(f"\nEvaluating on {self.device_manager.type}")
         print("=" * 50)
 
-        # OPTIMIZATION: Extract embeddings once for all tasks
-        print("\nExtracting embeddings once for all tasks...")
+        # Determine which evaluation methods to use
+        n_participants = len(dataset.participant_records)
+
+
+        evaluation_modes = ['standard', 'leave_one_out']  # Both for larger
+
+        print(f"Dataset has {n_participants} participants")
+        print(f"Running evaluation modes: {evaluation_modes}")
+
+        # Extract embeddings once for all tasks and methods
+        print("\nExtracting embeddings once for all evaluations...")
         self.extract_embeddings(dataset, aggregate_by_participant=True)
 
-        for task_name in self.tasks.keys():
-            print(f"\n{'=' * 40}")
-            print(f"Evaluating {task_name}")
-            print(f"{'=' * 40}")
+        # Run each evaluation mode
+        for eval_mode in evaluation_modes:
+            print(f"\n{'=' * 60}")
+            print(f"EVALUATION MODE: {eval_mode.upper()}")
+            print(f"{'=' * 60}")
 
-            try:
-                metrics = self.evaluate_task(task_name, dataset)
+            mode_results = []
 
-                if metrics:
-                    result = {
-                        'task': task_name,
-                        'type': self.tasks[task_name]['type'],
-                        **metrics
-                    }
-                    results.append(result)
+            for task_name in self.tasks.keys():
+                print(f"\n{'=' * 40}")
+                print(f"Evaluating {task_name} ({eval_mode})")
+                print(f"{'=' * 40}")
 
-                    self.results[task_name] = metrics
-            except Exception as e:
-                print(f"  ⚠️ Error evaluating {task_name}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                try:
+                    if eval_mode == 'leave_one_out':
+                        metrics = self._evaluate_task_leave_one_out(task_name, dataset)
+                    else:  # standard
+                        metrics = self.evaluate_task(task_name, dataset)
 
-            # Clean GPU memory between tasks
-            if self.device_manager.is_cuda:
-                self.device_manager.empty_cache()
+                    if metrics:
+                        result = {
+                            'task': task_name,
+                            'type': self.tasks[task_name]['type'],
+                            'eval_method': eval_mode,  # Track which method
+                            **metrics
+                        }
+                        mode_results.append(result)
 
-        # Create DataFrame
-        if results:
-            results_df = pd.DataFrame(results)
+                        # Store with method suffix
+                        self.results[f"{task_name}_{eval_mode}"] = metrics
+
+                except Exception as e:
+                    print(f"  ⚠️ Error evaluating {task_name}: {e}")
+                    continue
+
+                # Clean GPU memory between tasks
+                if self.device_manager.is_cuda:
+                    self.device_manager.empty_cache()
+
+            all_results.extend(mode_results)
+
+        # Create combined DataFrame with all results
+        if all_results:
+            results_df = pd.DataFrame(all_results)
+            results_df['device'] = self.device_manager.type
+            results_df['n_participants'] = n_participants
         else:
             print("⚠️ No evaluation results available")
             results_df = pd.DataFrame()
 
-        if not results_df.empty:
-            results_df['device'] = self.device_manager.type
-
+        # Save results
         if save_path and not results_df.empty:
+            # Save CSV with all results
             results_df.to_csv(save_path, index=False)
             print(f"\nResults saved to {save_path}")
 
+            # Save detailed JSON
             json_path = Path(save_path).with_suffix('.json')
-            results_with_device = {
+
+            # Organize results by evaluation method for clarity
+            organized_results = {}
+            for eval_mode in evaluation_modes:
+                mode_results = results_df[results_df['eval_method'] == eval_mode]
+                organized_results[eval_mode] = mode_results.to_dict('records')
+
+            results_json = {
                 'device': self.device_manager.type,
-                'device_properties': self.device_manager.get_properties(),
-                'results': self.results
+                'n_participants': n_participants,
+                'evaluation_modes': evaluation_modes,
+                'results_by_method': organized_results,
+                'detailed_results': self.results
             }
+
             with open(json_path, 'w') as f:
-                json.dump(results_with_device, f, indent=2, default=str)
+                json.dump(results_json, f, indent=2, default=str)
+
+            # Print comparison if both methods were run
+            if len(evaluation_modes) > 1:
+                self._print_comparison(results_df)
 
         return results_df
 
-    def print_summary(self, results_df: pd.DataFrame):
-        """Print summary - UNCHANGED."""
-        print("\n" + "=" * 60)
-        print("EVALUATION SUMMARY")
-        print("=" * 60)
-        print(f"Device: {self.device_manager.type}")
+    def _print_comparison(self, results_df: pd.DataFrame):
+        """Print side-by-side comparison of different evaluation methods."""
+        print("\n" + "=" * 70)
+        print("COMPARISON OF EVALUATION METHODS")
+        print("=" * 70)
 
-        if self.device_manager.is_cuda:
-            props = self.device_manager.get_properties()
-            print(f"GPU: {props.get('name', 'Unknown')}")
-            print(f"Memory: {props.get('memory_total', 0) / 1e9:.2f} GB")
+        tasks = results_df['task'].unique()
+        methods = results_df['eval_method'].unique()
 
-        if not results_df.empty:
-            print("\nResults:")
-            print("-" * 60)
-            print(results_df.to_string(index=False))
-            print("-" * 60)
-        else:
-            print("\n⚠️ No results to display")
+        for task in tasks:
+            print(f"\n{task}:")
+            print("-" * 40)
 
+            task_df = results_df[results_df['task'] == task]
 
+            for method in methods:
+                method_results = task_df[task_df['eval_method'] == method]
+                if not method_results.empty:
+                    row = method_results.iloc[0]
 
+                    print(f"  {method:15s}: ", end="")
+
+                    if row['type'] == 'classification':
+                        print(f"AUC={row.get('auc', 0):.3f}, "
+                              f"Acc={row.get('accuracy', 0):.3f}, "
+                              f"F1={row.get('f1', 0):.3f}")
+                    else:
+                        print(f"MAE={row.get('mae', 0):.3f}, "
+                              f"R2={row.get('r2', 0):.3f}")
 
 # ============= TEST FUNCTIONS =============
 
@@ -1162,7 +1191,8 @@ def test_label_extraction():
         split='test',
         return_labels=True,
         return_participant_id=True,
-        use_cache=False
+        use_cache=False,
+        downsample = True
     )
 
     print(f"   Dataset created with {len(dataset)} samples")

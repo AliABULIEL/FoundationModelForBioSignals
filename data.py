@@ -291,35 +291,51 @@ class BUTPPGDataset(Dataset):
         print(f"  Total pairs: {len(self.segment_pairs)}")
 
     def __getitem__(self, idx):
-        """Get item - properly returns label for positive/negative pairs."""
+        """Fixed to properly load and return data."""
         if idx >= len(self.segment_pairs):
-            # Return dummy pair
             dummy = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels:
-                return dummy, dummy, 0  # 0 for negative pair
-            return dummy, dummy
+            if self.return_labels and self.return_participant_id:
+                return dummy, dummy, "unknown", {'age': -1, 'sex': -1, 'bmi': -1}
+            elif self.return_labels:
+                return dummy, dummy, 0
+            else:
+                return dummy, dummy
 
         pair_info = self.segment_pairs[idx]
 
-        # Load segments
+        # Load segments - use _load_and_process if you have it, or _load_signal
         seg1 = self._load_signal(pair_info['record1'])
         seg2 = self._load_signal(pair_info['record2'])
 
+        # Debug: Check why loading is failing
         if seg1 is None or seg2 is None:
+            print(f"WARNING: Failed to load signals for records {pair_info['record1']}, {pair_info['record2']}")
             dummy = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels:
-                return dummy, dummy, 0
-            return dummy, dummy
+            if self.return_labels and self.return_participant_id:
+                # Still try to get participant info even if signal load failed
+                participant_id = pair_info['participant1']
+                participant_info = self._get_participant_info(participant_id)
+                return dummy, dummy, participant_id, participant_info
+            elif self.return_labels:
+                return dummy, dummy, pair_info['label']
+            else:
+                return dummy, dummy
 
         # Create segments with different random crops
         seg1_processed = self._create_segments(seg1, seed=idx)
         seg2_processed = self._create_segments(seg2, seed=idx + 1000000)
 
         if seg1_processed is None or seg2_processed is None:
+            print(f"WARNING: Failed to create segments for idx {idx}")
             dummy = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels:
-                return dummy, dummy, 0
-            return dummy, dummy
+            if self.return_labels and self.return_participant_id:
+                participant_id = pair_info['participant1']
+                participant_info = self._get_participant_info(participant_id)
+                return dummy, dummy, participant_id, participant_info
+            elif self.return_labels:
+                return dummy, dummy, pair_info['label']
+            else:
+                return dummy, dummy
 
         # Convert to tensors
         seg1_tensor = torch.from_numpy(seg1_processed).float()
@@ -327,15 +343,18 @@ class BUTPPGDataset(Dataset):
 
         # Return based on configuration
         if self.return_labels and self.return_participant_id:
-            # For evaluation - return participant info
+            # EVALUATION MODE - return participant info from first segment
             participant_id = pair_info['participant1']
             participant_info = self._get_participant_info(participant_id)
             return seg1_tensor, seg2_tensor, participant_id, participant_info
+
         elif self.return_labels:
-            # For training - return pair label (1=positive, 0=negative)
+            # TRAINING MODE - return pair label (1=positive, 0=negative)
             label = pair_info['label']
             return seg1_tensor, seg2_tensor, label
+
         else:
+            # NO LABELS MODE
             return seg1_tensor, seg2_tensor
     # def _build_segment_pairs(self):
     #     """Build positive pairs from same participant."""
@@ -579,31 +598,36 @@ class BUTPPGDataset(Dataset):
             return None
 
     def _create_segments(self, signal_data: np.ndarray, seed: Optional[int] = None) -> np.ndarray:
-        """Create segment of required length."""
+        """Create segment of required length - with debugging."""
         if signal_data is None:
+            print("DEBUG: signal_data is None")
             return None
 
-        # Set seed for reproducible segment extraction
-        if seed is not None:
-            np.random.seed(seed)
+        # print(f"DEBUG: signal_data shape: {signal_data.shape}, dtype: {signal_data.dtype}")
+        # print(f"DEBUG: Required segment_length: {self.segment_length}")
 
-        n_samples = signal_data.shape[1]
+        # Ensure 2D shape [channels, samples]
+        if signal_data.ndim == 1:
+            signal_data = signal_data[np.newaxis, :]
+
+        n_samples = signal_data.shape[1] if signal_data.ndim >= 2 else signal_data.shape[0]
+        # print(f"DEBUG: n_samples: {n_samples}")
 
         if n_samples < self.segment_length:
-            # Too short - try to extend by repeating
             if n_samples < self.segment_length // 4:
-                return None  # Too short to extend
-
-            # Repeat and concatenate
+                # print(f"DEBUG: Too short to extend: {n_samples} < {self.segment_length // 4}")
+                return None
+            # Repeat to extend
             n_repeats = (self.segment_length // n_samples) + 1
             extended = np.tile(signal_data, (1, n_repeats))
             return extended[:, :self.segment_length]
         else:
-            # Random crop if longer
+            # Random crop
+            if seed is not None:
+                np.random.seed(seed)
             max_start = n_samples - self.segment_length
             start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
             return signal_data[:, start:start + self.segment_length]
-
     def _get_participant_info(self, participant_id: str) -> Dict:
             # Add this fixed method to the BUTPPGDataset class in data.py
 
