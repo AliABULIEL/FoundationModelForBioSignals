@@ -238,7 +238,7 @@ class SSLModel(nn.Module):
                 z1_m = self.momentum_projection(h1_m)
                 z2_m = self.momentum_projection(h2_m)
 
-            loss, metrics = self.criterion(z1, z2, z2_m, z1_m)
+            loss, metrics = self.criterion(z1, z2, z1_m, z2_m)
 
         return loss, metrics
 

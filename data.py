@@ -601,10 +601,9 @@ class BUTPPGDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        FIXED VERSION: Returns positive pairs from SAME participant as per paper.
-        Minimal changes to existing implementation.
+        Returns positive pairs from SAME participant with no overlap when downsampling.
         """
-        # Handle empty dataset (keep your existing logic)
+        # Handle empty dataset
         if len(self.segment_pairs) == 0:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             if self.return_labels or self.return_participant_id:
@@ -616,19 +615,16 @@ class BUTPPGDataset(Dataset):
             else:
                 return zero_seg, zero_seg
 
-        # Use modulo to handle index overflow (keep existing)
+        # Use modulo to handle index overflow
         idx = idx % len(self.segment_pairs)
         pair_info = self.segment_pairs[idx]
 
-        # Get participant ID and info (keep existing)
+        # Get participant ID and info
         participant_id = pair_info['participant_id']
         participant_info = self._get_participant_info(participant_id) if self.return_labels else None
 
-        # Use idx as seed for reproducibility (keep existing)
+        # Use idx as seed for reproducibility
         np.random.seed(idx + self.random_seed)
-
-        # CRITICAL FIX: Ensure both segments come from same participant
-        # Instead of using record1 and record2 directly, ensure they're from same participant
 
         # Get all records for this participant
         participant_records = self.participant_records[participant_id]
@@ -644,11 +640,11 @@ class BUTPPGDataset(Dataset):
             record1 = participant_records[0]
             record2 = participant_records[0]
 
-        # Load both signals (rest stays the same)
+        # Load both signals
         signal1 = self._load_signal(record1)
         signal2 = self._load_signal(record2)
 
-        # If either fails, return zeros with labels (keep existing)
+        # If either fails, return zeros with labels
         if signal1 is None or signal2 is None:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             if self.return_labels or self.return_participant_id:
@@ -659,17 +655,56 @@ class BUTPPGDataset(Dataset):
             else:
                 return zero_seg, zero_seg
 
-        # Create segments
+        # Create segments - FIXED to ensure no overlap
         if record1 == record2:
-            # Same record: create different segments with different seeds
-            seg1 = self._create_segments(signal1, seed=idx)
-            seg2 = self._create_segments(signal2, seed=idx + 1000000)  # Different seed
-        else:
-            # Different records from same participant: can use same seed
-            seg1 = self._create_segments(signal1, seed=idx)
-            seg2 = self._create_segments(signal2, seed=idx + 1)  # Slightly different
+            # Same record: ensure non-overlapping segments
+            signal_length = signal1.shape[1]
 
-        # Rest of the method stays exactly the same...
+            if self.downsample:
+                # For downsampling: divide into non-overlapping chunks
+                n_possible_segments = signal_length // self.segment_length
+
+                if n_possible_segments >= 2:
+                    # Pick two different non-overlapping segment indices
+                    segment_indices = np.random.choice(n_possible_segments,
+                                                       min(2, n_possible_segments),
+                                                       replace=False)
+
+                    # Extract non-overlapping segments
+                    start1 = segment_indices[0] * self.segment_length
+                    seg1 = signal1[:, start1:start1 + self.segment_length]
+
+                    start2 = segment_indices[1] * self.segment_length
+                    seg2 = signal2[:, start2:start2 + self.segment_length]
+                else:
+                    # Signal too short for 2 non-overlapping segments
+                    # Use the whole segment twice (not ideal but safe)
+                    seg1 = signal1[:, :self.segment_length]
+                    seg2 = signal2[:, :self.segment_length]
+            else:
+                # Original behavior: random crops with different seeds
+                # Ensure minimum gap between segments
+                max_start = signal_length - self.segment_length
+
+                if max_start > self.segment_length:
+                    # Enough space for non-overlapping segments
+                    start1 = np.random.randint(0, max_start - self.segment_length + 1)
+                    seg1 = signal1[:, start1:start1 + self.segment_length]
+
+                    # Second segment starts after first one ends
+                    min_start2 = start1 + self.segment_length
+                    start2 = np.random.randint(min_start2, max_start + 1)
+                    seg2 = signal2[:, start2:start2 + self.segment_length]
+                else:
+                    # Not enough space, use different seeds and hope for the best
+                    seg1 = self._create_segments(signal1, seed=idx)
+                    seg2 = self._create_segments(signal2, seed=idx + 1000000)
+        else:
+            # Different records from same participant: can use random crops
+            seg1 = self._create_segments(signal1, seed=idx)
+            seg2 = self._create_segments(signal2, seed=idx + 1)
+
+        # Handle None returns from segment creation
         if seg1 is None or seg2 is None:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             if self.return_labels or self.return_participant_id:
@@ -680,11 +715,11 @@ class BUTPPGDataset(Dataset):
             else:
                 return zero_seg, zero_seg
 
-        # Convert to tensors (keep existing)
+        # Convert to tensors
         seg1_tensor = torch.from_numpy(seg1).float()
         seg2_tensor = torch.from_numpy(seg2).float()
 
-        # Return based on configuration (keep existing)
+        # Return based on configuration
         if self.return_labels or self.return_participant_id:
             if self.return_participant_id:
                 return seg1_tensor, seg2_tensor, participant_id, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
