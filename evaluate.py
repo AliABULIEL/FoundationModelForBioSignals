@@ -1129,13 +1129,13 @@ def test_evaluation():
     print("\n1. Testing with very small dataset (5 samples):")
 
     # Create tiny dummy data
-    X_tiny = np.random.randn(5, 256)
+    X_tiny = np.random.randn(5, 128)
     y_tiny_class = np.array([0, 0, 1, 1, 1])  # 2 class 0, 3 class 1
     y_tiny_reg = np.random.randn(5)
 
     # Create evaluator
     from model import EfficientNet1D
-    encoder = EfficientNet1D(in_channels=1, embedding_dim=256)
+    encoder = EfficientNet1D(in_channels=1, embedding_dim=128)
     encoder_path = Path('data/outputs/test_encoder.pt')
     encoder_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(encoder.state_dict(), encoder_path)
@@ -1162,7 +1162,7 @@ def test_evaluation():
     # Test with medium dataset
     print("\n2. Testing with medium dataset (20 samples):")
 
-    X_medium = np.random.randn(20, 256)
+    X_medium = np.random.randn(20, 128)
     y_medium_class = np.random.randint(0, 2, 20)
 
     metrics_medium = evaluator._evaluate_classification(X_medium, y_medium_class, n_splits=5)

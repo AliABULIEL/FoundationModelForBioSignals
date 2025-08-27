@@ -116,7 +116,7 @@ class EfficientNet1D(nn.Module):
     def __init__(
             self,
             in_channels: int = 1,  # 1 for PPG/ECG, 3 for ACC
-            embedding_dim: int = 256,
+            embedding_dim: int = 128,
             n_blocks: int = 8,
             width_multiplier: float = 1.0,
             depth_multiplier: float = 1.0,
@@ -315,7 +315,7 @@ class BiosignalFoundationModel(nn.Module):
         else:
             # Default configuration
             model_config = {
-                'embedding_dim': 256,
+                'embedding_dim': 128,
                 'n_blocks': 8,
                 'width_multiplier': 1.0,
                 'depth_multiplier': 1.0,
