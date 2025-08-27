@@ -27,8 +27,9 @@ warnings.filterwarnings('ignore')
 from data import create_dataloaders
 from model import BiosignalFoundationModel
 from augment import ContrastiveAugmentation
-from ssl_model import create_ssl_model
 from device import DeviceManager, get_device_manager
+from simsam_model import create_simsiam_model
+from ssl_model import create_ssl_model
 
 
 class Trainer:
@@ -39,7 +40,8 @@ class Trainer:
             config_path: str = 'configs/config.yaml',
             experiment_name: Optional[str] = None,
             device_manager: Optional[DeviceManager] = None,
-            downsample: bool = False
+            downsample: bool = False,
+            ssl_method: str = 'infonce'
     ):
         """
         Initialize trainer with device manager.
@@ -158,11 +160,27 @@ class Trainer:
         )
 
         # Create SSL model (it will use global device manager internally)
-        self.model = create_ssl_model(
+        if self.ssl_method == 'simsiam':
+
+            self.model = create_simsiam_model(
             encoder=foundation_model.encoder,
-            projection_head=foundation_model.projection_head,
+            projection_head=foundation_model.encode,
             config_path='configs/config.yaml'
         )
+            print(f"  Using SimSiam SSL model")
+        else:
+
+            self.model = create_ssl_model(
+            encoder=foundation_model.encoder,
+            projection_head=foundation_model.encode,
+            config_path='configs/config.yaml'
+        )
+        #     print(f"  Using InfoNCE SSL model")
+        # self.model = create_ssl_model(
+        #     encoder=foundation_model.encoder,
+        #     projection_head=foundation_model.encode,
+        #     config_path='configs/config.yaml'
+        # )
 
         # Move to device (model already on device from initialization)
         self.model = self.model.to(self.device)

@@ -45,6 +45,42 @@ model:
   dropout_rate: 0.2
   drop_path_rate: 0.2
 
+simsiam:
+  # Architecture parameters
+  projection_dim: 2048   # SimSiam paper default
+  prediction_dim: 512    # SimSiam paper default
+
+  # Training parameters optimized for small datasets
+  batch_size: 32         # Can work with smaller batches than InfoNCE
+  learning_rate: 0.00005 # Higher than InfoNCE since no momentum
+  weight_decay: 0.0001   # Less regularization than InfoNCE
+
+  # No temperature or momentum needed for SimSiam
+  # No negative pairs needed
+
+  # Augmentations can be stronger since no negatives
+  augmentations_ppg:
+    cutout: 0.9          # Stronger than InfoNCE
+    magnitude_warp: 0.7
+    gaussian_noise: 0.7
+    time_warp: 0.5
+    channel_permute: 0.0
+
+  augmentations_ecg:
+    cutout: 0.95         # Even stronger augmentation
+    magnitude_warp: 0.9
+    gaussian_noise: 0.9
+    time_warp: 0.7
+    channel_permute: 0.0
+
+  augmentations_acc:
+    cutout: 0.8
+    magnitude_warp: 0.6
+    gaussian_noise: 0.6
+    time_warp: 0.4
+    channel_permute: 0.5  # Important for ACC rotation invariance
+
+
 # SSL training parameters (Apple paper)
 ssl:
   # Loss function

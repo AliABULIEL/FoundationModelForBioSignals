@@ -152,6 +152,13 @@ def train_model(args, device_manager):
 
     # Setup configuration
     config_path, config = setup_config(args, device_manager)
+    ssl_method = getattr(args, 'ssl_method', 'infonce').replace('-', '_')
+    if ssl_method == 'simsiam':
+        # Add SimSiam config to the config file
+        config['simsiam'] = {
+            'projection_dim': getattr(args, 'simsiam_proj_dim', 2048),
+            'prediction_dim': getattr(args, 'simsiam_pred_dim', 512)
+        }
 
     # Create experiment name
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -162,7 +169,8 @@ def train_model(args, device_manager):
         config_path=config_path,
         experiment_name=experiment_name,
         device_manager=device_manager,
-        downsample=args.downsample# Pass device manager
+        downsample=args.downsample,# Pass device manager
+        ssl_method=ssl_method
     )
 
     # Show optimized settings
@@ -363,6 +371,16 @@ def main():
     train_parser.add_argument('--patience', type=int, default=10,
                               help='Early stopping patience')
 
+    train_parser.add_argument('--ssl-method', type=str, default='infonce',
+                              choices=['infonce', 'simsiam'],
+                              help='SSL method: infonce (Apple paper) or simsiam (small data)')
+    train_parser.add_argument('--simsiam-proj-dim', type=int, default=2048,
+                              help='SimSiam projection dimension')
+    train_parser.add_argument('--simsiam-pred-dim', type=int, default=512,
+                              help='SimSiam prediction dimension')
+
+
+
     # === EVALUATE COMMAND ===
     eval_parser = subparsers.add_parser('evaluate', help='Evaluate trained model')
     eval_parser.add_argument('--checkpoint-dir', type=str, required=True,
@@ -403,6 +421,15 @@ def main():
                              help='Early stopping patience')
     full_parser.add_argument('--resume', type=str, default=None,
                              help='Resume from checkpoint')
+
+    # Around line 425 in full_parser section, add the same:
+    full_parser.add_argument('--ssl-method', type=str, default='infonce',
+                             choices=['infonce', 'simsiam'],
+                             help='SSL method: infonce (Apple paper) or simsiam (small data)')
+    full_parser.add_argument('--simsiam-proj-dim', type=int, default=2048,
+                             help='SimSiam projection dimension')
+    full_parser.add_argument('--simsiam-pred-dim', type=int, default=512,
+                             help='SimSiam prediction dimension')
 
     # === TEST COMMAND ===
     test_parser = subparsers.add_parser('test', help='Run tests')
