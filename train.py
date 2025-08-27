@@ -52,6 +52,7 @@ class Trainer:
             device_manager: Device manager instance (if None, creates new one)
         """
         self.downsample = downsample
+        self.ssl_method = ssl_method
         # Load configuration
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
