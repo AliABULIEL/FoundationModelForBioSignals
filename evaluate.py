@@ -220,6 +220,7 @@ class DownstreamEvaluator:
         modality = 'ppg'
         model_config = self.config.get('model', {})
         embedding_dim = model_config.get('embedding_dim', 128)
+        print(f"  Embedding dim: {embedding_dim} (from config)")
 
         self.encoder = EfficientNet1D(
             in_channels=1 if modality != 'acc' else 3,
@@ -244,7 +245,7 @@ class DownstreamEvaluator:
         self.encoder.eval()
 
         print(f"Encoder loaded from {self.encoder_path}")
-        print(f"  Embedding dim: {embedding_dim} (from config)")
+
         print(f"  Modality: {modality}")
 
     @torch.no_grad()
