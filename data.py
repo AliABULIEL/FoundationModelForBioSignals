@@ -47,7 +47,7 @@ class BUTPPGDataset(Dataset):
             return_participant_id: bool = False,
             return_labels: bool = False,
             segment_overlap: float = 0.5,  # For creating longer segments
-            train_ratio: float = 0.6,
+            train_ratio: float = 0.8,
             val_ratio: float = 0.1,
             random_seed: int = 42,
             # New optimization parameters

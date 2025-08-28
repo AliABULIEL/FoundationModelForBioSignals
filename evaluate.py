@@ -219,7 +219,7 @@ class DownstreamEvaluator:
         """Load pre-trained encoder - UNCHANGED."""
         modality = 'ppg'
         model_config = self.config.get('model', {})
-        embedding_dim = model_config.get('embedding_dim', 128)
+        embedding_dim = model_config.get('embedding_dim', 256)
         print(f"  Embedding dim: {embedding_dim} (from config)")
 
         self.encoder = EfficientNet1D(
@@ -1135,7 +1135,7 @@ def test_evaluation():
 
     # Create evaluator
     from model import EfficientNet1D
-    encoder = EfficientNet1D(in_channels=1, embedding_dim=128)
+    encoder = EfficientNet1D(in_channels=1, embedding_dim=256)
     encoder_path = Path('data/outputs/test_encoder.pt')
     encoder_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(encoder.state_dict(), encoder_path)

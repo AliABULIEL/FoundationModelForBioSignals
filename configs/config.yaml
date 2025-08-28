@@ -15,14 +15,14 @@ dataset:
   ppg:
     original_fs: 30      # Hz (actual from BUT PPG)
     target_fs: 64        # Hz (can keep for consistency)
-    segment_length: 10   # seconds (actual data length)
+    segment_length: 30   # seconds (actual data length)
     band_low: 0.4        # Hz
     band_high: 8.0       # Hz
 
   ecg:
     original_fs: 100     # Hz (actual from BUT PPG)
     target_fs: 128       # Hz (can keep for consistency)
-    segment_length: 10   # seconds (actual data length)
+    segment_length: 30   # seconds (actual data length)
     band_low: 0.5        # Hz
     band_high: 40.0      # Hz
 
@@ -37,13 +37,13 @@ dataset:
 # Model architecture (Apple paper specifications)
 model:
   name: "EfficientNet1D"
-  embedding_dim: 128
+  embedding_dim: 256
   projection_dim: 128
-  n_blocks: 8           # Paper specifies 16 MBConv blocks
+  n_blocks: 16           # Paper specifies 16 MBConv blocks
   width_multiplier: 1.0
   depth_multiplier: 1.0
-  dropout_rate: 0.2
-  drop_path_rate: 0.2
+  dropout_rate: 0.1
+  drop_path_rate: 0.1
 
 simsiam:
   # Architecture parameters
@@ -85,7 +85,7 @@ simsiam:
 ssl:
   # Loss function
   temperature: 0.07    # InfoNCE temperature
-  lambda_koleo: 0.01      # KoLeo regularization weight
+  lambda_koleo: 0.05      # KoLeo regularization weight
   momentum_rate: 0.99    # Momentum encoder update rate
 
   # Augmentations (paper Table 1)

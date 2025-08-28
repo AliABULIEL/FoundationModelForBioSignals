@@ -721,7 +721,7 @@ def test_training():
             'optimizer': 'adam'
         },
         'model': {
-            'embedding_dim': 128,
+            'embedding_dim': 256,
             'n_blocks': 4,  # Smaller for testing
             'width_multiplier': 0.5,
             'depth_multiplier': 0.5,
