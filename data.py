@@ -247,7 +247,7 @@ class BUTPPGDataset(Dataset):
         self.participant_pairs = defaultdict(list)  # Track which pairs belong to which participant
 
         # Configuration for pair generation
-        max_pairs_per_participant = 100  # Limit to prevent explosion
+        max_pairs_per_participant = 300  # Limit to prevent explosion
         min_recordings_for_pairs = 2  # Need at least 2 recordings to make pairs
 
         total_possible_pairs = 0
