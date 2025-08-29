@@ -3,6 +3,7 @@
 Data loader for BUT PPG dataset - FULLY FIXED VERSION
 Implements participant-level positive pairs as per Apple paper
 Optimized with caching and correct subdirectory structure
+Uses centralized configuration management
 """
 
 import os
@@ -17,9 +18,9 @@ import wfdb
 from scipy import signal as scipy_signal
 import warnings
 from collections import defaultdict, OrderedDict
-import yaml
-
 import threading
+
+from config_loader import get_config  # Added ConfigLoader
 
 warnings.filterwarnings('ignore')
 
@@ -39,32 +40,35 @@ class BUTPPGDataset(Dataset):
 
     def __init__(
             self,
-            data_dir: str,
+            data_dir: Optional[str] = None,
             modality: str = 'ppg',  # 'ppg', 'ecg', or 'acc'
             split: str = 'train',  # 'train', 'val', or 'test'
             config_path: str = 'configs/config.yaml',
-            quality_filter: bool = False,  # Changed to False - use all data by default
+            quality_filter: bool = False,
             return_participant_id: bool = False,
             return_labels: bool = False,
-            segment_overlap: float = 0.5,  # For creating longer segments
+            segment_overlap: float = 0.5,
             train_ratio: float = 0.8,
             val_ratio: float = 0.1,
-            random_seed: int = 42,
+            random_seed: Optional[int] = None,
             # New optimization parameters
             use_cache: bool = True,
-            cache_size: int = 500,  # Number of signals to cache in memory
+            cache_size: int = 500,
             preprocessed_dir: Optional[str] = None,
-            # Directory with preprocessed data
             downsample: bool = False,
     ):
-        self.data_dir = Path(data_dir)
+        # Load configuration
+        self.config = get_config()
+
+        # Use config values with fallbacks to provided arguments
+        self.data_dir = Path(data_dir if data_dir else self.config.data_dir)
         self.modality = modality.lower()
         self.split = split
         self.quality_filter = quality_filter
         self.return_participant_id = return_participant_id
         self.return_labels = return_labels
         self.segment_overlap = segment_overlap
-        self.random_seed = random_seed
+        self.random_seed = random_seed if random_seed is not None else self.config.seed
         self.downsample = downsample
 
         # Optimization settings
@@ -73,34 +77,25 @@ class BUTPPGDataset(Dataset):
         self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
 
         # Initialize caches
-        self.signal_cache = OrderedDict()  # LRU cache for signals
-        self.cache_lock = threading.Lock()  # Thread-safe cache access
-        self._failed_records = set()  # Track failed loads to avoid retrying
+        self.signal_cache = OrderedDict()
+        self.cache_lock = threading.Lock()
+        self._failed_records = set()
 
-
-
-        # Load configuration
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-
-        # Get modality-specific parameters
-        self.signal_params = self.config['dataset'][modality]
-        self.original_fs = self.signal_params['original_fs']
-        self.target_fs = self.signal_params['target_fs']
-        self.segment_length_sec = self.signal_params['segment_length']
-        self.segment_length = int(self.segment_length_sec * self.target_fs)
-        self.band_low = self.signal_params['band_low']
-        self.band_high = self.signal_params['band_high']
+        # Get modality-specific parameters from config
+        modality_config = self.config.get_modality_config(modality)
+        self.original_fs = modality_config.get('original_fs')
+        self.target_fs = modality_config.get('target_fs')
 
         if self.downsample:
-            self.segment_length_sec = self.config['downsample']["segment_length_sec"]  # ← Changed to 10 seconds
-            original_length = self.signal_params['segment_length']
+            self.segment_length_sec = self.config.get('downsample.segment_length_sec', 10)
+            original_length = modality_config.get('segment_length')
             print(f"  ⚡ Downsampling enabled: {original_length}s → {self.segment_length_sec}s segments")
         else:
-            # Use original segment lengths from config
-            self.segment_length_sec = self.signal_params['segment_length']
+            self.segment_length_sec = modality_config.get('segment_length')
 
         self.segment_length = int(self.segment_length_sec * self.target_fs)
+        self.band_low = modality_config.get('band_low')
+        self.band_high = modality_config.get('band_high')
 
         # Load annotations
         self._load_annotations()
@@ -127,8 +122,8 @@ class BUTPPGDataset(Dataset):
 
     def _load_annotations(self):
         """Load quality annotations and subject info - FIXED for subdirectory structure."""
-        # Load subject info - FIXED filename
-        subject_path = self.data_dir / "subject-info.csv"
+        # Load subject info using config paths
+        subject_path = self.data_dir / self.config.get('dataset.subject_file', 'subject-info.csv')
         if subject_path.exists():
             self.subject_df = pd.read_csv(subject_path)
             print(f"  Loaded subject info: {len(self.subject_df)} entries")
@@ -136,8 +131,8 @@ class BUTPPGDataset(Dataset):
             print(f"Warning: Subject info not found at {subject_path}")
             self.subject_df = pd.DataFrame()
 
-        # Load quality annotations
-        quality_path = self.data_dir / "quality-hr-ann.csv"
+        # Load quality annotations using config paths
+        quality_path = self.data_dir / self.config.get('dataset.quality_file', 'quality-hr-ann.csv')
         if quality_path.exists() and self.quality_filter:
             self.quality_df = pd.read_csv(quality_path)
             print(f"  Loaded quality annotations: {len(self.quality_df)} records")
@@ -179,8 +174,6 @@ class BUTPPGDataset(Dataset):
         # Group by participant (first 3 digits of record ID)
         for record_id in all_records:
             # Extract participant ID from record ID
-            # For 6-digit IDs like "100001", use first 3 digits: "100"
-            # Adjust this logic based on your actual participant grouping needs
             if len(record_id) >= 6:
                 participant_id = record_id[:3]  # "100001" -> "100"
             else:
@@ -188,8 +181,6 @@ class BUTPPGDataset(Dataset):
 
             # Apply quality filter if requested
             if self.quality_filter and self.quality_df is not None:
-                # Check quality for this record
-                # You may need to adjust this based on your quality CSV structure
                 try:
                     record_num = int(record_id)
                     quality_mask = (self.quality_df['ID'] == record_num)
@@ -244,11 +235,11 @@ class BUTPPGDataset(Dataset):
     def _build_segment_pairs(self):
         """Build positive pairs efficiently - avoiding combinatorial explosion."""
         self.segment_pairs = []
-        self.participant_pairs = defaultdict(list)  # Track which pairs belong to which participant
+        self.participant_pairs = defaultdict(list)
 
         # Configuration for pair generation
-        max_pairs_per_participant = 300  # Limit to prevent explosion
-        min_recordings_for_pairs = 2  # Need at least 2 recordings to make pairs
+        max_pairs_per_participant = 300
+        min_recordings_for_pairs = 2
 
         total_possible_pairs = 0
         total_created_pairs = 0
@@ -258,7 +249,6 @@ class BUTPPGDataset(Dataset):
             n_records = len(records)
 
             if n_records < min_recordings_for_pairs:
-                # Skip participants with too few recordings
                 continue
 
             # Calculate how many pairs we could theoretically create
@@ -280,11 +270,9 @@ class BUTPPGDataset(Dataset):
                         total_created_pairs += 1
             else:
                 # Sample a subset of pairs to avoid explosion
-                # Use a set to avoid duplicate pairs
                 created_pairs = set()
 
                 # Strategy: Create diverse pairs by ensuring each recording appears at least once
-                # First, create a chain of pairs ensuring all recordings are used
                 for i in range(n_records - 1):
                     pair = (i, i + 1)
                     created_pairs.add(pair)
@@ -295,7 +283,6 @@ class BUTPPGDataset(Dataset):
                     idx2 = np.random.randint(0, n_records)
 
                     if idx1 != idx2:
-                        # Ensure consistent ordering
                         pair = (min(idx1, idx2), max(idx1, idx2))
                         created_pairs.add(pair)
 
@@ -330,7 +317,6 @@ class BUTPPGDataset(Dataset):
         """Get a positive pair with better error handling."""
         # Handle empty dataset
         if len(self.segment_pairs) == 0:
-            # This should rarely happen with proper initialization
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             if self.return_labels or self.return_participant_id:
                 empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
@@ -635,10 +621,6 @@ class BUTPPGDataset(Dataset):
 
         n_samples = signal_data.shape[1]
 
-        # For BUT PPG with 10-second data:
-        # After resampling PPG: 30Hz→64Hz gives 640 samples
-        # After resampling ECG: 100Hz→128Hz gives 1280 samples
-
         if n_samples < self.segment_length:
             # If we need more samples, tile the signal
             n_repeats = (self.segment_length // n_samples) + 1
@@ -663,8 +645,6 @@ class BUTPPGDataset(Dataset):
             return signal_data[:, start:start + self.segment_length]
 
     def _get_participant_info(self, participant_id: str) -> Dict:
-            # Add this fixed method to the BUTPPGDataset class in data.py
-
         """Get demographic info for a participant - FIXED VERSION."""
         if self.subject_df.empty:
             return {'age': -1, 'sex': -1, 'bmi': -1}
@@ -727,7 +707,8 @@ class BUTPPGDataset(Dataset):
 
                 # Debug output (remove after testing)
                 if self.split == 'test' and len(self.participant_records) < 10:
-                    print(f"DEBUG: Participant {participant_id}, record {record_id}: age={result['age']}, sex={result['sex']}, bmi={result['bmi']}")
+                    print(
+                        f"DEBUG: Participant {participant_id}, record {record_id}: age={result['age']}, sex={result['sex']}, bmi={result['bmi']}")
 
                 return result
             else:
@@ -738,7 +719,8 @@ class BUTPPGDataset(Dataset):
                         mask = self.subject_df['ID'] == record_num
                         if mask.any():
                             # Found it with another record, recursively call with this record
-                            self.participant_records[participant_id] = [record_id] + [r for r in records if r != record_id]
+                            self.participant_records[participant_id] = [record_id] + [r for r in records if
+                                                                                      r != record_id]
                             return self._get_participant_info(participant_id)
                     except:
                         continue
@@ -751,15 +733,13 @@ class BUTPPGDataset(Dataset):
         return {'age': -1, 'sex': -1, 'bmi': -1}
 
 
-
-
 def create_dataloaders(
-        data_dir: str,
+        data_dir: Optional[str] = None,
         modality: str = 'ppg',
-        batch_size: int = 64,
-        num_workers: int = 4,
+        batch_size: Optional[int] = None,
+        num_workers: Optional[int] = None,
         config_path: str = 'configs/config.yaml',
-        pin_memory: bool = False,
+        pin_memory: Optional[bool] = None,
         prefetch_factor: int = 2,
         persistent_workers: bool = False,
         preprocessed_dir: Optional[str] = None,
@@ -768,6 +748,22 @@ def create_dataloaders(
         **dataset_kwargs
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Create train/val/test dataloaders with optimizations."""
+
+    # Load config
+    config = get_config()
+
+    # Use config values with fallbacks to provided arguments
+    if data_dir is None:
+        data_dir = config.data_dir
+
+    if batch_size is None:
+        batch_size = config.get('training.batch_size', 64)
+
+    if num_workers is None:
+        num_workers = config.get('training.num_workers', 4)
+
+    if pin_memory is None:
+        pin_memory = config.get('training.pin_memory', False)
 
     # Check for preprocessed directory
     if preprocessed_dir is None:
@@ -869,7 +865,9 @@ def test_data_loading():
     print("Testing Optimized BUT PPG Data Loading")
     print("=" * 50)
 
-    data_dir = "data/but_ppg/dataset"
+    # Load config
+    config = get_config()
+    data_dir = config.data_dir
 
     if not Path(data_dir).exists():
         print(f"❌ Data directory not found: {data_dir}")
@@ -915,13 +913,16 @@ def test_data_loading():
 
 def test_participant_info_loading():
     """Test that ACTUALLY uses the dataset's method."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("TESTING PARTICIPANT INFO LOADING")
-    print("="*60)
+    print("=" * 60)
+
+    # Load config
+    config = get_config()
 
     # Create an actual dataset instance
     dataset = BUTPPGDataset(
-        data_dir="data/but_ppg/dataset",
+        data_dir=config.data_dir,
         modality='ppg',
         split='test',
         return_labels=True,  # Important!
@@ -967,7 +968,9 @@ def test_zero_signal_diagnostic():
     from pathlib import Path
     import wfdb
 
-    data_dir = Path("data/but_ppg/dataset")
+    # Load config
+    config = get_config()
+    data_dir = Path(config.data_dir)
 
     # Step 1: Understand the actual file structure
     print("\n1. Analyzing File Structure:")
@@ -1149,8 +1152,11 @@ def test_no_zeros_guarantee():
     print("TESTING: NO ZEROS GUARANTEE")
     print("=" * 70)
 
+    # Load config
+    config = get_config()
+
     dataset = BUTPPGDataset(
-        data_dir="data/but_ppg/dataset",
+        data_dir=config.data_dir,
         modality='ppg',
         split='train',
         use_cache=False
