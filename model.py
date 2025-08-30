@@ -2,6 +2,7 @@
 """
 EfficientNet1D model for biosignals
 Following Apple paper's architecture specifications
+Uses centralized configuration management
 """
 
 import torch
@@ -9,8 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple, Dict
-import yaml
 from pathlib import Path
+
+from config_loader import get_config  # Added ConfigLoader
 
 
 class SqueezeExcitation1D(nn.Module):
@@ -115,20 +117,42 @@ class EfficientNet1D(nn.Module):
 
     def __init__(
             self,
-            in_channels: int = 1,  # 1 for PPG/ECG, 3 for ACC
-            embedding_dim: int = 256,
-            n_blocks: int = 8,
-            width_multiplier: float = 1.0,
-            depth_multiplier: float = 1.0,
-            dropout_rate: float = 0.2,
-            drop_path_rate: float = 0.2,
-            modality: str = 'ppg'  # Added for modality-specific adjustments
+            in_channels: Optional[int] = None,
+            embedding_dim: Optional[int] = None,
+            n_blocks: Optional[int] = None,
+            width_multiplier: Optional[float] = None,
+            depth_multiplier: Optional[float] = None,
+            dropout_rate: Optional[float] = None,
+            drop_path_rate: Optional[float] = None,
+            modality: str = 'ppg',
+            config_path: str = 'configs/config.yaml'
     ):
         super().__init__()
 
+        # Load configuration
+        self.config = get_config()
+        model_config = self.config.get_model_config()
+
+        # Use config values with fallbacks to provided arguments
+        if in_channels is None:
+            # Set input channels based on modality
+            if modality == 'acc':
+                in_channels = self.config.get('dataset.acc.channels', 3)
+            else:
+                in_channels = 1  # Single channel for PPG/ECG
+
         self.in_channels = in_channels
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embedding_dim if embedding_dim is not None else model_config.get('embedding_dim', 256)
         self.modality = modality
+
+        # Get architecture parameters from config
+        n_blocks = n_blocks if n_blocks is not None else model_config.get('n_blocks', 16)
+        width_multiplier = width_multiplier if width_multiplier is not None else model_config.get('width_multiplier',
+                                                                                                  1.0)
+        depth_multiplier = depth_multiplier if depth_multiplier is not None else model_config.get('depth_multiplier',
+                                                                                                  1.0)
+        dropout_rate = dropout_rate if dropout_rate is not None else model_config.get('dropout_rate', 0.2)
+        drop_path_rate = drop_path_rate if drop_path_rate is not None else model_config.get('drop_path_rate', 0.2)
 
         # Stem - adjust based on input channels
         stem_channels = self._make_divisible(32 * width_multiplier)
@@ -204,7 +228,7 @@ class EfficientNet1D(nn.Module):
         # Global pooling and projection
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(head_channels, embedding_dim)
+        self.fc = nn.Linear(head_channels, self.embedding_dim)
 
         # Initialize weights
         self._initialize_weights()
@@ -271,12 +295,22 @@ class ProjectionHead(nn.Module):
 
     def __init__(
             self,
-            input_dim: int = 256,
-            hidden_dim: int = 1024,
-            output_dim: int = 128,
-            use_bn: bool = True
+            input_dim: Optional[int] = None,
+            hidden_dim: Optional[int] = None,
+            output_dim: Optional[int] = None,
+            use_bn: bool = True,
+            config_path: str = 'configs/config.yaml'
     ):
         super().__init__()
+
+        # Load configuration
+        config = get_config()
+        model_config = config.get_model_config()
+
+        # Use config values with fallbacks to provided arguments
+        input_dim = input_dim if input_dim is not None else model_config.get('embedding_dim', 256)
+        hidden_dim = hidden_dim if hidden_dim is not None else 1024  # Can add to config if needed
+        output_dim = output_dim if output_dim is not None else model_config.get('projection_dim', 128)
 
         layers = [nn.Linear(input_dim, hidden_dim)]
 
@@ -300,55 +334,48 @@ class BiosignalFoundationModel(nn.Module):
     def __init__(
             self,
             config_path: str = 'configs/config.yaml',
-            device: str = 'mps',
-            modality: str = 'ppg'  # Added modality parameter
+            device: Optional[str] = None,
+            modality: str = 'ppg'
     ):
         super().__init__()
 
         self.modality = modality
 
         # Load configuration
-        if Path(config_path).exists():
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            model_config = config['model']
-        else:
-            # Default configuration
-            model_config = {
-                'embedding_dim': 256,
-                'n_blocks': 8,
-                'width_multiplier': 1.0,
-                'depth_multiplier': 1.0,
-                'dropout_rate': 0.2,
-                'drop_path_rate': 0.2
-            }
+        self.config = get_config()
+        model_config = self.config.get_model_config()
+        device_config = self.config.get_device_config()
 
-        # Set input channels based on modality
+        # Set input channels based on modality using config
         if modality == 'acc':
-            in_channels = 3  # 3-axis accelerometer
+            in_channels = self.config.get('dataset.acc.channels', 3)
         else:
             in_channels = 1  # Single channel for PPG/ECG
 
-        # Create encoder
+        # Create encoder using config values
         self.encoder = EfficientNet1D(
             in_channels=in_channels,
-            embedding_dim=model_config['embedding_dim'],
-            n_blocks=model_config['n_blocks'],
-            width_multiplier=model_config['width_multiplier'],
-            depth_multiplier=model_config['depth_multiplier'],
-            dropout_rate=model_config['dropout_rate'],
-            drop_path_rate=model_config['drop_path_rate'],
-            modality=modality  # Pass modality to encoder
+            embedding_dim=model_config.get('embedding_dim', 256),
+            n_blocks=model_config.get('n_blocks', 16),
+            width_multiplier=model_config.get('width_multiplier', 1.0),
+            depth_multiplier=model_config.get('depth_multiplier', 1.0),
+            dropout_rate=model_config.get('dropout_rate', 0.2),
+            drop_path_rate=model_config.get('drop_path_rate', 0.2),
+            modality=modality,
+            config_path=config_path
         )
 
-        # Create projection head
+        # Create projection head using config values
         self.projection_head = ProjectionHead(
-            input_dim=model_config['embedding_dim'],
-            hidden_dim=1024,
-            output_dim=128
+            input_dim=model_config.get('embedding_dim', 256),
+            hidden_dim=1024,  # Can add to config if needed
+            output_dim=model_config.get('projection_dim', 128),
+            config_path=config_path
         )
 
-        # Set device
+        # Set device using config with fallback
+        if device is None:
+            device = device_config.get('backend', 'cpu')
         self.device = self._get_device(device)
         self.to(self.device)
 
@@ -391,7 +418,7 @@ class BiosignalFoundationModel(nn.Module):
 
 
 def create_model(config_path: str = 'configs/config.yaml',
-                 device: str = 'mps',
+                 device: Optional[str] = None,
                  modality: str = 'ppg'):
     """Create model with configuration."""
     return BiosignalFoundationModel(config_path, device, modality)
@@ -405,11 +432,16 @@ def test_model():
     print("Testing Model Architecture")
     print("=" * 50)
 
-    # Check device
-    if torch.backends.mps.is_available():
+    # Load config
+    config = get_config()
+    device_config = config.get_device_config()
+
+    # Check device from config
+    device_backend = device_config.get('backend', 'cpu')
+    if device_backend == 'mps' and torch.backends.mps.is_available():
         device = 'mps'
         print(f"✓ Using M1 chip (MPS)")
-    elif torch.cuda.is_available():
+    elif device_backend == 'cuda' and torch.cuda.is_available():
         device = 'cuda'
         print(f"✓ Using CUDA GPU")
     else:
@@ -418,54 +450,72 @@ def test_model():
 
     # Test PPG encoder
     print("\n1. Testing EfficientNet1D Encoder for PPG:")
-    ppg_encoder = EfficientNet1D(in_channels=1, embedding_dim=256, modality='ppg')
+    ppg_encoder = EfficientNet1D(modality='ppg')
     ppg_encoder = ppg_encoder.to(device)
 
-    # Test with PPG input [batch=2, channels=1, length=3840]
-    ppg_input = torch.randn(2, 1, 3840).to(device)
+    # Get segment length from config for PPG
+    ppg_segment_length = config.get('dataset.ppg.segment_length', 60)
+    ppg_target_fs = config.get('dataset.ppg.target_fs', 64)
+    ppg_length = ppg_segment_length * ppg_target_fs
+
+    # Test with PPG input
+    ppg_input = torch.randn(2, 1, ppg_length).to(device)
     ppg_embedding = ppg_encoder(ppg_input)
 
     print(f"   Input shape: {ppg_input.shape}")
     print(f"   Output shape: {ppg_embedding.shape}")
-    assert ppg_embedding.shape == (2, 256), f"Wrong shape: {ppg_embedding.shape}"
+    expected_embedding_dim = config.get('model.embedding_dim', 256)
+    assert ppg_embedding.shape == (2, expected_embedding_dim), f"Wrong shape: {ppg_embedding.shape}"
     print("   ✓ PPG encoder test passed!")
 
     # Test ECG encoder
     print("\n2. Testing EfficientNet1D Encoder for ECG:")
-    ecg_encoder = EfficientNet1D(in_channels=1, embedding_dim=256, modality='ecg')
+    ecg_encoder = EfficientNet1D(modality='ecg')
     ecg_encoder = ecg_encoder.to(device)
 
-    ecg_input = torch.randn(2, 1, 3840).to(device)
+    # Get segment length from config for ECG
+    ecg_segment_length = config.get('dataset.ecg.segment_length', 30)
+    ecg_target_fs = config.get('dataset.ecg.target_fs', 128)
+    ecg_length = ecg_segment_length * ecg_target_fs
+
+    ecg_input = torch.randn(2, 1, ecg_length).to(device)
     ecg_embedding = ecg_encoder(ecg_input)
 
     print(f"   Input shape: {ecg_input.shape}")
     print(f"   Output shape: {ecg_embedding.shape}")
-    assert ecg_embedding.shape == (2, 256), f"Wrong shape: {ecg_embedding.shape}"
+    assert ecg_embedding.shape == (2, expected_embedding_dim), f"Wrong shape: {ecg_embedding.shape}"
     print("   ✓ ECG encoder test passed!")
 
     # Test ACC encoder (3 channels)
     print("\n3. Testing EfficientNet1D Encoder for ACC:")
-    acc_encoder = EfficientNet1D(in_channels=3, embedding_dim=256, modality='acc')
+    acc_encoder = EfficientNet1D(modality='acc')
     acc_encoder = acc_encoder.to(device)
 
-    # Test with ACC input [batch=2, channels=3, length=6000]
-    acc_input = torch.randn(2, 3, 6000).to(device)
+    # Get segment length from config for ACC
+    acc_segment_length = config.get('dataset.acc.segment_length', 60)
+    acc_target_fs = config.get('dataset.acc.target_fs', 100)
+    acc_channels = config.get('dataset.acc.channels', 3)
+    acc_length = acc_segment_length * acc_target_fs
+
+    # Test with ACC input
+    acc_input = torch.randn(2, acc_channels, acc_length).to(device)
     acc_embedding = acc_encoder(acc_input)
 
     print(f"   Input shape: {acc_input.shape}")
     print(f"   Output shape: {acc_embedding.shape}")
-    assert acc_embedding.shape == (2, 256), f"Wrong shape: {acc_embedding.shape}"
+    assert acc_embedding.shape == (2, expected_embedding_dim), f"Wrong shape: {acc_embedding.shape}"
     print("   ✓ ACC encoder test passed!")
 
     # Test projection head
     print("\n4. Testing Projection Head:")
-    proj_head = ProjectionHead(input_dim=256, output_dim=128)
+    proj_head = ProjectionHead()
     proj_head = proj_head.to(device)
 
     projection = proj_head(acc_embedding)
+    expected_projection_dim = config.get('model.projection_dim', 128)
     print(f"   Input shape: {acc_embedding.shape}")
     print(f"   Output shape: {projection.shape}")
-    assert projection.shape == (2, 128), f"Wrong shape: {projection.shape}"
+    assert projection.shape == (2, expected_projection_dim), f"Wrong shape: {projection.shape}"
     print("   ✓ Projection head test passed!")
 
     # Test complete model for each modality
@@ -478,8 +528,8 @@ def test_model():
     ppg_projection = ppg_model(ppg_input, return_embedding=False)
     print(f"   PPG embedding shape: {ppg_embedding.shape}")
     print(f"   PPG projection shape: {ppg_projection.shape}")
-    assert ppg_embedding.shape == (2, 256)
-    assert ppg_projection.shape == (2, 128)
+    assert ppg_embedding.shape == (2, expected_embedding_dim)
+    assert ppg_projection.shape == (2, expected_projection_dim)
     print("   ✓ PPG model test passed!")
 
     # ECG model
@@ -489,8 +539,8 @@ def test_model():
     ecg_projection = ecg_model(ecg_input, return_embedding=False)
     print(f"   ECG embedding shape: {ecg_embedding.shape}")
     print(f"   ECG projection shape: {ecg_projection.shape}")
-    assert ecg_embedding.shape == (2, 256)
-    assert ecg_projection.shape == (2, 128)
+    assert ecg_embedding.shape == (2, expected_embedding_dim)
+    assert ecg_projection.shape == (2, expected_projection_dim)
     print("   ✓ ECG model test passed!")
 
     # ACC model
@@ -500,24 +550,24 @@ def test_model():
     acc_projection = acc_model(acc_input, return_embedding=False)
     print(f"   ACC embedding shape: {acc_embedding.shape}")
     print(f"   ACC projection shape: {acc_projection.shape}")
-    assert acc_embedding.shape == (2, 256)
-    assert acc_projection.shape == (2, 128)
+    assert acc_embedding.shape == (2, expected_embedding_dim)
+    assert acc_projection.shape == (2, expected_projection_dim)
     print("   ✓ ACC model test passed!")
 
     # Test with different batch sizes for ACC
     print("\n6. Testing different batch sizes for ACC:")
     for batch_size in [1, 4, 8, 16]:
-        test_input = torch.randn(batch_size, 3, 6000).to(device)
+        test_input = torch.randn(batch_size, acc_channels, acc_length).to(device)
         output = acc_model(test_input, return_embedding=True)
-        assert output.shape == (batch_size, 256)
+        assert output.shape == (batch_size, expected_embedding_dim)
         print(f"   Batch size {batch_size}: ✓")
 
     # Test ACC with different input lengths
     print("\n7. Testing ACC with different input lengths:")
     for length in [3000, 6000, 12000]:
-        test_input = torch.randn(2, 3, length).to(device)
+        test_input = torch.randn(2, acc_channels, length).to(device)
         output = acc_model(test_input, return_embedding=True)
-        assert output.shape == (2, 256)
+        assert output.shape == (2, expected_embedding_dim)
         print(f"   Length {length}: ✓")
 
     # Test memory efficiency for ACC
