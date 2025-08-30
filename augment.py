@@ -3,6 +3,7 @@
 Signal augmentation module for SSL training
 Following Apple paper's augmentation strategy
 Uses global device manager instead of internal device management
+Uses centralized configuration management
 """
 
 import torch
@@ -11,9 +12,10 @@ import numpy as np
 from typing import Dict, Tuple, Optional, List
 import random
 from scipy.interpolate import CubicSpline
-import yaml
 from pathlib import Path
+
 from device import get_device_manager
+from config_loader import get_config  # Added ConfigLoader
 
 
 class SignalAugmentation:
@@ -31,7 +33,8 @@ class SignalAugmentation:
     def __init__(
             self,
             modality: str = 'ppg',
-            config_path: str = 'configs/config.yaml'
+            config_path: str = 'configs/config.yaml',
+            ssl_method: str = 'infonce'
     ):
         """
         Initialize augmentation module.
@@ -39,51 +42,71 @@ class SignalAugmentation:
         Args:
             modality: Signal type ('ppg', 'ecg', or 'acc')
             config_path: Path to configuration file
+            ssl_method: SSL method ('infonce' or 'simsiam')
         """
         self.modality = modality.lower()
+        self.ssl_method = ssl_method
 
         # Get device from global device manager
         self.device_manager = get_device_manager()
         self.device = self.device_manager.device
 
         # Load configuration
-        if Path(config_path).exists():
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
+        self.config = get_config()
 
-            # Get modality-specific augmentation probabilities
+        # Get modality-specific augmentation probabilities from config
+        self.aug_probs = self.config.get_augmentation_config(modality, ssl_method)
+
+        # If no augmentation config found, load from config file
+        if not self.aug_probs:
+            # Get the right section based on SSL method
+            if ssl_method == 'simsiam':
+                config_section = self.config.get_section('simsiam')
+            else:
+                config_section = self.config.get_section('ssl')
+
+            # Get augmentation probabilities for the modality
             aug_key = f'augmentations_{modality}'
-            self.aug_probs = config['ssl'].get(aug_key, {})
-        else:
-            # Default probabilities from paper
-            if modality == 'ppg':
+            self.aug_probs = config_section.get(aug_key, {})
+
+            # If still no config, use minimal defaults
+            if not self.aug_probs:
+                print(f"Warning: No augmentation config found for {modality} with {ssl_method}, using minimal defaults")
                 self.aug_probs = {
-                    'cutout': 0.4,
-                    'magnitude_warp': 0.25,
-                    'gaussian_noise': 0.25,
-                    'time_warp': 0.15,
-                    'channel_permute': 0.0  # Single channel
-                }
-            elif modality == 'ecg':
-                self.aug_probs = {
-                    'cutout': 0.8,
-                    'magnitude_warp': 0.5,
-                    'gaussian_noise': 0.5,
-                    'time_warp': 0.3,
-                    'channel_permute': 0.0  # Single channel
-                }
-            else:  # acc
-                self.aug_probs = {
-                    'cutout': 0.3,
-                    'magnitude_warp': 0.2,
-                    'gaussian_noise': 0.2,
-                    'time_warp': 0.1,
-                    'channel_permute': 0.25  # Important for 3-axis ACC
+                    'cutout': 0.0,
+                    'magnitude_warp': 0.0,
+                    'gaussian_noise': 0.0,
+                    'time_warp': 0.0,
+                    'channel_permute': 0.0
                 }
 
         print(f"Augmentation initialized for {modality.upper()} on {self.device}")
+        print(f"  SSL method: {ssl_method}")
+        print(f"  Augmentation probabilities from config:")
+        for aug_name, prob in self.aug_probs.items():
+            print(f"    {aug_name}: {prob:.2f}")
         if modality == 'acc':
-            print(f"  ACC-specific: channel_permute probability = {self.aug_probs['channel_permute']}")
+            print(f"  ACC-specific: channel_permute probability = {self.aug_probs.get('channel_permute', 0)}")
+
+        # Get cutout parameters from config
+        self.cutout_min_ratio = self.config.get('augmentation.cutout_min_ratio', 0.05)
+        self.cutout_max_ratio = self.config.get('augmentation.cutout_max_ratio', 0.15)
+        self.cutout_max_masks = self.config.get('augmentation.cutout_max_masks', 3)
+
+        # Get magnitude warp parameters from config
+        self.magnitude_warp_min = self.config.get('augmentation.magnitude_warp_min', 0.8)
+        self.magnitude_warp_max = self.config.get('augmentation.magnitude_warp_max', 1.2)
+        self.magnitude_warp_knots_min = self.config.get('augmentation.magnitude_warp_knots_min', 4)
+        self.magnitude_warp_knots_max = self.config.get('augmentation.magnitude_warp_knots_max', 6)
+
+        # Get noise parameters from config
+        self.noise_level_min = self.config.get('augmentation.noise_level_min', 0.01)
+        self.noise_level_max = self.config.get('augmentation.noise_level_max', 0.03)
+
+        # Get time warp parameters from config
+        self.time_warp_shift_ratio = self.config.get('augmentation.time_warp_shift_ratio', 0.05)
+        self.time_warp_knots_min = self.config.get('augmentation.time_warp_knots_min', 4)
+        self.time_warp_knots_max = self.config.get('augmentation.time_warp_knots_max', 6)
 
     def cutout(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -98,18 +121,22 @@ class SignalAugmentation:
         # Apply to each sample in batch
         for b in range(B):
             if random.random() < self.aug_probs.get('cutout', 0):
-                # Number of segments to mask (1-3)
-                n_masks = random.randint(1, 3)
+                # Number of segments to mask (from config)
+                n_masks = random.randint(1, self.cutout_max_masks)
 
                 for _ in range(n_masks):
-                    # Mask length: 5-15% of signal
-                    mask_len = random.randint(int(0.05 * L), int(0.15 * L))
+                    # Mask length: from config ratios
+                    mask_len = random.randint(
+                        int(self.cutout_min_ratio * L),
+                        int(self.cutout_max_ratio * L)
+                    )
 
                     # Random position
                     if L > mask_len:
                         start = random.randint(0, L - mask_len)
                         # For ACC, we can choose to mask all channels or individual channels
-                        if self.modality == 'acc' and random.random() < 0.5:
+                        acc_individual_channel_prob = self.config.get('augmentation.acc_individual_channel_prob', 0.5)
+                        if self.modality == 'acc' and random.random() < acc_individual_channel_prob:
                             # Mask individual channel
                             channel = random.randint(0, C - 1)
                             x_aug[b, channel, start:start + mask_len] = 0.0
@@ -132,16 +159,23 @@ class SignalAugmentation:
         for b in range(B):
             if random.random() < self.aug_probs.get('magnitude_warp', 0):
                 # Create smooth warping curve
-                n_knots = random.randint(4, 6)
+                n_knots = random.randint(self.magnitude_warp_knots_min, self.magnitude_warp_knots_max)
                 knot_xs = np.linspace(0, L - 1, n_knots)
 
                 # For ACC, we can apply different warping to each axis
                 if self.modality == 'acc':
                     for c in range(C):
-                        # Warping factors (0.8 to 1.2 for physiological realism)
-                        knot_ys = np.random.uniform(0.8, 1.2, n_knots)
-                        knot_ys[0] = np.clip(knot_ys[0], 0.9, 1.1)
-                        knot_ys[-1] = np.clip(knot_ys[-1], 0.9, 1.1)
+                        # Warping factors from config
+                        knot_ys = np.random.uniform(
+                            self.magnitude_warp_min,
+                            self.magnitude_warp_max,
+                            n_knots
+                        )
+                        # Clip edge values for stability
+                        edge_min = self.config.get('augmentation.magnitude_warp_edge_min', 0.9)
+                        edge_max = self.config.get('augmentation.magnitude_warp_edge_max', 1.1)
+                        knot_ys[0] = np.clip(knot_ys[0], edge_min, edge_max)
+                        knot_ys[-1] = np.clip(knot_ys[-1], edge_min, edge_max)
 
                         # Create smooth curve
                         spline = CubicSpline(knot_xs, knot_ys)
@@ -152,9 +186,15 @@ class SignalAugmentation:
                         x_aug[b, c] = x_aug[b, c] * warp_tensor
                 else:
                     # Single warping for all channels (PPG/ECG)
-                    knot_ys = np.random.uniform(0.8, 1.2, n_knots)
-                    knot_ys[0] = np.clip(knot_ys[0], 0.9, 1.1)
-                    knot_ys[-1] = np.clip(knot_ys[-1], 0.9, 1.1)
+                    knot_ys = np.random.uniform(
+                        self.magnitude_warp_min,
+                        self.magnitude_warp_max,
+                        n_knots
+                    )
+                    edge_min = self.config.get('augmentation.magnitude_warp_edge_min', 0.9)
+                    edge_max = self.config.get('augmentation.magnitude_warp_edge_max', 1.1)
+                    knot_ys[0] = np.clip(knot_ys[0], edge_min, edge_max)
+                    knot_ys[-1] = np.clip(knot_ys[-1], edge_min, edge_max)
 
                     spline = CubicSpline(knot_xs, knot_ys)
                     warp_curve = spline(np.arange(L))
@@ -181,14 +221,14 @@ class SignalAugmentation:
                     # For ACC, calculate std per channel
                     for c in range(C):
                         channel_std = torch.std(x[b, c])
-                        # Noise level: 1-3% of signal std
-                        noise_level = random.uniform(0.01, 0.03)
+                        # Noise level from config
+                        noise_level = random.uniform(self.noise_level_min, self.noise_level_max)
                         noise = torch.randn_like(x[b, c]) * channel_std * noise_level
                         x_aug[b, c] = x_aug[b, c] + noise
                 else:
                     # For PPG/ECG
                     signal_std = torch.std(x[b], dim=-1, keepdim=True)
-                    noise_level = random.uniform(0.01, 0.03)
+                    noise_level = random.uniform(self.noise_level_min, self.noise_level_max)
                     noise = torch.randn_like(x[b]) * signal_std * noise_level
                     x_aug[b] = x_aug[b] + noise
 
@@ -207,13 +247,13 @@ class SignalAugmentation:
         for b in range(B):
             if random.random() < self.aug_probs.get('time_warp', 0):
                 # Create time warping
-                n_knots = random.randint(4, 6)
+                n_knots = random.randint(self.time_warp_knots_min, self.time_warp_knots_max)
                 orig_times = np.linspace(0, L - 1, n_knots)
 
                 # Warped time points
                 warped_times = [0]
                 for i in range(1, n_knots - 1):
-                    max_shift = int(0.05 * L / n_knots)
+                    max_shift = int(self.time_warp_shift_ratio * L / n_knots)
                     shift = random.randint(-max_shift, max_shift)
                     new_time = orig_times[i] + shift
                     new_time = max(warped_times[-1] + 1, new_time)
@@ -259,7 +299,8 @@ class SignalAugmentation:
 
                 # For ACC, we can also apply axis swapping with sign flips
                 # This simulates different device orientations
-                if self.modality == 'acc' and random.random() < 0.5:
+                acc_sign_flip_prob = self.config.get('augmentation.acc_sign_flip_prob', 0.5)
+                if self.modality == 'acc' and random.random() < acc_sign_flip_prob:
                     # Randomly flip signs of axes
                     signs = torch.tensor([random.choice([-1, 1]) for _ in range(C)],
                                          dtype=x.dtype, device=self.device)
@@ -296,10 +337,11 @@ class ContrastiveAugmentation:
     def __init__(
             self,
             modality: str = 'ppg',
-            config_path: str = 'configs/config.yaml'
+            config_path: str = 'configs/config.yaml',
+            ssl_method: str = 'infonce'
     ):
         """Initialize augmentation for positive pairs."""
-        self.augment = SignalAugmentation(modality, config_path)
+        self.augment = SignalAugmentation(modality, config_path, ssl_method)
         self.modality = modality
 
         # Get device from global device manager
@@ -340,14 +382,22 @@ def test_augmentations():
     device_manager = get_device_manager()
     device = device_manager.device
 
+    # Load config
+    config = get_config()
+
     print(f"✓ Using device: {device} ({device_manager.type})")
 
     # Test PPG augmentations
     print("\n1. Testing PPG Augmentations:")
     ppg_aug = SignalAugmentation(modality='ppg')
 
-    # Create dummy PPG signal [batch=2, channels=1, length=3840]
-    ppg_signal = torch.randn(2, 1, 3840).to(device)
+    # Get PPG segment parameters from config
+    ppg_segment_length = config.get('dataset.ppg.segment_length', 60)
+    ppg_target_fs = config.get('dataset.ppg.target_fs', 64)
+    ppg_length = ppg_segment_length * ppg_target_fs
+
+    # Create dummy PPG signal
+    ppg_signal = torch.randn(2, 1, ppg_length).to(device)
 
     # Test individual augmentations
     print("   Testing individual augmentations:")
@@ -374,8 +424,13 @@ def test_augmentations():
     print("\n2. Testing ECG Augmentations:")
     ecg_aug = SignalAugmentation(modality='ecg')
 
-    # Create dummy ECG signal [batch=2, channels=1, length=3840]
-    ecg_signal = torch.randn(2, 1, 3840).to(device)
+    # Get ECG segment parameters from config
+    ecg_segment_length = config.get('dataset.ecg.segment_length', 30)
+    ecg_target_fs = config.get('dataset.ecg.target_fs', 128)
+    ecg_length = ecg_segment_length * ecg_target_fs
+
+    # Create dummy ECG signal
+    ecg_signal = torch.randn(2, 1, ecg_length).to(device)
 
     # Test multiple augmentations
     augmented_ecgs = []
@@ -395,8 +450,14 @@ def test_augmentations():
     print("\n3. Testing ACC Augmentations (3-channel):")
     acc_aug = SignalAugmentation(modality='acc')
 
-    # Create dummy ACC signal [batch=2, channels=3, length=6000]
-    acc_signal = torch.randn(2, 3, 6000).to(device)
+    # Get ACC segment parameters from config
+    acc_segment_length = config.get('dataset.acc.segment_length', 60)
+    acc_target_fs = config.get('dataset.acc.target_fs', 100)
+    acc_channels = config.get('dataset.acc.channels', 3)
+    acc_length = acc_segment_length * acc_target_fs
+
+    # Create dummy ACC signal
+    acc_signal = torch.randn(2, acc_channels, acc_length).to(device)
     print(f"   Original ACC signal shape: {acc_signal.shape}")
 
     # Test individual ACC augmentations
@@ -404,18 +465,18 @@ def test_augmentations():
 
     # Test cutout
     acc_cutout = acc_aug.cutout(acc_signal.clone())
-    zeros_per_channel = [(acc_cutout[0, c] == 0).sum().item() for c in range(3)]
+    zeros_per_channel = [(acc_cutout[0, c] == 0).sum().item() for c in range(acc_channels)]
     print(f"   ✓ Cutout - zeros per channel: {zeros_per_channel}")
 
     # Test magnitude warp (per-channel)
     acc_mag = acc_aug.magnitude_warp(acc_signal.clone())
-    for c in range(3):
+    for c in range(acc_channels):
         ratio = (acc_mag[0, c] / (acc_signal[0, c] + 1e-6)).mean().item()
         print(f"   ✓ Magnitude warp channel {c}: ratio = {ratio:.3f}")
 
     # Test Gaussian noise (per-channel)
     acc_noise = acc_aug.gaussian_noise(acc_signal.clone())
-    for c in range(3):
+    for c in range(acc_channels):
         noise_std = (acc_noise[0, c] - acc_signal[0, c]).std().item()
         print(f"   ✓ Gaussian noise channel {c}: std = {noise_std:.4f}")
 
@@ -424,8 +485,8 @@ def test_augmentations():
     acc_perm = acc_aug.channel_permute(acc_signal.clone())
 
     # Check if channels were actually permuted
-    original_norms = [acc_signal[0, c].norm().item() for c in range(3)]
-    permuted_norms = [acc_perm[0, c].norm().item() for c in range(3)]
+    original_norms = [acc_signal[0, c].norm().item() for c in range(acc_channels)]
+    permuted_norms = [acc_perm[0, c].norm().item() for c in range(acc_channels)]
     print(f"   Original channel norms: {[f'{n:.3f}' for n in original_norms]}")
     print(f"   After permutation: {[f'{n:.3f}' for n in permuted_norms]}")
 
@@ -433,15 +494,15 @@ def test_augmentations():
     acc_full = acc_aug(acc_signal.clone())
     print(f"\n   ✓ Full ACC augmentation: {acc_full.shape}")
     assert acc_full.shape[0] == 2, f"Wrong batch size: {acc_full.shape[0]}"
-    assert acc_full.shape[1] == 3, f"ACC should have 3 channels, got {acc_full.shape[1]}"
+    assert acc_full.shape[1] == acc_channels, f"ACC should have {acc_channels} channels, got {acc_full.shape[1]}"
     print("   ✓ ACC augmentation test passed!")
 
     # Test ContrastiveAugmentation for ACC
     print("\n4. Testing Contrastive Augmentation for ACC:")
     contrast_aug = ContrastiveAugmentation(modality='acc')
 
-    seg1 = torch.randn(4, 3, 6000).to(device)
-    seg2 = torch.randn(4, 3, 6000).to(device)
+    seg1 = torch.randn(4, acc_channels, acc_length).to(device)
+    seg2 = torch.randn(4, acc_channels, acc_length).to(device)
 
     seg1_aug, seg2_aug = contrast_aug(seg1, seg2)
 
@@ -454,23 +515,24 @@ def test_augmentations():
     # Test with different batch sizes for ACC
     print("\n5. Testing different batch sizes for ACC:")
     for batch_size in [1, 4, 8, 16]:
-        test_signal = torch.randn(batch_size, 3, 6000).to(device)
+        test_signal = torch.randn(batch_size, acc_channels, acc_length).to(device)
         aug_signal = acc_aug(test_signal)
         assert aug_signal.shape == test_signal.shape
         print(f"   Batch size {batch_size}: ✓")
 
     # Test reproducibility with seed for ACC
     print("\n6. Testing ACC reproducibility:")
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    seed = config.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-    test_signal = torch.randn(2, 3, 6000).to(device)
+    test_signal = torch.randn(2, acc_channels, acc_length).to(device)
     aug1 = acc_aug(test_signal.clone())
 
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     aug2 = acc_aug(test_signal.clone())
 
@@ -478,15 +540,20 @@ def test_augmentations():
     print(f"   Max difference with same seed: {diff:.6f}")
     print("   ✓ ACC reproducibility test passed!")
 
+    # Test with SimSiam augmentations
+    print("\n7. Testing SimSiam augmentations:")
+    simsiam_aug = SignalAugmentation(modality='ppg', ssl_method='simsiam')
+    print("   ✓ SimSiam augmentation initialized")
+
     # Test memory efficiency
-    print("\n7. Testing memory efficiency:")
+    print("\n8. Testing memory efficiency:")
     if device_manager.is_cuda:
         initial_mem = device_manager.memory_stats()
         print(f"   Initial GPU memory: {initial_mem.get('allocated', 0):.3f} GB")
 
         # Run augmentations
         for _ in range(10):
-            large_signal = torch.randn(32, 3, 6000).to(device)
+            large_signal = torch.randn(32, acc_channels, acc_length).to(device)
             aug_signal = acc_aug(large_signal)
             del large_signal, aug_signal
 
