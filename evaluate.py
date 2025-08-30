@@ -1,6 +1,7 @@
+# biosignal/evaluate.py
 """
-evaluate.py - OPTIMIZED VERSION WITH FULL COMPATIBILITY
-Maintains all original functionality while adding performance optimizations
+Evaluation module for downstream tasks
+Uses centralized configuration management
 """
 
 import torch
@@ -17,7 +18,6 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedKFold, KFold, LeaveOneOut, train_test_split
 from tqdm import tqdm
-import yaml
 import json
 import pickle
 import hashlib
@@ -28,6 +28,7 @@ warnings.filterwarnings('ignore')
 from data import BUTPPGDataset
 from model import EfficientNet1D
 from device import DeviceManager, get_device_manager
+from config_loader import get_config  # Added ConfigLoader
 
 
 class LinearProbe:
@@ -36,11 +37,18 @@ class LinearProbe:
     def __init__(
             self,
             task_type: str = 'classification',
-            alpha: float = 1.0
+            alpha: Optional[float] = None,
+            config_path: str = 'configs/config.yaml'
     ):
-        """Initialize linear probe - UNCHANGED FROM ORIGINAL."""
+        """Initialize linear probe."""
         self.task_type = task_type
-        self.alpha = alpha
+        
+        # Load configuration
+        config = get_config()
+        eval_config = config.get_evaluation_config()
+        
+        # Use config value with fallback
+        self.alpha = alpha if alpha is not None else eval_config.get('ridge_alpha', 1.0)
 
         # Get device from global device manager
         self.device_manager = get_device_manager()
@@ -94,7 +102,12 @@ class EmbeddingCache:
     """Cache manager for embeddings to avoid recomputation."""
 
     def __init__(self, cache_dir: Optional[Path] = None):
-        self.cache_dir = cache_dir or Path('data/cache/embeddings')
+        # Load config
+        config = get_config()
+        
+        # Use cache directory from config or default
+        default_cache_dir = config.get('evaluation.embedding_cache_dir', 'data/cache/embeddings')
+        self.cache_dir = cache_dir or Path(default_cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.memory_cache = {}
 
@@ -133,8 +146,8 @@ class EmbeddingCache:
 
 class DownstreamEvaluator:
     """
-    Evaluator for downstream tasks - OPTIMIZED VERSION
-    Maintains full compatibility with original interface
+    Evaluator for downstream tasks
+    Uses centralized configuration
     """
 
     def __init__(
@@ -142,11 +155,17 @@ class DownstreamEvaluator:
             encoder_path: str,
             config_path: str = 'configs/config.yaml',
             device_manager: Optional[DeviceManager] = None,
-            use_cache: bool = True  # NEW: Enable caching by default
+            use_cache: Optional[bool] = None
     ):
         """Initialize evaluator with device manager."""
         self.encoder_path = encoder_path
-        self.use_cache = use_cache
+        
+        # Load configuration
+        self.config = get_config()
+        eval_config = self.config.get_evaluation_config()
+        
+        # Use cache setting from config
+        self.use_cache = use_cache if use_cache is not None else eval_config.get('use_embedding_cache', True)
 
         # Use device manager
         if device_manager is None:
@@ -156,12 +175,8 @@ class DownstreamEvaluator:
 
         self.device = self.device_manager.device
 
-        # Load configuration
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-
         # Initialize cache
-        self.cache = EmbeddingCache() if use_cache else None
+        self.cache = EmbeddingCache() if self.use_cache else None
 
         # Cache for current dataset embeddings
         self._current_dataset_id = None
@@ -172,8 +187,24 @@ class DownstreamEvaluator:
         # Load encoder
         self._load_encoder()
 
-        # Define tasks (following Apple paper) - UNCHANGED
-        self.tasks = {
+        # Define tasks from config
+        self.tasks = self._load_tasks_from_config()
+
+        # Results storage
+        self.results = {}
+
+        print(f"Evaluator initialized on {self.device_manager.type}")
+        if self.device_manager.is_cuda:
+            mem_stats = self.device_manager.memory_stats()
+            print(f"  GPU memory available: {mem_stats.get('free', 0):.2f} GB")
+
+    def _load_tasks_from_config(self) -> Dict:
+        """Load task definitions from configuration."""
+        eval_config = self.config.get_evaluation_config()
+        tasks_list = eval_config.get('tasks', [])
+        
+        # Default tasks if not in config
+        default_tasks = {
             'age_classification': {
                 'type': 'classification',
                 'threshold': 50,
@@ -200,30 +231,48 @@ class DownstreamEvaluator:
                 'type': 'classification',
                 'threshold': 140,
                 'label_key': 'bp_systolic'
-            },
-            # 'spo2_regression': {
-            #     'type': 'regression',
-            #     'label_key': 'spo2'
-            # }
+            }
         }
-
-        # Results storage
-        self.results = {}
-
-        print(f"Evaluator initialized on {self.device_manager.type}")
-        if self.device_manager.is_cuda:
-            mem_stats = self.device_manager.memory_stats()
-            print(f"  GPU memory available: {mem_stats.get('free', 0):.2f} GB")
+        
+        # Build tasks dict from config list
+        tasks = {}
+        for task_name in tasks_list:
+            if task_name in default_tasks:
+                tasks[task_name] = default_tasks[task_name]
+            else:
+                # Try to parse task from config
+                if '_classification' in task_name:
+                    label_key = task_name.replace('_classification', '')
+                    tasks[task_name] = {
+                        'type': 'classification',
+                        'label_key': label_key,
+                        'threshold': self.config.get(f'evaluation.thresholds.{label_key}', 50)
+                    }
+                elif '_regression' in task_name:
+                    label_key = task_name.replace('_regression', '')
+                    tasks[task_name] = {
+                        'type': 'regression',
+                        'label_key': label_key
+                    }
+        
+        # If no tasks in config, use defaults
+        if not tasks:
+            tasks = default_tasks
+            
+        return tasks
 
     def _load_encoder(self):
-        """Load pre-trained encoder - UNCHANGED."""
-        modality = 'ppg'
-        model_config = self.config.get('model', {})
+        """Load pre-trained encoder."""
+        # Get modality from checkpoint or default
+        modality = 'ppg'  # Default, could be stored in checkpoint
+        
+        model_config = self.config.get_model_config()
         embedding_dim = model_config.get('embedding_dim', 256)
+        
         print(f"  Embedding dim: {embedding_dim} (from config)")
 
         self.encoder = EfficientNet1D(
-            in_channels=1 if modality != 'acc' else 3,
+            in_channels=1 if modality != 'acc' else self.config.get('dataset.acc.channels', 3),
             embedding_dim=embedding_dim,
             modality=modality
         )
@@ -245,7 +294,6 @@ class DownstreamEvaluator:
         self.encoder.eval()
 
         print(f"Encoder loaded from {self.encoder_path}")
-
         print(f"  Modality: {modality}")
 
     @torch.no_grad()
@@ -253,11 +301,10 @@ class DownstreamEvaluator:
             self,
             dataset: BUTPPGDataset,
             aggregate_by_participant: bool = True,
-            batch_size: int = 32
+            batch_size: Optional[int] = None
     ) -> Tuple[np.ndarray, List, np.ndarray]:
         """
         Extract embeddings with caching optimization.
-        MAINTAINS ORIGINAL DEBUG PRINTS AND INTERFACE.
         """
         from torch.utils.data import DataLoader
 
@@ -282,7 +329,6 @@ class DownstreamEvaluator:
         print("DEBUG: extract_embeddings")
         print("=" * 60)
 
-        # All original debug prints maintained
         print("DEBUG 1: Dataset Configuration")
         print(f"  - Dataset type: {type(dataset).__name__}")
         print(f"  - Dataset return_labels: {dataset.return_labels}")
@@ -307,20 +353,25 @@ class DownstreamEvaluator:
                 else:
                     print(f"    [{i}] Type: {type(item).__name__}")
 
-        # Optimize batch size
+        # Get batch size from config or use device optimal
         if batch_size is None:
-            batch_size = self.device_manager.get_optimal_batch_size(dataset.modality)
-            print(f"Using auto-selected batch size: {batch_size}")
+            eval_config = self.config.get_evaluation_config()
+            batch_size = eval_config.get('batch_size', None)
+            if batch_size is None:
+                batch_size = self.device_manager.get_optimal_batch_size(dataset.modality)
+            print(f"Using batch size: {batch_size}")
 
-        # OPTIMIZATION: Better DataLoader settings
+        # DataLoader settings from config
+        num_workers = self.config.get('evaluation.num_workers', self.device_manager.get_num_workers())
+        
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=self.device_manager.get_num_workers(),
+            num_workers=num_workers,
             pin_memory=self.device_manager.is_cuda,
-            prefetch_factor=2 if self.device_manager.get_num_workers() > 0 else None,
-            persistent_workers=self.device_manager.get_num_workers() > 0
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0
         )
 
         all_embeddings = []
@@ -338,7 +389,7 @@ class DownstreamEvaluator:
         for batch_idx, batch in enumerate(tqdm(loader)):
             batch_count += 1
 
-            # First batch debug (unchanged)
+            # First batch debug
             if batch_idx == 0:
                 print(f"\nDEBUG 4: First batch structure")
                 print(f"  - Batch contains {len(batch)} elements")
@@ -372,7 +423,7 @@ class DownstreamEvaluator:
                 if batch_idx == 0:
                     print(f"  - Got 2 elements (no pid, no labels)")
 
-            # OPTIMIZATION: Non-blocking transfer
+            # Non-blocking transfer
             if self.device_manager.is_cuda:
                 seg1 = seg1.to(self.device, non_blocking=True)
             else:
@@ -382,7 +433,7 @@ class DownstreamEvaluator:
             embeddings = self.encoder(seg1)
             all_embeddings.append(embeddings.cpu().numpy())
 
-            # Handle participant IDs (unchanged)
+            # Handle participant IDs
             if pid is not None:
                 if torch.is_tensor(pid):
                     pid_list = pid.tolist() if pid.dim() > 0 else [pid.item()]
@@ -397,7 +448,7 @@ class DownstreamEvaluator:
                 if batch_idx == 0:
                     print(f"  - PIDs in first batch: {pid_list[:min(3, len(pid_list))]}")
 
-            # Collect labels (unchanged but optimized)
+            # Collect labels
             if labels:
                 if batch_idx == 0:
                     print(f"  - Labels type: {type(labels)}")
@@ -437,11 +488,11 @@ class DownstreamEvaluator:
                 if batch_idx == 0 and batch_labels:
                     print(f"  - First sample labels: {batch_labels[0]}")
 
-            # OPTIMIZATION: Periodic memory cleanup
-            if self.device_manager.is_cuda and batch_idx % 50 == 0:
+            # Periodic memory cleanup
+            cache_clean_freq = self.config.get('evaluation.cache_clean_frequency', 50)
+            if self.device_manager.is_cuda and batch_idx % cache_clean_freq == 0:
                 self.device_manager.empty_cache()
 
-        # All original debug prints maintained
         print(f"\nDEBUG 5: Batch processing complete")
         print(f"  - Processed {batch_count} batches")
         print(f"  - Total embeddings: {len(all_embeddings)}")
@@ -481,7 +532,7 @@ class DownstreamEvaluator:
             print(f"  - After: {len(embeddings)} embeddings, {len(all_labels)} labels")
             print(f"  - Unique participants: {len(np.unique(all_participant_ids))}")
 
-        # OPTIMIZATION: Cache the results
+        # Cache the results
         result = (embeddings, all_labels, np.array(all_participant_ids))
 
         # Store in memory cache
@@ -503,25 +554,21 @@ class DownstreamEvaluator:
             labels: List[Dict],
             participant_ids: List
     ) -> Tuple[np.ndarray, List[Dict], np.ndarray]:
-        """Aggregate embeddings by participant - OPTIMIZED."""
+        """Aggregate embeddings by participant."""
         unique_pids = np.unique(participant_ids)
 
-        # OPTIMIZATION: Pre-allocate arrays
         aggregated_embeddings = np.zeros((len(unique_pids), embeddings.shape[1]),
                                          dtype=np.float32)
         aggregated_labels = []
 
         print(f"  Aggregating {len(unique_pids)} unique participants")
 
-        # OPTIMIZATION: Vectorized operations where possible
         pids_array = np.array(participant_ids)
 
         for i, pid in enumerate(unique_pids):
             mask = pids_array == pid
-            # Vectorized mean
             aggregated_embeddings[i] = embeddings[mask].mean(axis=0)
 
-            # Take first label
             if labels:
                 pid_indices = np.where(mask)[0]
                 if len(pid_indices) > 0:
@@ -533,11 +580,10 @@ class DownstreamEvaluator:
             self,
             task_name: str,
             dataset: BUTPPGDataset,
-            n_splits: int = 5
+            n_splits: Optional[int] = None
     ) -> Dict:
         """
-        Evaluate a specific task - OPTIMIZED.
-        Maintains all original functionality and debug prints.
+        Evaluate a specific task.
         """
         print(f"\n{'=' * 60}")
         print(f"DEBUG: evaluate_task for {task_name}")
@@ -555,7 +601,11 @@ class DownstreamEvaluator:
         if 'threshold' in task_info:
             print(f"  - Threshold: {task_info['threshold']}")
 
-        # OPTIMIZATION: Reuse embeddings if same dataset
+        # Get n_splits from config
+        if n_splits is None:
+            eval_config = self.config.get_evaluation_config()
+            n_splits = eval_config.get('cv_folds', 5)
+
         print(f"\nDEBUG 2: Starting extraction for {task_name}...")
         embeddings, labels_list, participant_ids = self.extract_embeddings(
             dataset, aggregate_by_participant=True
@@ -570,7 +620,7 @@ class DownstreamEvaluator:
             print(f"ERROR: No labels extracted!")
             return {}
 
-        # Prepare labels (unchanged logic)
+        # Prepare labels
         label_key = task_info['label_key']
         print(f"\nDEBUG 4: Processing labels for key '{label_key}'")
 
@@ -647,17 +697,19 @@ class DownstreamEvaluator:
         else:
             return self._evaluate_regression(X, y, n_splits)
 
-    # All other methods remain UNCHANGED from original
     def _evaluate_classification(self, X, y, n_splits=5):
-        """Original classification evaluation - UNCHANGED."""
-        # [Original implementation exactly as provided]
+        """Classification evaluation."""
         unique, counts = np.unique(y, return_counts=True)
         min_class_samples = np.min(counts)
         total_samples = len(y)
 
         print(f"  Total samples: {total_samples}, Min class size: {min_class_samples}")
 
-        if total_samples < 10 or min_class_samples < 2:
+        # Get min samples threshold from config
+        min_samples_for_cv = self.config.get('evaluation.min_samples_for_cv', 10)
+        min_samples_per_class = self.config.get('evaluation.min_samples_per_class', 2)
+
+        if total_samples < min_samples_for_cv or min_class_samples < min_samples_per_class:
             print("  ⚠️ Very small dataset. Using leave-one-out cross-validation.")
             loo = LeaveOneOut()
 
@@ -707,7 +759,7 @@ class DownstreamEvaluator:
             print(f"  ⚠️ Adjusting CV folds from {n_splits} to {adjusted_splits} based on class sizes.")
             n_splits = adjusted_splits
 
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.config.seed)
 
         aucs = []
         paucs = []
@@ -759,6 +811,101 @@ class DownstreamEvaluator:
             'cv_type': f'stratified-{n_splits}-fold',
             'n_samples': total_samples
         }
+
+    def _evaluate_regression(self, X, y, n_splits=5):
+        """Regression evaluation."""
+        total_samples = len(y)
+        print(f"  Total samples: {total_samples}")
+
+        # Get min samples threshold from config
+        min_samples_for_cv = self.config.get('evaluation.min_samples_for_cv', 10)
+
+        if total_samples < min_samples_for_cv:
+            print("  ⚠️ Very small dataset. Using leave-one-out cross-validation.")
+            loo = LeaveOneOut()
+
+            predictions = []
+            actuals = []
+
+            for train_idx, test_idx in loo.split(X):
+                X_train, X_test = X[train_idx], X[test_idx]
+                y_train, y_test = y[train_idx], y[test_idx]
+
+                probe = LinearProbe(task_type='regression')
+                probe.fit(X_train, y_train)
+
+                y_pred = probe.predict(X_test)
+                predictions.append(y_pred[0])
+                actuals.append(y_test[0])
+
+            predictions = np.array(predictions)
+            actuals = np.array(actuals)
+
+            mae = mean_absolute_error(actuals, predictions)
+            rmse = np.sqrt(mean_squared_error(actuals, predictions))
+            r2 = r2_score(actuals, predictions) if len(actuals) > 1 else 0.0
+
+            return {
+                'mae': mae,
+                'mae_std': 0.0,
+                'rmse': rmse,
+                'rmse_std': 0.0,
+                'r2': r2,
+                'r2_std': 0.0,
+                'cv_type': 'leave-one-out',
+                'n_samples': total_samples
+            }
+
+        elif total_samples < n_splits * 2:
+            adjusted_splits = max(2, total_samples // 2)
+            print(f"  ⚠️ Adjusting CV folds from {n_splits} to {adjusted_splits} based on sample size.")
+            n_splits = adjusted_splits
+
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.config.seed)
+
+        maes = []
+        rmses = []
+        r2s = []
+
+        for fold, (train_idx, test_idx) in enumerate(kf.split(X)):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+
+            probe = LinearProbe(task_type='regression')
+            probe.fit(X_train, y_train)
+
+            y_pred = probe.predict(X_test)
+
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            r2 = r2_score(y_test, y_pred)
+
+            maes.append(mae)
+            rmses.append(rmse)
+            r2s.append(r2)
+
+        return {
+            'mae': np.mean(maes),
+            'mae_std': np.std(maes),
+            'rmse': np.mean(rmses),
+            'rmse_std': np.std(rmses),
+            'r2': np.mean(r2s),
+            'r2_std': np.std(r2s),
+            'cv_type': f'{n_splits}-fold',
+            'n_samples': total_samples
+        }
+
+    def _calculate_partial_auc(self, fpr, tpr, max_fpr=0.1):
+        """Calculate partial AUC."""
+        idx = np.where(fpr <= max_fpr)[0]
+
+        if len(idx) < 2:
+            return 0.0
+
+        partial_auc_value = auc(fpr[idx], tpr[idx])
+        normalized_pauc = partial_auc_value / max_fpr
+
+        return normalized_pauc
 
     def _evaluate_task_leave_one_out(self, task_name: str, dataset: BUTPPGDataset) -> Dict:
         """
@@ -878,97 +1025,6 @@ class DownstreamEvaluator:
                 'cv_type': 'leave-one-out',
                 'n_samples': len(actuals)
             }
-    def _evaluate_regression(self, X, y, n_splits=5):
-        """Original regression evaluation - UNCHANGED."""
-        total_samples = len(y)
-        print(f"  Total samples: {total_samples}")
-
-        if total_samples < 10:
-            print("  ⚠️ Very small dataset. Using leave-one-out cross-validation.")
-            loo = LeaveOneOut()
-
-            predictions = []
-            actuals = []
-
-            for train_idx, test_idx in loo.split(X):
-                X_train, X_test = X[train_idx], X[test_idx]
-                y_train, y_test = y[train_idx], y[test_idx]
-
-                probe = LinearProbe(task_type='regression')
-                probe.fit(X_train, y_train)
-
-                y_pred = probe.predict(X_test)
-                predictions.append(y_pred[0])
-                actuals.append(y_test[0])
-
-            predictions = np.array(predictions)
-            actuals = np.array(actuals)
-
-            mae = mean_absolute_error(actuals, predictions)
-            rmse = np.sqrt(mean_squared_error(actuals, predictions))
-            r2 = r2_score(actuals, predictions) if len(actuals) > 1 else 0.0
-
-            return {
-                'mae': mae,
-                'mae_std': 0.0,
-                'rmse': rmse,
-                'rmse_std': 0.0,
-                'r2': r2,
-                'r2_std': 0.0,
-                'cv_type': 'leave-one-out',
-                'n_samples': total_samples
-            }
-
-        elif total_samples < n_splits * 2:
-            adjusted_splits = max(2, total_samples // 2)
-            print(f"  ⚠️ Adjusting CV folds from {n_splits} to {adjusted_splits} based on sample size.")
-            n_splits = adjusted_splits
-
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-
-        maes = []
-        rmses = []
-        r2s = []
-
-        for fold, (train_idx, test_idx) in enumerate(kf.split(X)):
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-
-            probe = LinearProbe(task_type='regression')
-            probe.fit(X_train, y_train)
-
-            y_pred = probe.predict(X_test)
-
-            mae = mean_absolute_error(y_test, y_pred)
-            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-            r2 = r2_score(y_test, y_pred)
-
-            maes.append(mae)
-            rmses.append(rmse)
-            r2s.append(r2)
-
-        return {
-            'mae': np.mean(maes),
-            'mae_std': np.std(maes),
-            'rmse': np.mean(rmses),
-            'rmse_std': np.std(rmses),
-            'r2': np.mean(r2s),
-            'r2_std': np.std(r2s),
-            'cv_type': f'{n_splits}-fold',
-            'n_samples': total_samples
-        }
-
-    def _calculate_partial_auc(self, fpr, tpr, max_fpr=0.1):
-        """Calculate partial AUC - UNCHANGED."""
-        idx = np.where(fpr <= max_fpr)[0]
-
-        if len(idx) < 2:
-            return 0.0
-
-        partial_auc_value = auc(fpr[idx], tpr[idx])
-        normalized_pauc = partial_auc_value / max_fpr
-
-        return normalized_pauc
 
     def evaluate_all_tasks(
             self,
@@ -977,11 +1033,6 @@ class DownstreamEvaluator:
     ) -> pd.DataFrame:
         """
         Evaluate all tasks using specified evaluation methods.
-
-        Args:
-            dataset: Dataset to evaluate
-            save_path: Path to save results
-            evaluation_modes: List of modes ['standard', 'leave_one_out'] or None for auto
         """
         all_results = []
 
@@ -990,9 +1041,15 @@ class DownstreamEvaluator:
 
         # Determine which evaluation methods to use
         n_participants = len(dataset.participant_records)
-
-
-        evaluation_modes = ['standard', 'leave_one_out']  # Both for larger
+        
+        # Get evaluation modes from config
+        eval_config = self.config.get_evaluation_config()
+        min_participants_for_standard = eval_config.get('min_participants_for_standard', 20)
+        
+        if n_participants < min_participants_for_standard:
+            evaluation_modes = ['leave_one_out']
+        else:
+            evaluation_modes = ['standard', 'leave_one_out']
 
         print(f"Dataset has {n_participants} participants")
         print(f"Running evaluation modes: {evaluation_modes}")
@@ -1024,7 +1081,7 @@ class DownstreamEvaluator:
                         result = {
                             'task': task_name,
                             'type': self.tasks[task_name]['type'],
-                            'eval_method': eval_mode,  # Track which method
+                            'eval_method': eval_mode,
                             **metrics
                         }
                         mode_results.append(result)
@@ -1113,6 +1170,7 @@ class DownstreamEvaluator:
                         print(f"MAE={row.get('mae', 0):.3f}, "
                               f"R2={row.get('r2', 0):.3f}")
 
+
 # ============= TEST FUNCTIONS =============
 
 def test_evaluation():
@@ -1123,19 +1181,21 @@ def test_evaluation():
 
     # Get device from global device manager
     device_manager = get_device_manager()
+    config = get_config()
+    
     print(f"Testing on device: {device_manager.type}")
 
     # Test with very small dataset
     print("\n1. Testing with very small dataset (5 samples):")
 
     # Create tiny dummy data
-    X_tiny = np.random.randn(5, 128)
+    X_tiny = np.random.randn(5, config.get('model.embedding_dim', 128))
     y_tiny_class = np.array([0, 0, 1, 1, 1])  # 2 class 0, 3 class 1
     y_tiny_reg = np.random.randn(5)
 
     # Create evaluator
     from model import EfficientNet1D
-    encoder = EfficientNet1D(in_channels=1, embedding_dim=256)
+    encoder = EfficientNet1D(in_channels=1, embedding_dim=config.get('model.embedding_dim', 256))
     encoder_path = Path('data/outputs/test_encoder.pt')
     encoder_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(encoder.state_dict(), encoder_path)
@@ -1162,7 +1222,7 @@ def test_evaluation():
     # Test with medium dataset
     print("\n2. Testing with medium dataset (20 samples):")
 
-    X_medium = np.random.randn(20, 128)
+    X_medium = np.random.randn(20, config.get('model.embedding_dim', 128))
     y_medium_class = np.random.randint(0, 2, 20)
 
     metrics_medium = evaluator._evaluate_classification(X_medium, y_medium_class, n_splits=5)
@@ -1187,17 +1247,19 @@ def test_label_extraction():
 
     from data import BUTPPGDataset
     from torch.utils.data import DataLoader
+    
+    config = get_config()
 
     # Create a test dataset
     print("\n1. Creating test dataset...")
     dataset = BUTPPGDataset(
-        data_dir="data/but_ppg/dataset",
+        data_dir=config.data_dir,
         modality='ppg',
         split='test',
         return_labels=True,
         return_participant_id=True,
         use_cache=False,
-        downsample = True
+        downsample=True
     )
 
     print(f"   Dataset created with {len(dataset)} samples")
@@ -1228,10 +1290,12 @@ def test_label_extraction():
 
     # Test DataLoader behavior
     print("\n3. Testing DataLoader behavior...")
-    loader = DataLoader(dataset, batch_size=4, shuffle=False)
+    
+    batch_size = config.get('evaluation.batch_size', 4)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     for i, batch in enumerate(loader):
-        if i == 0:  # First batch onlyå
+        if i == 0:  # First batch only
             print(f"   Batch has {len(batch)} elements")
 
             if len(batch) == 4:
