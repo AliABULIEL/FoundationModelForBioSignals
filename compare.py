@@ -1,6 +1,8 @@
+# biosignal/compare.py
 """
 Module to compare our results with Apple paper benchmarks
 Generates comprehensive comparison reports with performance optimizations
+Uses centralized configuration management
 """
 
 import pandas as pd
@@ -9,12 +11,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import json
-import yaml
 from typing import Dict, List, Optional, Union, Tuple, Any
 from datetime import datetime
 from functools import lru_cache, cached_property
 import warnings
 import logging
+
+from config_loader import get_config  # Added ConfigLoader
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING)
@@ -27,27 +30,6 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 class ResultsComparator:
     """Compare experimental results with paper benchmarks - Optimized version."""
 
-    # Class-level constants to avoid repeated initialization
-    _PAPER_BENCHMARKS = {
-        'ppg': {
-            'age_classification': {'auc': 0.976, 'pauc': 0.907},
-            'age_regression': {'mae': 3.19},
-            'bmi_classification': {'auc': 0.918, 'pauc': 0.750},
-            'bmi_regression': {'mae': 2.54},
-            'sex_classification': {'auc': 0.993, 'pauc': 0.967}
-        },
-        'ecg': {
-            'age_classification': {'auc': 0.916, 'pauc': 0.763},
-            'age_regression': {'mae': 6.33},
-            'bmi_classification': {'auc': 0.797, 'pauc': 0.612},
-            'bmi_regression': {'mae': 3.72},
-            'sex_classification': {'auc': 0.951, 'pauc': 0.841}
-        }
-    }
-
-    _HIGHER_BETTER_METRICS = frozenset({'auc', 'pauc', 'r2', 'accuracy', 'f1'})
-    _LOWER_BETTER_METRICS = frozenset({'mae', 'rmse', 'mse'})
-
     def __init__(self, config_path: str = 'configs/config.yaml'):
         """
         Initialize comparator with optimizations.
@@ -55,12 +37,44 @@ class ResultsComparator:
         Args:
             config_path: Path to configuration file
         """
-        # Cache config loading
-        self.config_path = config_path
-        self._config = None
+        # Load configuration
+        self.config = get_config()
 
-        # Use class-level benchmarks to avoid recreation
-        self.paper_benchmarks = self._PAPER_BENCHMARKS.copy()
+        # Load paper benchmarks from config
+        self.paper_benchmarks = self.config.get_section('paper_benchmarks')
+
+        # If no benchmarks in config, use defaults
+        if not self.paper_benchmarks:
+            logger.warning("No paper benchmarks found in config, using defaults")
+            self.paper_benchmarks = {
+                'ppg': {
+                    'age_classification': {'auc': 0.976, 'pauc': 0.907},
+                    'age_regression': {'mae': 3.19},
+                    'bmi_classification': {'auc': 0.918, 'pauc': 0.750},
+                    'bmi_regression': {'mae': 2.54},
+                    'sex_classification': {'auc': 0.993, 'pauc': 0.967}
+                },
+                'ecg': {
+                    'age_classification': {'auc': 0.916, 'pauc': 0.763},
+                    'age_regression': {'mae': 6.33},
+                    'bmi_classification': {'auc': 0.797, 'pauc': 0.612},
+                    'bmi_regression': {'mae': 3.72},
+                    'sex_classification': {'auc': 0.951, 'pauc': 0.841}
+                }
+            }
+        else:
+            # Convert flat config structure to nested if needed
+            self.paper_benchmarks = self._restructure_benchmarks(self.paper_benchmarks)
+
+        # Get metric categories from config
+        self._HIGHER_BETTER_METRICS = frozenset(
+            self.config.get('comparison.higher_better_metrics',
+                          ['auc', 'pauc', 'r2', 'accuracy', 'f1'])
+        )
+        self._LOWER_BETTER_METRICS = frozenset(
+            self.config.get('comparison.lower_better_metrics',
+                          ['mae', 'rmse', 'mse'])
+        )
 
         # Initialize results storage with pre-allocated space
         self.our_results = {}
@@ -69,27 +83,37 @@ class ResultsComparator:
         # Cache for expensive computations
         self._comparison_cache = {}
 
-        # Load config lazily when needed
-        if Path(config_path).exists():
-            self._load_config()
+    def _restructure_benchmarks(self, benchmarks: Dict) -> Dict:
+        """Restructure flat benchmark config to nested structure."""
+        restructured = {}
 
-    def _load_config(self):
-        """Lazy load configuration when needed."""
-        if self._config is None:
-            try:
-                with open(self.config_path, 'r') as f:
-                    self._config = yaml.safe_load(f)
-            except FileNotFoundError:
-                logger.warning(f"Config file not found: {self.config_path}")
-                self._config = {}
-        return self._config
+        for modality in ['ppg', 'ecg', 'acc']:
+            if modality in benchmarks:
+                modality_benchmarks = benchmarks[modality]
 
-    @property
-    def config(self):
-        """Lazy property for config access - maintains backward compatibility."""
-        if self._config is None:
-            self._load_config()
-        return self._config
+                # If it's already properly structured, use it
+                if isinstance(modality_benchmarks, dict):
+                    # Check if it needs restructuring (flat structure)
+                    if 'age_classification_auc' in modality_benchmarks:
+                        # Restructure flat format
+                        restructured[modality] = {}
+
+                        # Parse flat keys like 'age_classification_auc'
+                        for key, value in modality_benchmarks.items():
+                            parts = key.rsplit('_', 1)
+                            if len(parts) == 2:
+                                task_name = parts[0]
+                                metric_name = parts[1]
+
+                                if task_name not in restructured[modality]:
+                                    restructured[modality][task_name] = {}
+
+                                restructured[modality][task_name][metric_name] = value
+                    else:
+                        # Already nested properly
+                        restructured[modality] = modality_benchmarks
+
+        return restructured if restructured else benchmarks
 
     def load_results(
             self,
@@ -253,7 +277,7 @@ class ResultsComparator:
 
     def generate_report(
             self,
-            save_dir: str = 'data/outputs/comparisons'
+            save_dir: Optional[str] = None
     ) -> Dict:
         """
         Generate comprehensive comparison report with optimized I/O.
@@ -264,13 +288,21 @@ class ResultsComparator:
         Returns:
             Dictionary with comparison statistics
         """
+        # Get save directory from config if not provided
+        if save_dir is None:
+            save_dir = self.config.get('comparison.output_dir', 'data/outputs/comparisons')
+
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         report = {
             'timestamp': datetime.now().isoformat(),
             'modalities': list(self.our_results.keys()),
-            'comparisons': {}
+            'comparisons': {},
+            'config': {
+                'dataset': self.config.dataset_name,
+                'seed': self.config.seed
+            }
         }
 
         # Pre-allocate list for DataFrames
@@ -318,8 +350,11 @@ class ResultsComparator:
         """
         summary = {}
 
+        # Get metric types from config
+        metric_types = self.config.get('comparison.summary_metrics', ['auc', 'mae', 'pauc'])
+
         # Use numpy for faster computation
-        for metric_type in ['auc', 'mae', 'pauc']:
+        for metric_type in metric_types:
             our_col = f'our_{metric_type}'
             paper_col = f'paper_{metric_type}'
 
@@ -349,7 +384,7 @@ class ResultsComparator:
     def plot_comparison(
             self,
             save_path: Optional[str] = None,
-            figsize: tuple = (12, 8)
+            figsize: Optional[tuple] = None
     ):
         """
         Create optimized visualization comparing results.
@@ -362,9 +397,18 @@ class ResultsComparator:
             print("No comparison data to plot")
             return
 
+        # Get plot settings from config
+        plot_config = self.config.get_nested('comparison', 'plot_settings', default={})
+        if figsize is None:
+            figsize = tuple(plot_config.get('figsize', [12, 8]))
+
+        plot_style = plot_config.get('style', 'whitegrid')
+        font_size = plot_config.get('font_size', 10)
+        dpi = plot_config.get('dpi', 150)
+
         # Set style once
-        sns.set_style("whitegrid")
-        plt.rcParams.update({'font.size': 10, 'figure.max_open_warning': 0})
+        sns.set_style(plot_style)
+        plt.rcParams.update({'font.size': font_size, 'figure.max_open_warning': 0})
 
         # Create figure with constrained layout for better performance
         fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
@@ -391,7 +435,7 @@ class ResultsComparator:
 
         # Save if requested
         if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight',
+            plt.savefig(save_path, dpi=dpi, bbox_inches='tight',
                         facecolor='white', edgecolor='none')
             print(f"Comparison plot saved to {save_path}")
 
@@ -418,11 +462,14 @@ class ResultsComparator:
 
             sns.barplot(data=auc_melted, x='Task', y='AUC', hue='Source', ax=ax)
             ax.set_title('AUC Comparison (Classification)')
+
+            # Get AUC threshold from config
+            auc_threshold = self.config.get('comparison.auc_threshold', 0.9)
             ax.set_ylim([0.5, 1.0])
             ax.set_ylabel('AUC')
             ax.set_xlabel('')
             ax.legend(title='')
-            ax.axhline(y=0.9, color='r', linestyle='--', alpha=0.3)
+            ax.axhline(y=auc_threshold, color='r', linestyle='--', alpha=0.3)
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
     def _plot_mae_comparison(self, ax, df):
@@ -516,11 +563,11 @@ class ResultsComparator:
 
             summary_lines.append("")
 
-        # Add dataset info
+        # Add dataset info from config
         summary_lines.extend([
-            "Dataset: BUT PPG",
-            "Model: EfficientNet1D",
-            "SSL: RegularizedInfoNCE + KoLeo"
+            f"Dataset: {self.config.dataset_name}",
+            f"Model: {self.config.get('model.name', 'EfficientNet1D')}",
+            f"SSL: {self.config.get('comparison.ssl_method', 'RegularizedInfoNCE + KoLeo')}"
         ])
 
         ax.text(0.1, 0.5, '\n'.join(summary_lines),
@@ -579,7 +626,10 @@ def test_comparison():
     print("Testing Optimized Comparison Module")
     print("=" * 50)
 
-    # Create comparator using original class name
+    # Load config
+    config = get_config()
+
+    # Create comparator
     comparator = ResultsComparator()
     print("✓ Comparator initialized")
 
@@ -702,6 +752,13 @@ def test_comparison():
     print(f"   Average comparison time: {elapsed / 10:.4f} seconds")
     print("   ✓ Performance test passed!")
 
+    # Test with config benchmarks
+    print("\n8. Testing with config benchmarks:")
+    config_benchmarks = config.get_paper_benchmarks('ppg')
+    if config_benchmarks:
+        print(f"   Loaded {len(config_benchmarks)} benchmarks from config")
+        print("   ✓ Config benchmark test passed!")
+
     # Clean up
     import shutil
     if report_dir.exists():
@@ -710,6 +767,7 @@ def test_comparison():
     print("\n" + "=" * 50)
     print("All optimized comparison tests passed successfully!")
     print("Backward compatibility maintained!")
+    print("Configuration integration complete!")
     print("=" * 50)
 
 
