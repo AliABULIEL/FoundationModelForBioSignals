@@ -287,7 +287,7 @@ class VitalDBDataset(BaseSignalDataset):
             signal = self.vitaldb.load_case(case_id, [self.track_name])
 
             if signal is None or not isinstance(signal, np.ndarray):
-                zero_seg = torch.zeros(1, self.segment_length, dtype=np.float32)
+                zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
                 return zero_seg, zero_seg
 
             # Handle 2D array
@@ -299,7 +299,7 @@ class VitalDBDataset(BaseSignalDataset):
 
             if len(signal) < 2 * self.segment_length:
                 # Not enough data for two segments
-                zero_seg = torch.zeros(1, self.segment_length, dtype=np.float32)
+                zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
                 return zero_seg, zero_seg
 
             # Preprocess full signal
@@ -310,7 +310,7 @@ class VitalDBDataset(BaseSignalDataset):
                 np.save(cache_file, full_signal)
 
         if full_signal is None or full_signal.shape[1] < 2 * self.segment_length:
-            zero_seg = torch.zeros(1, self.segment_length, dtype=np.float32)
+            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             return zero_seg, zero_seg
 
         # Extract TWO DIFFERENT segments from SAME signal
