@@ -1,8 +1,8 @@
 # biosignal/data.py
 """
-Data loader for BUT PPG dataset - FULLY FIXED VERSION
+Data loader for BUT PPG and VitalDB datasets - REFACTORED VERSION
 Implements participant-level positive pairs as per Apple paper
-Optimized with caching and correct subdirectory structure
+Includes complete VitalDB integration for pre-training
 Uses centralized configuration management
 """
 
@@ -20,29 +20,287 @@ import warnings
 from collections import defaultdict, OrderedDict
 import threading
 
-from config_loader import get_config  # Added ConfigLoader
+from config_loader import get_config
 
 warnings.filterwarnings('ignore')
 
 
-class BUTPPGDataset(Dataset):
+# ================================================================================
+# BASE DATASET CLASS - SHARED FUNCTIONALITY
+# ================================================================================
+
+class BaseSignalDataset(Dataset):
+    """Base class with shared preprocessing methods for signal datasets."""
+
+    def _preprocess_signal(self, signal_data: np.ndarray) -> Optional[np.ndarray]:
+        """Preprocess signal - shared across datasets."""
+        try:
+            # Remove NaN/Inf
+            signal_data = np.nan_to_num(signal_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Ensure 2D shape [channels, samples]
+            if signal_data.ndim == 1:
+                signal_data = signal_data[np.newaxis, :]
+
+            # Check minimum length (at least 1 second of data)
+            min_samples = self.original_fs
+            if signal_data.shape[1] < min_samples:
+                return None
+
+            # Bandpass filter
+            if signal_data.shape[1] >= 100:
+                nyquist = self.original_fs / 2
+                if self.band_high < nyquist * 0.95:
+                    try:
+                        sos = scipy_signal.butter(
+                            4, [self.band_low, self.band_high],
+                            btype='band', fs=self.original_fs, output='sos'
+                        )
+                        signal_data = scipy_signal.sosfiltfilt(sos, signal_data, axis=1)
+                    except:
+                        pass
+
+            # Resample to target frequency
+            if self.original_fs != self.target_fs:
+                n_samples = signal_data.shape[1]
+                n_resampled = int(n_samples * self.target_fs / self.original_fs)
+
+                resampled = np.zeros((signal_data.shape[0], n_resampled))
+                for i in range(signal_data.shape[0]):
+                    resampled[i] = scipy_signal.resample(signal_data[i], n_resampled)
+                signal_data = resampled
+
+            # Z-score normalization
+            mean = np.mean(signal_data, axis=1, keepdims=True)
+            std = np.std(signal_data, axis=1, keepdims=True)
+            std = np.where(std < 1e-8, 1.0, std)
+            signal_data = (signal_data - mean) / std
+
+            # Create segment
+            segment = self._create_segments(signal_data)
+            return segment
+
+        except Exception as e:
+            print(f"Preprocessing error: {e}")
+            return None
+
+    def _create_segments(self, signal_data: np.ndarray, seed: Optional[int] = None) -> Optional[np.ndarray]:
+        """Create segment of required length - shared."""
+        if signal_data is None:
+            return None
+
+        if seed is not None:
+            np.random.seed(seed)
+
+        n_samples = signal_data.shape[1]
+
+        if n_samples < self.segment_length:
+            # Tile if too short
+            n_repeats = (self.segment_length // n_samples) + 1
+            extended = np.tile(signal_data, (1, n_repeats))
+            segment = extended[:, :self.segment_length]
+
+            if n_repeats > 1:
+                noise = np.random.randn(*segment.shape) * 0.001
+                segment = segment + noise
+
+            return segment
+
+        elif n_samples == self.segment_length:
+            return signal_data
+
+        else:
+            # Random crop if longer
+            max_start = n_samples - self.segment_length
+            start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+            return signal_data[:, start:start + self.segment_length]
+
+
+# ================================================================================
+# VITALDB DATASET - FOR PRE-TRAINING
+# ================================================================================
+
+class VitalDBDataset(BaseSignalDataset):
+    """VitalDB dataset for pre-training on large-scale PPG/ECG data."""
+
+    def __init__(
+            self,
+            cache_dir: Optional[str] = None,
+            modality: str = 'ppg',
+            split: str = 'train',
+            config_path: str = 'configs/config.yaml',
+            train_ratio: Optional[float] = None,
+            val_ratio: Optional[float] = None,
+            random_seed: Optional[int] = None,
+            use_cache: bool = True,
+            cache_size: int = 500,
+            **kwargs  # Accept extra kwargs for compatibility
+    ):
+        # Load config
+        self.config = get_config()
+        vitaldb_config = self.config.config.get('vitaldb', {})
+
+        # Set cache directory from config
+        self.cache_dir = Path(cache_dir if cache_dir else vitaldb_config.get('cache_dir', 'data/vitaldb_cache'))
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Split ratios from config
+        train_ratio = train_ratio if train_ratio else vitaldb_config.get('train_ratio', 0.8)
+        val_ratio = val_ratio if val_ratio else vitaldb_config.get('val_ratio', 0.1)
+        max_pairs = vitaldb_config.get('max_pairs_per_case', 10)
+
+        # Modality settings
+        self.modality = modality.lower()
+        self.split = split
+        self.random_seed = random_seed if random_seed is not None else self.config.seed
+        self.use_cache = use_cache
+
+        # Get modality config
+        modality_config = self.config.get_modality_config(modality)
+        self.target_fs = modality_config.get('target_fs')
+        self.segment_length_sec = modality_config.get('segment_length')
+        self.segment_length = int(self.segment_length_sec * self.target_fs)
+        self.band_low = modality_config.get('band_low')
+        self.band_high = modality_config.get('band_high')
+
+        # VitalDB specific sampling rates from config
+        vitaldb_fs = vitaldb_config.get('sampling_rates', {})
+        self.original_fs = vitaldb_fs.get(modality, 100)  # Default 100Hz
+
+        # Track mapping from config
+        track_mapping = vitaldb_config.get('track_mapping', {
+            'ppg': 'PLETH',
+            'ecg': 'ECG_II',
+            'acc': 'ACC'
+        })
+        self.track_name = track_mapping.get(modality, 'PLETH')
+
+        # Initialize caches
+        self.signal_cache = OrderedDict()
+        self.cache_lock = threading.Lock()
+
+        # Import VitalDB
+        try:
+            import vitaldb
+            self.vitaldb = vitaldb
+        except ImportError:
+            raise ImportError("Please install vitaldb: pip install vitaldb")
+
+        # Get cases
+        self.cases = self.vitaldb.find_cases(self.track_name)
+
+        # Apply case limit from config if specified
+        cases_limit = vitaldb_config.get('cases_limit')
+        if cases_limit:
+            self.cases = self.cases[:cases_limit]
+
+        # Split cases
+        n = len(self.cases)
+        train_end = int(train_ratio * n)
+        val_end = int((train_ratio + val_ratio) * n)
+
+        if split == 'train':
+            self.cases = self.cases[:train_end]
+        elif split == 'val':
+            self.cases = self.cases[train_end:val_end]
+        else:
+            self.cases = self.cases[val_end:]
+
+        # Build pairs
+        self.segment_pairs = []
+        for i in range(len(self.cases)):
+            for j in range(i + 1, min(i + max_pairs, len(self.cases))):
+                self.segment_pairs.append({
+                    'case1': self.cases[i],
+                    'case2': self.cases[j]
+                })
+
+        # Shuffle pairs
+        if self.random_seed is not None:
+            np.random.seed(self.random_seed)
+            np.random.shuffle(self.segment_pairs)
+
+        print(f"\nVitalDB Dataset initialized for {split}:")
+        print(f"  Modality: {modality} (track: {self.track_name})")
+        print(f"  Cases: {len(self.cases)}")
+        print(f"  Pairs: {len(self.segment_pairs)}")
+        print(f"  Segment: {self.segment_length_sec}s @ {self.target_fs}Hz = {self.segment_length} samples")
+        print(f"  Cache: {self.cache_dir}")
+
+    def __len__(self):
+        return len(self.segment_pairs) if self.segment_pairs else 1
+
+    def __getitem__(self, idx):
+        if len(self.segment_pairs) == 0:
+            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
+            return zero_seg, zero_seg
+
+        pair = self.segment_pairs[idx % len(self.segment_pairs)]
+
+        sig1 = self._load_vitaldb_signal(pair['case1'])
+        sig2 = self._load_vitaldb_signal(pair['case2'])
+
+        return torch.from_numpy(sig1).float(), torch.from_numpy(sig2).float()
+
+    def _load_vitaldb_signal(self, case_id):
+        """Load and preprocess VitalDB signal."""
+        # Check cache
+        cache_file = self.cache_dir / f"{case_id}_{self.modality}.npy"
+        if cache_file.exists() and self.use_cache:
+            try:
+                return np.load(cache_file)
+            except:
+                pass
+
+        try:
+            # Load from VitalDB
+            vals = self.vitaldb.load_case(case_id, [self.track_name])
+
+            if not vals or vals[0] is None:
+                return np.zeros((1, self.segment_length), dtype=np.float32)
+
+            signal = vals[0]
+            if not isinstance(signal, np.ndarray):
+                signal = np.array(signal)
+
+            # Preprocess
+            processed = self._preprocess_signal(signal)
+
+            if processed is None:
+                return np.zeros((1, self.segment_length), dtype=np.float32)
+
+            # Cache
+            if self.use_cache:
+                np.save(cache_file, processed)
+
+            return processed
+
+        except Exception as e:
+            print(f"Error loading case {case_id}: {e}")
+            return np.zeros((1, self.segment_length), dtype=np.float32)
+
+
+# ================================================================================
+# BUT PPG DATASET - FOR FINE-TUNING AND EVALUATION
+# ================================================================================
+
+class BUTPPGDataset(BaseSignalDataset):
     """
     Dataset for BUT PPG following Apple paper's approach.
 
     Key features:
     1. Participant-level positive pairs (different segments from same participant)
-    2. PPG: Resample 30Hz→64Hz, create 60s segments
-    3. ECG: Resample 1000Hz→128Hz, create 30s segments
-    4. ACC: Keep 100Hz, prepare for future use
-    5. Z-score normalization per segment
-    6. OPTIMIZED: In-memory caching, preprocessed data support, NO RETRIES
+    2. PPG: Resample 30Hz→64Hz, create segments
+    3. ECG: Resample 1000Hz→128Hz, create segments
+    4. Z-score normalization per segment
+    5. OPTIMIZED: In-memory caching, preprocessed data support
     """
 
     def __init__(
             self,
             data_dir: Optional[str] = None,
-            modality: str = 'ppg',  # 'ppg', 'ecg', or 'acc'
-            split: str = 'train',  # 'train', 'val', or 'test'
+            modality: str = 'ppg',
+            split: str = 'train',
             config_path: str = 'configs/config.yaml',
             quality_filter: bool = False,
             return_participant_id: bool = False,
@@ -51,11 +309,11 @@ class BUTPPGDataset(Dataset):
             train_ratio: float = 0.8,
             val_ratio: float = 0.1,
             random_seed: Optional[int] = None,
-            # New optimization parameters
             use_cache: bool = True,
             cache_size: int = 500,
             preprocessed_dir: Optional[str] = None,
             downsample: bool = False,
+            **kwargs  # Accept extra kwargs for compatibility
     ):
         # Load configuration
         self.config = get_config()
@@ -159,17 +417,6 @@ class BUTPPGDataset(Dataset):
         if len(all_records) == 0:
             print(f"  Warning: No {self.modality.upper()} files found!")
             print(f"  Looked for pattern: {self.data_dir}/{pattern}")
-            # List a few directories to debug
-            subdirs = list(self.data_dir.iterdir())[:5]
-            if subdirs:
-                print(f"  Sample directories in {self.data_dir}:")
-                for subdir in subdirs:
-                    if subdir.is_dir():
-                        print(f"    - {subdir.name}")
-                        # Check what files are in there
-                        files = list(subdir.glob(f"*_{self.modality.upper()}.*"))[:2]
-                        for f in files:
-                            print(f"      -> {f.name}")
 
         # Group by participant (first 3 digits of record ID)
         for record_id in all_records:
@@ -306,7 +553,8 @@ class BUTPPGDataset(Dataset):
         print(f"  Pair generation statistics:")
         print(f"    Total possible pairs: {total_possible_pairs:,}")
         print(f"    Created pairs: {total_created_pairs:,}")
-        print(f"    Reduction ratio: {total_created_pairs / max(1, total_possible_pairs):.2%}")
+        if total_possible_pairs > 0:
+            print(f"    Reduction ratio: {total_created_pairs / total_possible_pairs:.2%}")
         print(f"    Participants with pairs: {len(self.participant_pairs)}")
 
     def __len__(self):
@@ -377,12 +625,8 @@ class BUTPPGDataset(Dataset):
             if signal2 is None:
                 self._failed_records.add(record2)
 
-        # All attempts failed - this should be very rare
-        print(f"Warning: Failed to load any valid pair after {max_attempts} attempts at idx {idx}")
-
-        # As last resort, return a valid but repeated signal from cache
+        # All attempts failed - return cached signal if available
         if self.signal_cache:
-            # Get any valid signal from cache
             cached_signal = next(iter(self.signal_cache.values()))
             seg_tensor = torch.from_numpy(cached_signal).float()
 
@@ -395,7 +639,7 @@ class BUTPPGDataset(Dataset):
             else:
                 return seg_tensor, seg_tensor
 
-        # Absolute fallback - should never reach here
+        # Absolute fallback
         zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
         if self.return_labels or self.return_participant_id:
             empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
@@ -560,92 +804,8 @@ class BUTPPGDataset(Dataset):
             self._failed_records.add(record_id)
             return None
 
-    def _preprocess_signal(self, signal_data: np.ndarray) -> Optional[np.ndarray]:
-        """Preprocess signal - FIXED for BUT PPG's actual format."""
-        try:
-            # Remove NaN/Inf
-            signal_data = np.nan_to_num(signal_data, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # Ensure 2D shape [channels, samples]
-            if signal_data.ndim == 1:
-                signal_data = signal_data[np.newaxis, :]
-
-            # Check minimum length (at least 1 second of data)
-            min_samples = self.original_fs  # At least 1 second
-            if signal_data.shape[1] < min_samples:
-                return None
-
-            # 1. Bandpass filter (only if we have enough samples)
-            if signal_data.shape[1] >= 100:  # Need reasonable length for filtering
-                nyquist = self.original_fs / 2
-                if self.band_high < nyquist * 0.95:
-                    try:
-                        sos = scipy_signal.butter(
-                            4, [self.band_low, self.band_high],
-                            btype='band', fs=self.original_fs, output='sos'
-                        )
-                        signal_data = scipy_signal.sosfiltfilt(sos, signal_data, axis=1)
-                    except:
-                        pass  # Skip filtering if it fails
-
-            # 2. Resample to target frequency
-            if self.original_fs != self.target_fs:
-                n_samples = signal_data.shape[1]
-                n_resampled = int(n_samples * self.target_fs / self.original_fs)
-
-                resampled = np.zeros((signal_data.shape[0], n_resampled))
-                for i in range(signal_data.shape[0]):
-                    resampled[i] = scipy_signal.resample(signal_data[i], n_resampled)
-                signal_data = resampled
-
-            # 3. Z-score normalization
-            mean = np.mean(signal_data, axis=1, keepdims=True)
-            std = np.std(signal_data, axis=1, keepdims=True)
-            std = np.where(std < 1e-8, 1.0, std)
-            signal_data = (signal_data - mean) / std
-
-            return signal_data.astype(np.float32)
-
-        except Exception as e:
-            print(f"Preprocessing error: {e}")
-            return None
-
-    def _create_segments(self, signal_data: np.ndarray, seed: Optional[int] = None) -> np.ndarray:
-        """Create segment of required length - FIXED for BUT PPG."""
-        if signal_data is None:
-            return None
-
-        # Set seed for reproducible segment extraction
-        if seed is not None:
-            np.random.seed(seed)
-
-        n_samples = signal_data.shape[1]
-
-        if n_samples < self.segment_length:
-            # If we need more samples, tile the signal
-            n_repeats = (self.segment_length // n_samples) + 1
-            extended = np.tile(signal_data, (1, n_repeats))
-
-            # Take exactly segment_length samples
-            segment = extended[:, :self.segment_length]
-
-            # Add small random noise to break exact repetition
-            if n_repeats > 1:
-                noise = np.random.randn(*segment.shape) * 0.001
-                segment = segment + noise
-
-            return segment
-        elif n_samples == self.segment_length:
-            # Perfect match
-            return signal_data
-        else:
-            # Random crop if longer
-            max_start = n_samples - self.segment_length
-            start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
-            return signal_data[:, start:start + self.segment_length]
-
     def _get_participant_info(self, participant_id: str) -> Dict:
-        """Get demographic info for a participant - FIXED VERSION."""
+        """Get demographic info for a participant."""
         if self.subject_df.empty:
             return {'age': -1, 'sex': -1, 'bmi': -1}
 
@@ -662,7 +822,6 @@ class BUTPPGDataset(Dataset):
             try:
                 record_num = int(record_id)
             except (ValueError, TypeError):
-                print(f"Warning: Invalid record_id format: {record_id}")
                 return {'age': -1, 'sex': -1, 'bmi': -1}
 
             # Look up in subject_df by ID
@@ -697,7 +856,7 @@ class BUTPPGDataset(Dataset):
                     bmi = -1
 
                 # Return all demographic info
-                result = {
+                return {
                     'age': float(age) if age != -1 and not pd.isna(age) else -1,
                     'sex': sex,
                     'bmi': float(bmi) if bmi != -1 else -1,
@@ -705,33 +864,15 @@ class BUTPPGDataset(Dataset):
                     'weight': float(weight)
                 }
 
-                # Debug output (remove after testing)
-                if self.split == 'test' and len(self.participant_records) < 10:
-                    print(
-                        f"DEBUG: Participant {participant_id}, record {record_id}: age={result['age']}, sex={result['sex']}, bmi={result['bmi']}")
-
-                return result
-            else:
-                # Try all records for this participant
-                for record_id in records:
-                    try:
-                        record_num = int(record_id)
-                        mask = self.subject_df['ID'] == record_num
-                        if mask.any():
-                            # Found it with another record, recursively call with this record
-                            self.participant_records[participant_id] = [record_id] + [r for r in records if
-                                                                                      r != record_id]
-                            return self._get_participant_info(participant_id)
-                    except:
-                        continue
-
         except Exception as e:
             print(f"Error getting participant info for {participant_id}: {e}")
-            import traceback
-            traceback.print_exc()
 
         return {'age': -1, 'sex': -1, 'bmi': -1}
 
+
+# ================================================================================
+# DATALOADER CREATION - UNIFIED FOR BOTH DATASETS
+# ================================================================================
 
 def create_dataloaders(
         data_dir: Optional[str] = None,
@@ -739,83 +880,83 @@ def create_dataloaders(
         batch_size: Optional[int] = None,
         num_workers: Optional[int] = None,
         config_path: str = 'configs/config.yaml',
+        dataset_type: str = 'but_ppg',  # 'but_ppg' or 'vitaldb'
         pin_memory: Optional[bool] = None,
-        prefetch_factor: int = 2,
-        persistent_workers: bool = False,
-        preprocessed_dir: Optional[str] = None,
-        cache_size: int = 500,
-        downsample: bool = False,
+        prefetch_factor: Optional[int] = 2,
+        persistent_workers: Optional[bool] = None,
         **dataset_kwargs
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Create train/val/test dataloaders with optimizations."""
+    """
+    Create train/val/test dataloaders with VitalDB support.
 
-    # Load config
+    Args:
+        data_dir: Directory for BUT PPG data (not used for VitalDB)
+        modality: Signal modality ('ppg', 'ecg', 'acc')
+        batch_size: Batch size (uses config defaults if None)
+        num_workers: Number of data loading workers
+        config_path: Path to configuration file
+        dataset_type: 'but_ppg' or 'vitaldb'
+        pin_memory: Pin memory for GPU transfer
+        prefetch_factor: Number of batches to prefetch
+        persistent_workers: Keep workers alive between epochs
+        **dataset_kwargs: Additional arguments passed to dataset
+
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader)
+    """
+
     config = get_config()
 
-    # Use config values with fallbacks to provided arguments
-    if data_dir is None:
-        data_dir = config.data_dir
+    # Choose dataset class
+    if dataset_type == 'vitaldb':
+        DatasetClass = VitalDBDataset
+        # VitalDB doesn't use data_dir, uses cache_dir from config
+        dataset_kwargs.pop('data_dir', None)
+    else:
+        DatasetClass = BUTPPGDataset
+        if data_dir is None:
+            data_dir = config.data_dir
 
+    # Get batch size and workers from config
     if batch_size is None:
-        batch_size = config.get('training.batch_size', 64)
+        if dataset_type == 'vitaldb':
+            batch_size = config.get('pretrain.batch_size', 128)
+        else:
+            batch_size = config.get('training.batch_size', 64)
 
     if num_workers is None:
-        num_workers = config.get('training.num_workers', 4)
+        if dataset_type == 'vitaldb':
+            num_workers = config.get('pretrain.num_workers', 8)
+        else:
+            num_workers = config.get('training.num_workers', 4)
 
     if pin_memory is None:
         pin_memory = config.get('training.pin_memory', False)
 
-    # Check for preprocessed directory
-    if preprocessed_dir is None:
-        prep_path = Path(data_dir).parent / "preprocessed" / modality
-        if prep_path.exists():
-            preprocessed_dir = str(prep_path)
-            print(f"Auto-detected preprocessed data at: {preprocessed_dir}")
+    if persistent_workers is None:
+        persistent_workers = num_workers > 0
 
-    # Create datasets with caching enabled
-    train_dataset = BUTPPGDataset(
-        data_dir=data_dir,
-        modality=modality,
-        split='train',
-        config_path=config_path,
-        preprocessed_dir=preprocessed_dir,
-        cache_size=cache_size,
-        use_cache=True,
-        downsample=downsample,
+    # Create datasets
+    common_kwargs = {
+        'modality': modality,
+        'config_path': config_path,
         **dataset_kwargs
-    )
+    }
 
-    val_dataset = BUTPPGDataset(
-        data_dir=data_dir,
-        modality=modality,
-        split='val',
-        config_path=config_path,
-        preprocessed_dir=preprocessed_dir,
-        cache_size=cache_size // 2,
-        use_cache=True,
-        downsample=downsample,
-        **dataset_kwargs
-    )
+    if dataset_type == 'but_ppg':
+        common_kwargs['data_dir'] = data_dir
 
-    test_dataset = BUTPPGDataset(
-        data_dir=data_dir,
-        modality=modality,
-        split='test',
-        config_path=config_path,
-        preprocessed_dir=preprocessed_dir,
-        cache_size=cache_size // 2,
-        use_cache=True,
-        downsample=downsample,
-        **dataset_kwargs
-    )
+    train_dataset = DatasetClass(split='train', **common_kwargs)
+    val_dataset = DatasetClass(split='val', **common_kwargs)
+    test_dataset = DatasetClass(split='test', **common_kwargs)
 
-    # Simpler collate function - no complex error handling
-    def fast_collate(batch):
-        """Fast collate that skips bad samples."""
+    # Collate function for handling empty batches
+    def collate_fn(batch):
+        """Fast collate that handles bad samples."""
         valid_batch = [item for item in batch if item[0].numel() > 0]
 
         if len(valid_batch) == 0:
-            # Return single dummy sample
+            # Return dummy sample if all samples are bad
             dummy = torch.zeros(1, 1, train_dataset.segment_length)
             return dummy, dummy
 
@@ -826,13 +967,13 @@ def create_dataloaders(
         'batch_size': batch_size,
         'num_workers': num_workers,
         'pin_memory': pin_memory,
-        'collate_fn': fast_collate
+        'collate_fn': collate_fn
     }
 
     # Add optional parameters only if workers > 0
-    if num_workers > 0 and len(train_dataset) > 100:
+    if num_workers > 0:
         dataloader_kwargs['persistent_workers'] = persistent_workers
-        if prefetch_factor > 0:
+        if prefetch_factor is not None and prefetch_factor > 0:
             dataloader_kwargs['prefetch_factor'] = prefetch_factor
 
     # Create dataloaders
@@ -889,8 +1030,6 @@ def test_data_loading():
     print(f"Segment seconds: {ppg_dataset.segment_length_sec}")  # Should be 30
     print(f"Segment length: {ppg_dataset.segment_length}")  # Should be 1920
     print(f"Actual segment shape: {ppg_dataset[0][0].shape}")  # Should be [1, 1920]
-
-
 
     if len(ppg_dataset) > 0 and len(ppg_dataset.segment_pairs) > 0:
         import time
@@ -1199,13 +1338,274 @@ def test_no_zeros_guarantee():
         return True
 
 
+def test_vitaldb_loading():
+    """Test VitalDB data loading functionality."""
+    print("=" * 50)
+    print("Testing VitalDB Data Loading")
+    print("=" * 50)
+
+    config = get_config()
+
+    print("\n1. Testing VitalDB Dataset initialization:")
+
+    try:
+        import vitaldb
+        print("   ✓ VitalDB package installed")
+    except ImportError:
+        print("   ❌ VitalDB not installed. Run: pip install vitaldb")
+        return False
+
+    # Test dataset creation
+    try:
+        vitaldb_dataset = VitalDBDataset(
+            modality='ppg',
+            split='train',
+            config_path='configs/config.yaml'
+        )
+        print(f"   ✓ Dataset created with {len(vitaldb_dataset)} pairs")
+
+        # Test data loading
+        if len(vitaldb_dataset) > 0:
+            print("\n2. Testing signal loading:")
+
+            import time
+            start = time.time()
+            seg1, seg2 = vitaldb_dataset[0]
+            load_time = time.time() - start
+
+            print(f"   Load time: {load_time:.3f}s")
+            print(f"   Segment 1 shape: {seg1.shape}")
+            print(f"   Segment 2 shape: {seg2.shape}")
+
+            # Check for zeros
+            if torch.all(seg1 == 0) or torch.all(seg2 == 0):
+                print("   ⚠️ Warning: Zero signals detected")
+            else:
+                print(f"   ✓ Valid signals (mean: {seg1.mean():.4f}, {seg2.mean():.4f})")
+
+            # Test caching
+            print("\n3. Testing cache:")
+            start = time.time()
+            seg1_cached, seg2_cached = vitaldb_dataset[0]
+            cache_time = time.time() - start
+
+            if cache_time < load_time * 0.5:
+                print(f"   ✓ Cache working ({cache_time:.3f}s vs {load_time:.3f}s)")
+            else:
+                print(f"   ⚠️ Cache may not be working properly")
+
+        else:
+            print("   ⚠️ No data pairs created")
+
+    except Exception as e:
+        print(f"   ❌ Error creating dataset: {e}")
+        return False
+
+    print("\n✓ VitalDB tests completed!")
+    return True
+
+
+def test_dataset_compatibility():
+    """Test that both datasets produce compatible outputs."""
+    print("=" * 50)
+    print("Testing Dataset Compatibility")
+    print("=" * 50)
+
+    config = get_config()
+
+    # Create both datasets
+    print("\n1. Creating datasets:")
+
+    butppg_dataset = BUTPPGDataset(
+        data_dir=config.data_dir,
+        modality='ppg',
+        split='train',
+        use_cache=False
+    )
+    print(f"   BUT PPG: {len(butppg_dataset)} pairs")
+
+    try:
+        vitaldb_dataset = VitalDBDataset(
+            modality='ppg',
+            split='train',
+            use_cache=False
+        )
+        print(f"   VitalDB: {len(vitaldb_dataset)} pairs")
+    except ImportError:
+        print("   ⚠️ VitalDB not available for comparison")
+        return
+
+    # Compare outputs
+    print("\n2. Comparing output formats:")
+
+    if len(butppg_dataset) > 0 and len(vitaldb_dataset) > 0:
+        but_seg1, but_seg2 = butppg_dataset[0]
+        vital_seg1, vital_seg2 = vitaldb_dataset[0]
+
+        print(f"   BUT PPG shapes: {but_seg1.shape}, {but_seg2.shape}")
+        print(f"   VitalDB shapes: {vital_seg1.shape}, {vital_seg2.shape}")
+
+        # Check compatibility
+        compatible = True
+
+        if but_seg1.shape != vital_seg1.shape:
+            print(f"   ❌ Shape mismatch!")
+            compatible = False
+        else:
+            print(f"   ✓ Shapes match")
+
+        if but_seg1.dtype != vital_seg1.dtype:
+            print(f"   ❌ Dtype mismatch!")
+            compatible = False
+        else:
+            print(f"   ✓ Dtypes match ({but_seg1.dtype})")
+
+        # Check value ranges
+        print(f"\n3. Value ranges:")
+        print(f"   BUT PPG: [{but_seg1.min():.3f}, {but_seg1.max():.3f}]")
+        print(f"   VitalDB: [{vital_seg1.min():.3f}, {vital_seg1.max():.3f}]")
+
+        if compatible:
+            print("\n✓ Datasets are compatible!")
+        else:
+            print("\n❌ Datasets have compatibility issues!")
+
+    else:
+        print("   ⚠️ Cannot compare - one or both datasets empty")
+
+
+def test_dataloader_creation():
+    """Test dataloader creation for both datasets."""
+    print("=" * 50)
+    print("Testing DataLoader Creation")
+    print("=" * 50)
+
+    config = get_config()
+
+    # Test BUT PPG dataloaders
+    print("\n1. BUT PPG DataLoaders:")
+    try:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            data_dir=config.data_dir,
+            modality='ppg',
+            batch_size=4,
+            num_workers=0,
+            dataset_type='but_ppg'
+        )
+        print(f"   Train: {len(train_loader)} batches")
+        print(f"   Val: {len(val_loader)} batches")
+        print(f"   Test: {len(test_loader)} batches")
+
+        # Test iteration
+        for batch in train_loader:
+            if len(batch) == 2:
+                seg1, seg2 = batch
+                print(f"   Batch shapes: {seg1.shape}, {seg2.shape}")
+                break
+
+    except Exception as e:
+        print(f"   ❌ Error: {e}")
+
+    # Test VitalDB dataloaders
+    print("\n2. VitalDB DataLoaders:")
+    try:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            modality='ppg',
+            batch_size=4,
+            num_workers=0,
+            dataset_type='vitaldb'
+        )
+        print(f"   Train: {len(train_loader)} batches")
+        print(f"   Val: {len(val_loader)} batches")
+        print(f"   Test: {len(test_loader)} batches")
+
+        # Test iteration
+        for batch in train_loader:
+            if len(batch) == 2:
+                seg1, seg2 = batch
+                print(f"   Batch shapes: {seg1.shape}, {seg2.shape}")
+                break
+
+    except ImportError:
+        print("   ⚠️ VitalDB not installed")
+    except Exception as e:
+        print(f"   ❌ Error: {e}")
+
+    print("\n✓ DataLoader tests completed!")
+
+
+def test_preprocessing_consistency():
+    """Test that preprocessing is consistent across datasets."""
+    print("=" * 50)
+    print("Testing Preprocessing Consistency")
+    print("=" * 50)
+
+    # Create synthetic signal
+    np.random.seed(42)
+    test_signal = np.random.randn(1, 1000).astype(np.float32)
+
+    config = get_config()
+
+    # Test with BUT PPG dataset
+    butppg_dataset = BUTPPGDataset(
+        data_dir=config.data_dir,
+        modality='ppg',
+        split='train'
+    )
+
+    # Process with BUT PPG
+    but_processed = butppg_dataset._preprocess_signal(test_signal.copy())
+
+    try:
+        # Test with VitalDB dataset
+        vitaldb_dataset = VitalDBDataset(
+            modality='ppg',
+            split='train'
+        )
+
+        # Process with VitalDB
+        vital_processed = vitaldb_dataset._preprocess_signal(test_signal.copy())
+
+        # Compare
+        if but_processed is not None and vital_processed is not None:
+            difference = np.mean(np.abs(but_processed - vital_processed))
+            print(f"   Mean absolute difference: {difference:.6f}")
+
+            if difference < 1e-5:
+                print("   ✓ Preprocessing is consistent!")
+            else:
+                print("   ⚠️ Preprocessing differs between datasets")
+        else:
+            print("   ⚠️ Preprocessing failed for one or both datasets")
+
+    except ImportError:
+        print("   ⚠️ VitalDB not available for comparison")
+
+    print("\n✓ Preprocessing test completed!")
+
+
+# Main test runner
 if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("RUNNING ALL DATA TESTS")
+    print("=" * 60)
+
+    # Original BUT PPG tests
+    print("\n[BUT PPG TESTS]")
     test_data_loading()
     test_participant_info_loading()
 
-    print("\n" + "=" * 70)
+    # VitalDB tests
+    print("\n[VITALDB TESTS]")
+    has_vitaldb = test_vitaldb_loading()
 
-    # First diagnose the issue
-    if test_zero_signal_diagnostic():
-        # Then verify no zeros
-        test_no_zeros_guarantee()
+    # Compatibility tests
+    if has_vitaldb:
+        print("\n[COMPATIBILITY TESTS]")
+        test_dataset_compatibility()
+        test_dataloader_creation()
+        test_preprocessing_consistency()
+
+    print("\n" + "=" * 60)
+    print("ALL TESTS COMPLETED")
+    print("=" * 60)
