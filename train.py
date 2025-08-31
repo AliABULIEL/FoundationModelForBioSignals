@@ -502,7 +502,7 @@ class Trainer:
             num_epochs = self.training_config.get('num_epochs', 30)
 
         if early_stopping_patience is None:
-            early_stopping_patience = self.config.get('early_stopping_patience', 30)
+            self.early_stopping_patience = self.config.get('early_stopping_patience', 30)
 
         print(f"\nStarting training:")
         print(f"  Modality: {modality.upper()}")
@@ -511,7 +511,7 @@ class Trainer:
         print(f"  Batch size: {self.training_config.get('batch_size', 64)}")
         print(
             f"  Effective batch size: {self.training_config.get('batch_size', 64) * self.gradient_accumulation_steps}")
-        print(f"  Early stopping patience: {early_stopping_patience}")
+        print(f"  Early stopping patience: {self.early_stopping_patience}")
 
         # Show initial memory stats
         if self.device_manager.is_cuda:
@@ -606,8 +606,8 @@ class Trainer:
                 print(f"  New best model saved (val loss: {self.best_val_loss:.4f})")
             else:
                 patience_counter += 1
-                if patience_counter >= early_stopping_patience:
-                    print(f"\nEarly stopping triggered! No improvement for {early_stopping_patience} epochs.")
+                if patience_counter >= self.early_stopping_patience:
+                    print(f"\nEarly stopping triggered! No improvement for {self.early_stopping_patience} epochs.")
                     print(" we o")
                     # break
 
@@ -757,6 +757,8 @@ def test_training():
         experiment_name='test_run',
         device_manager=device_manager
     )
+
+    print(f" Early stopping  {Trainer.early_stopping_patience} ")
     print("   ✓ Trainer initialized with device manager")
 
     # Test setup for different modalities
