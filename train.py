@@ -609,8 +609,8 @@ class Trainer:
                 patience_counter += 1
                 if patience_counter >= self.early_stopping_patience:
                     print(f"\nEarly stopping triggered! No improvement for {self.early_stopping_patience} epochs.")
-                    print(" we o")
-                    # break
+                    #
+                    break
 
             # Save training history
             self.save_history()
