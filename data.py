@@ -884,6 +884,13 @@ def test_data_loading():
         use_cache=True,
         cache_size=10
     )
+    print(f"Modality: {ppg_dataset.modality}")
+    print(f"Target FS: {ppg_dataset.target_fs}")  # Should be 64 for PPG
+    print(f"Segment seconds: {ppg_dataset.segment_length_sec}")  # Should be 30
+    print(f"Segment length: {ppg_dataset.segment_length}")  # Should be 1920
+    print(f"Actual segment shape: {ppg_dataset[0][0].shape}")  # Should be [1, 1920]
+
+
 
     if len(ppg_dataset) > 0 and len(ppg_dataset.segment_pairs) > 0:
         import time

@@ -15,14 +15,14 @@ dataset:
   ppg:
     original_fs: 30      # Hz (actual from BUT PPG)
     target_fs: 64        # Hz (can keep for consistency)
-    segment_length: 30   # seconds (actual data length)
+    segment_length: 10   # seconds (actual data length)
     band_low: 0.4        # Hz
     band_high: 8.0       # Hz
 
   ecg:
     original_fs: 100     # Hz (actual from BUT PPG)
     target_fs: 128       # Hz (can keep for consistency)
-    segment_length: 30   # seconds (actual data length)
+    segment_length: 10   # seconds (actual data length)
     band_low: 0.5        # Hz
     band_high: 40.0      # Hz
 
@@ -125,6 +125,7 @@ training:
   scheduler: "step"
   lr_step_size: 30
   lr_gamma: 0.1
+  early_stopping_patience: 40
 
   # Data loading
   num_workers: 8         # For M1 chip
