@@ -122,10 +122,10 @@ training:
   weight_decay: 0.00001
 
   # Learning rate schedule
-  scheduler: "step"
+  scheduler: "cosine"
   lr_step_size: 30
   lr_gamma: 0.1
-  early_stopping_patience: 40
+  early_stopping_patience: 10
 
   # Data loading
   num_workers: 8         # For M1 chip
