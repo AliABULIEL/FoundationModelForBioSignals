@@ -1,9 +1,62 @@
-# prefetch_vitaldb_all_modalities.py
-import vitaldb
+# prefetch_vitaldb_all_modalities_fixed.py
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+
+# VitalDB API functions (from your documentation)
+api_url = "https://api.vitaldb.net"
+
+
+def get_all_cases():
+    """Get all available case IDs."""
+    df = pd.read_csv(f"{api_url}/cases")
+    return df['caseid'].tolist()
+
+
+def find_cases_with_track(track_name):
+    """Find cases that have a specific track."""
+    dftrks = pd.read_csv(f"{api_url}/trks")
+    return list(dftrks.loc[dftrks['tname'].str.endswith(track_name), 'caseid'].unique())
+
+
+def load_case_data(caseid, track_name, interval=1 / 100):
+    """Load case data for a specific track."""
+    try:
+        dftrks = pd.read_csv(f"{api_url}/trks")
+        tid_values = dftrks.loc[(dftrks['caseid'] == caseid) &
+                                (dftrks['tname'].str.endswith(track_name)), 'tid'].values
+
+        if len(tid_values) == 0:
+            return None
+
+        tid = tid_values[0]
+        url = f"{api_url}/{tid}"
+        dtvals = pd.read_csv(url, na_values='-nan(ind)', dtype=np.float32).values
+
+        if len(dtvals) == 0:
+            return None
+
+        # Process the signal (from your load_trk function)
+        dtvals[:, 0] /= interval
+        nsamp = int(np.nanmax(dtvals[:, 0])) + 1
+        ret = np.full(nsamp, np.nan)
+
+        if np.isnan(dtvals[:, 0]).any():  # wave track
+            if nsamp != len(dtvals):
+                ret = np.take(dtvals[:, 1], np.linspace(0, len(dtvals) - 1, nsamp).astype(np.int64))
+            else:
+                ret = dtvals[:, 1]
+        else:  # numeric track
+            for idx, val in dtvals:
+                ret[int(idx)] = val
+
+        return ret
+
+    except Exception as e:
+        print(f"Error loading case {caseid}: {e}")
+        return None
 
 
 def prefetch_vitaldb_data(modality='ppg', max_cases=6000):
@@ -12,7 +65,7 @@ def prefetch_vitaldb_data(modality='ppg', max_cases=6000):
     # Track mapping
     track_map = {
         'ppg': 'PLETH',
-        'ecg': 'ECG_II',  # or 'ECG_V5' if you prefer
+        'ecg': 'ECG_II',
     }
 
     if modality not in track_map:
@@ -22,24 +75,17 @@ def prefetch_vitaldb_data(modality='ppg', max_cases=6000):
     cache_dir = Path("data/vitaldb_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Pre-caching {modality.upper()} data (track: {track_name})...")
+    print(f"Finding cases with {track_name}...")
 
-    # Get all cases
-    all_cases = vitaldb.find_cases()[:max_cases]
-
-    # Filter cases that have the required track
-    valid_cases = []
-    print("Filtering cases with required signal...")
-    for case_id in tqdm(all_cases, desc="Checking"):
-        tracks = vitaldb.tracklist(case_id)
-        if tracks and track_name in tracks:
-            valid_cases.append(case_id)
+    # Find cases that have this track
+    valid_cases = find_cases_with_track(track_name)[:max_cases]
 
     print(f"Found {len(valid_cases)} cases with {track_name}")
 
     # Download and cache
     failed = []
     skipped = []
+    cached = []
 
     for case_id in tqdm(valid_cases, desc=f"Caching {modality.upper()}"):
         cache_file = cache_dir / f"{case_id}_{modality}_full.npy"
@@ -48,23 +94,21 @@ def prefetch_vitaldb_data(modality='ppg', max_cases=6000):
             skipped.append(case_id)
             continue
 
+
+
         try:
-            # Download signal
-            signal = vitaldb.load_case(case_id, [track_name])
+            # Download signal using the API
+            signal = load_case_data(case_id, track_name)
 
             if signal is not None and len(signal) > 0:
-                # Handle 2D arrays (multiple channels)
-                if signal.ndim == 2:
-                    signal = signal[:, 0]  # Take first channel
-
                 # Remove NaN values
                 signal = signal[~np.isnan(signal)]
 
-                # Only save if we have enough data (at least 20 seconds)
-                min_samples = 20 * 100  # 20 seconds at 100Hz
+                # Only save if we have enough data (at least 20 seconds at 100Hz)
+                min_samples = 20 * 100
                 if len(signal) >= min_samples:
-                    # Save as float32 to save space
                     np.save(cache_file, signal.astype(np.float32))
+                    cached.append(case_id)
                 else:
                     failed.append((case_id, "Too short"))
 
@@ -73,11 +117,11 @@ def prefetch_vitaldb_data(modality='ppg', max_cases=6000):
 
     # Report results
     print(f"\n📊 Results for {modality.upper()}:")
-    print(f"  ✅ Cached: {len(valid_cases) - len(failed) - len(skipped)} new files")
+    print(f"  ✅ Cached: {len(cached)} new files")
     print(f"  ⏭️  Skipped: {len(skipped)} (already cached)")
     print(f"  ❌ Failed: {len(failed)}")
 
-    if failed[:5]:  # Show first 5 failures
+    if failed[:5]:
         print("\n  First few failures:")
         for case_id, reason in failed[:5]:
             print(f"    Case {case_id}: {reason}")
