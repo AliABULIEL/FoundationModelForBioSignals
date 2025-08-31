@@ -67,10 +67,10 @@ simsiam:
     channel_permute: 0.0
 
   augmentations_ecg:
-    cutout: 0.95        # Even stronger augmentation
-    magnitude_warp: 0.8
-    gaussian_noise: 0.8
-    time_warp: 0.5
+    cutout: 0.2        # Even stronger augmentation
+    magnitude_warp: 0.3
+    gaussian_noise: 0.3
+    time_warp: 0.2
     channel_permute: 0.0
 
   augmentations_acc:

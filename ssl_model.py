@@ -68,6 +68,9 @@ class RegularizedInfoNCE(nn.Module):
         config = get_config()
         min_dist_clamp = config.get('ssl.koleo_min_distance_clamp', 1e-3)
         min_distances = torch.clamp(min_distances, min=min_dist_clamp)
+        embedding_std = embeddings.std(dim=0).mean()
+        if embedding_std < 0.01:
+            print("WARNING: Possible collapse detected!")
 
         return -torch.log(min_distances).mean()
 
