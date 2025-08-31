@@ -112,6 +112,7 @@ class Trainer:
         print(f"  Gradient Accumulation: {self.gradient_accumulation_steps}")
         print(f"  SSL Method: {self.ssl_method}")
 
+
     def _set_seeds(self, seed: int):
         """Set random seeds for reproducibility."""
         random.seed(seed)
@@ -501,7 +502,7 @@ class Trainer:
             num_epochs = self.training_config.get('num_epochs', 30)
 
         if early_stopping_patience is None:
-            early_stopping_patience = self.config.get('training.early_stopping_patience', 10)
+            early_stopping_patience = self.config.get('early_stopping_patience', 30)
 
         print(f"\nStarting training:")
         print(f"  Modality: {modality.upper()}")
@@ -607,13 +608,14 @@ class Trainer:
                 patience_counter += 1
                 if patience_counter >= early_stopping_patience:
                     print(f"\nEarly stopping triggered! No improvement for {early_stopping_patience} epochs.")
-                    break
+                    print(" we o")
+                    # break
 
             # Save training history
             self.save_history()
 
             # Clean GPU cache periodically based on config
-            cache_clean_frequency = self.config.get('training.cache_clean_frequency', 10)
+            cache_clean_frequency = self.config.get('cache_clean_frequency', 10)
             if self.device_manager.is_cuda and (epoch + 1) % cache_clean_frequency == 0:
                 self.device_manager.empty_cache()
                 print("  Cleared GPU cache")
