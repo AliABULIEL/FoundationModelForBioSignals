@@ -53,6 +53,7 @@ class Trainer:
             downsample: Whether to use downsampled segments
             ssl_method: SSL method to use ('infonce' or 'simsiam')
         """
+        self.early_stopping_patience = None
         self.downsample = downsample
         self.ssl_method = ssl_method
 
