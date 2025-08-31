@@ -155,7 +155,7 @@ class EfficientNet1D(nn.Module):
         drop_path_rate = drop_path_rate if drop_path_rate is not None else model_config.get('drop_path_rate', 0.2)
 
         # Stem - adjust based on input channels
-        stem_channels = self._make_divisible(32 * width_multiplier)
+        stem_channels = self._make_divisible(16 * width_multiplier)
 
         # For ACC, we might want a different stem to handle 3 channels
         if modality == 'acc' and in_channels == 3:
@@ -218,7 +218,7 @@ class EfficientNet1D(nn.Module):
         self.blocks = nn.Sequential(*blocks)
 
         # Head
-        head_channels = self._make_divisible(1280 * width_multiplier)
+        head_channels = self._make_divisible(640 * width_multiplier)
         self.head = nn.Sequential(
             nn.Conv1d(in_ch, head_channels, 1, bias=False),
             nn.BatchNorm1d(head_channels),
@@ -309,7 +309,7 @@ class ProjectionHead(nn.Module):
 
         # Use config values with fallbacks to provided arguments
         input_dim = input_dim if input_dim is not None else model_config.get('embedding_dim', 256)
-        hidden_dim = hidden_dim if hidden_dim is not None else 1024  # Can add to config if needed
+        hidden_dim = hidden_dim if hidden_dim is not None else 512  # Can add to config if needed
         output_dim = output_dim if output_dim is not None else model_config.get('projection_dim', 128)
 
         layers = [nn.Linear(input_dim, hidden_dim)]

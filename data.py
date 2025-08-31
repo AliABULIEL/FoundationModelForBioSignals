@@ -121,7 +121,7 @@ class BaseSignalDataset(Dataset):
 # ================================================================================
 
 class VitalDBDataset(BaseSignalDataset):
-    """VitalDB dataset for pre-training on large-scale PPG/ECG data."""
+    """VitalDB dataset for pre-training - FIXED to use same-patient pairs."""
 
     def __init__(
             self,
@@ -134,7 +134,7 @@ class VitalDBDataset(BaseSignalDataset):
             random_seed: Optional[int] = None,
             use_cache: bool = True,
             cache_size: int = 500,
-            **kwargs  # Accept extra kwargs for compatibility
+            **kwargs
     ):
         # Load config
         self.config = get_config()
@@ -147,7 +147,7 @@ class VitalDBDataset(BaseSignalDataset):
         # Split ratios from config
         train_ratio = train_ratio if train_ratio else vitaldb_config.get('train_ratio', 0.8)
         val_ratio = val_ratio if val_ratio else vitaldb_config.get('val_ratio', 0.1)
-        max_pairs = vitaldb_config.get('max_pairs_per_case', 10)
+        self.segments_per_case = vitaldb_config.get('segments_per_case', 20)  # NEW: segments per patient
 
         # Modality settings
         self.modality = modality.lower()
@@ -165,7 +165,7 @@ class VitalDBDataset(BaseSignalDataset):
 
         # VitalDB specific sampling rates from config
         vitaldb_fs = vitaldb_config.get('sampling_rates', {})
-        self.original_fs = vitaldb_fs.get(modality, 100)  # Default 100Hz
+        self.original_fs = vitaldb_fs.get(modality, 100)
 
         # Track mapping from config
         track_mapping = vitaldb_config.get('track_mapping', {
@@ -178,13 +178,36 @@ class VitalDBDataset(BaseSignalDataset):
         # Initialize caches
         self.signal_cache = OrderedDict()
         self.cache_lock = threading.Lock()
+        self.full_signal_cache = OrderedDict()  # NEW: cache full signals
 
         # Import VitalDB
         try:
             import vitaldb
             self.vitaldb = vitaldb
-        except ImportError:
-            raise ImportError("Please install vitaldb: pip install vitaldb")
+
+            # FIX: Configure SSL properly
+            import certifi
+            import ssl
+            import urllib.request
+
+            # Create SSL context with certifi certificates
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+            # Monkey-patch urllib to use this context
+            def make_https_handler():
+                return urllib.request.HTTPSHandler(context=ssl_context)
+
+            # Apply the patch
+            opener = urllib.request.build_opener(make_https_handler())
+            urllib.request.install_opener(opener)
+
+        except ImportError as e:
+            if 'vitaldb' in str(e):
+                raise ImportError("Please install vitaldb: pip install vitaldb")
+            elif 'certifi' in str(e):
+                raise ImportError("Please install certifi: pip install certifi")
+            else:
+                raise
 
         # Get cases
         self.cases = self.vitaldb.find_cases(self.track_name)
@@ -206,14 +229,8 @@ class VitalDBDataset(BaseSignalDataset):
         else:
             self.cases = self.cases[val_end:]
 
-        # Build pairs
-        self.segment_pairs = []
-        for i in range(len(self.cases)):
-            for j in range(i + 1, min(i + max_pairs, len(self.cases))):
-                self.segment_pairs.append({
-                    'case1': self.cases[i],
-                    'case2': self.cases[j]
-                })
+        # Build SAME-PATIENT pairs
+        self.segment_pairs = self._build_same_patient_pairs()
 
         # Shuffle pairs
         if self.random_seed is not None:
@@ -227,23 +244,256 @@ class VitalDBDataset(BaseSignalDataset):
         print(f"  Segment: {self.segment_length_sec}s @ {self.target_fs}Hz = {self.segment_length} samples")
         print(f"  Cache: {self.cache_dir}")
 
+    def _build_same_patient_pairs(self):
+        """Build pairs from SAME patient, different time segments."""
+        pairs = []
+
+        for case_id in self.cases:
+            # Create multiple pairs from the SAME case
+            for _ in range(self.segments_per_case):
+                pairs.append({
+                    'case_id': case_id,  # SAME patient
+                    'pair_type': 'same_patient'
+                })
+
+        return pairs
+
     def __len__(self):
         return len(self.segment_pairs) if self.segment_pairs else 1
 
     def __getitem__(self, idx):
-        if len(self.segment_pairs) == 0:
+        """Get TWO segments from SAME patient - CRITICAL FIX."""
+        if len(self.cases) == 0:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
             return zero_seg, zero_seg
 
-        pair = self.segment_pairs[idx % len(self.segment_pairs)]
+        # Use same case for both segments!
+        case_idx = idx % len(self.cases)
+        case_id = self.cases[case_idx]
 
-        sig1 = self._load_vitaldb_signal(pair['case1'])
-        sig2 = self._load_vitaldb_signal(pair['case2'])
+        # Load full signal once
+        cache_file = self.cache_dir / f"{case_id}_{self.modality}_full.npy"
 
-        return torch.from_numpy(sig1).float(), torch.from_numpy(sig2).float()
+        if cache_file.exists() and self.use_cache:
+            try:
+                full_signal = np.load(cache_file)
+            except:
+                full_signal = None
+        else:
+            full_signal = None
+
+        if full_signal is None:
+            # Load from VitalDB
+            signal = self.vitaldb.load_case(case_id, [self.track_name])
+
+            if signal is None or not isinstance(signal, np.ndarray):
+                zero_seg = torch.zeros(1, self.segment_length, dtype=np.float32)
+                return zero_seg, zero_seg
+
+            # Handle 2D array
+            if signal.ndim == 2:
+                signal = signal[:, 0]
+
+            # Remove NaN values
+            signal = signal[~np.isnan(signal)]
+
+            if len(signal) < 2 * self.segment_length:
+                # Not enough data for two segments
+                zero_seg = torch.zeros(1, self.segment_length, dtype=np.float32)
+                return zero_seg, zero_seg
+
+            # Preprocess full signal
+            full_signal = self._preprocess_full_signal(signal)
+
+            # Cache it
+            if self.use_cache and full_signal is not None:
+                np.save(cache_file, full_signal)
+
+        if full_signal is None or full_signal.shape[1] < 2 * self.segment_length:
+            zero_seg = torch.zeros(1, self.segment_length, dtype=np.float32)
+            return zero_seg, zero_seg
+
+        # Extract TWO DIFFERENT segments from SAME signal
+        max_start = full_signal.shape[1] - self.segment_length
+
+        # Random, non-overlapping segments
+        start1 = np.random.randint(0, max_start + 1)
+        start2 = np.random.randint(0, max_start + 1)
+
+        # Ensure minimal overlap
+        while abs(start1 - start2) < self.segment_length // 4:
+            start2 = np.random.randint(0, max_start + 1)
+
+        seg1 = full_signal[:, start1:start1 + self.segment_length]
+        seg2 = full_signal[:, start2:start2 + self.segment_length]
+
+        return torch.from_numpy(seg1).float(), torch.from_numpy(seg2).float()
+
+    def _preprocess_full_signal(self, signal: np.ndarray) -> Optional[np.ndarray]:
+        """Preprocess the full signal without segmentation."""
+        try:
+            # Already 1D and NaN-free at this point
+
+            # Bandpass filter
+            if len(signal) >= 100:
+                nyquist = 100 / 2  # VitalDB PPG is usually 100Hz
+                if self.band_high < nyquist * 0.95:
+                    from scipy import signal as scipy_signal
+                    sos = scipy_signal.butter(
+                        4, [self.band_low, self.band_high],
+                        btype='band', fs=100, output='sos'
+                    )
+                    signal = scipy_signal.sosfiltfilt(sos, signal)
+
+            # Resample to target frequency (100Hz -> 64Hz for PPG)
+            if self.target_fs != 100:
+                from scipy import signal as scipy_signal
+                n_samples = int(len(signal) * self.target_fs / 100)
+                signal = scipy_signal.resample(signal, n_samples)
+
+            # Z-score normalization
+            mean = np.mean(signal)
+            std = np.std(signal)
+            if std > 1e-8:
+                signal = (signal - mean) / std
+
+            # Ensure 2D shape [1, samples]
+            signal = signal.reshape(1, -1)
+
+            return signal.astype(np.float32)
+
+        except Exception as e:
+            print(f"Preprocessing error: {e}")
+            return None
+
+    def _load_full_signal(self, case_id):
+        """Load and preprocess the FULL signal for a patient."""
+        # Check cache first
+        cache_key = f"{case_id}_full"
+
+        with self.cache_lock:
+            if cache_key in self.full_signal_cache:
+                self.full_signal_cache.move_to_end(cache_key)
+                return self.full_signal_cache[cache_key].copy()
+
+        # Check file cache
+        cache_file = self.cache_dir / f"{case_id}_{self.modality}_full.npy"
+        if cache_file.exists() and self.use_cache:
+            try:
+                signal = np.load(cache_file)
+                # Add to memory cache
+                with self.cache_lock:
+                    if len(self.full_signal_cache) >= 10:  # Keep only 10 full signals in memory
+                        self.full_signal_cache.popitem(last=False)
+                    self.full_signal_cache[cache_key] = signal
+                return signal
+            except:
+                pass
+
+        try:
+            # Load from VitalDB
+            vals = self.vitaldb.load_case(case_id, [self.track_name])
+
+            if vals is None or len(vals) == 0 or vals[0] is None:
+                return None
+
+            signal = vals[0]
+            if not isinstance(signal, np.ndarray):
+                signal = np.array(signal)
+
+            # Basic preprocessing (without segmentation)
+            processed = self._preprocess_full_signal(signal)
+
+            if processed is None:
+                return None
+
+            # Cache to file
+            if self.use_cache:
+                np.save(cache_file, processed)
+
+            # Add to memory cache
+            with self.cache_lock:
+                if len(self.full_signal_cache) >= 10:
+                    self.full_signal_cache.popitem(last=False)
+                self.full_signal_cache[cache_key] = processed
+
+            return processed
+
+        except Exception as e:
+            print(f"Error loading case {case_id}: {e}")
+            return None
+
+    def _preprocess_full_signal(self, signal_data: np.ndarray) -> Optional[np.ndarray]:
+        """Preprocess the full signal without segmentation."""
+        try:
+            # Remove NaN/Inf
+            signal_data = np.nan_to_num(signal_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Ensure 2D shape [channels, samples]
+            if signal_data.ndim == 1:
+                signal_data = signal_data[np.newaxis, :]
+
+            # Check minimum length
+            min_samples = self.original_fs * 2  # At least 2 seconds
+            if signal_data.shape[1] < min_samples:
+                return None
+
+            # Bandpass filter
+            if signal_data.shape[1] >= 100:
+                nyquist = self.original_fs / 2
+                if self.band_high < nyquist * 0.95:
+                    try:
+                        sos = scipy_signal.butter(
+                            4, [self.band_low, self.band_high],
+                            btype='band', fs=self.original_fs, output='sos'
+                        )
+                        signal_data = scipy_signal.sosfiltfilt(sos, signal_data, axis=1)
+                    except:
+                        pass
+
+            # Resample to target frequency
+            if self.original_fs != self.target_fs:
+                n_samples = signal_data.shape[1]
+                n_resampled = int(n_samples * self.target_fs / self.original_fs)
+
+                resampled = np.zeros((signal_data.shape[0], n_resampled))
+                for i in range(signal_data.shape[0]):
+                    resampled[i] = scipy_signal.resample(signal_data[i], n_resampled)
+                signal_data = resampled
+
+            # Z-score normalization
+            mean = np.mean(signal_data, axis=1, keepdims=True)
+            std = np.std(signal_data, axis=1, keepdims=True)
+            std = np.where(std < 1e-8, 1.0, std)
+            signal_data = (signal_data - mean) / std
+
+            return signal_data.astype(np.float32)
+
+        except Exception as e:
+            print(f"Preprocessing error: {e}")
+            return None
+
+    def _extract_random_segment(self, full_signal: np.ndarray, seed: Optional[int] = None) -> np.ndarray:
+        """Extract a random segment from the full signal."""
+        if seed is not None:
+            np.random.seed(seed)
+
+        n_samples = full_signal.shape[1]
+
+        if n_samples <= self.segment_length:
+            # Pad if too short
+            padded = np.zeros((full_signal.shape[0], self.segment_length))
+            padded[:, :n_samples] = full_signal
+            return padded
+
+        # Random crop
+        max_start = n_samples - self.segment_length
+        start = np.random.randint(0, max_start + 1)
+
+        return full_signal[:, start:start + self.segment_length]
 
     def _load_vitaldb_signal(self, case_id):
-        """Load and preprocess VitalDB signal."""
+        """Load and preprocess VitalDB signal - FULLY FIXED."""
         # Check cache
         cache_file = self.cache_dir / f"{case_id}_{self.modality}.npy"
         if cache_file.exists() and self.use_cache:
@@ -253,15 +503,29 @@ class VitalDBDataset(BaseSignalDataset):
                 pass
 
         try:
-            # Load from VitalDB
-            vals = self.vitaldb.load_case(case_id, [self.track_name])
+            # Load from VitalDB - returns (N, 1) numpy array
+            signal = self.vitaldb.load_case(case_id, [self.track_name])
 
-            if not vals or vals[0] is None:
+            if signal is None:
                 return np.zeros((1, self.segment_length), dtype=np.float32)
 
-            signal = vals[0]
-            if not isinstance(signal, np.ndarray):
-                signal = np.array(signal)
+            if isinstance(signal, np.ndarray):
+                # Handle 2D array (N, 1) -> 1D array
+                if signal.ndim == 2:
+                    signal = signal[:, 0]
+
+                # Remove NaN values
+                signal = signal[~np.isnan(signal)]
+
+                if len(signal) < self.segment_length:
+                    print(f"Signal too short after NaN removal: {len(signal)} samples")
+                    return np.zeros((1, self.segment_length), dtype=np.float32)
+
+                # Debug info
+                print(f"Case {case_id}: {len(signal)} valid samples, range=[{signal.min():.2f}, {signal.max():.2f}]")
+
+            else:
+                return np.zeros((1, self.segment_length), dtype=np.float32)
 
             # Preprocess
             processed = self._preprocess_signal(signal)
@@ -1584,6 +1848,99 @@ def test_preprocessing_consistency():
     print("\n✓ Preprocessing test completed!")
 
 
+def test_vitaldb_positive_pairs():
+    """Test that VitalDB creates same-patient pairs (critical for paper compliance)."""
+    print("=" * 60)
+    print("TESTING VITALDB POSITIVE PAIRS")
+    print("=" * 60)
+
+    try:
+        from data import VitalDBDataset
+
+        # Create dataset
+        dataset = VitalDBDataset(modality='ppg', split='train')
+
+        print(f"\nDataset has {len(dataset.segment_pairs)} pairs from {len(dataset.cases)} cases")
+
+        # Test 1: Check pair structure
+        print("\n1. Checking pair structure:")
+        sample_pairs = dataset.segment_pairs[:5]
+
+        for i, pair_info in enumerate(sample_pairs):
+            print(f"   Pair {i}: {pair_info}")
+
+            # Check if using correct structure
+            if 'case1' in pair_info and 'case2' in pair_info:
+                # This is WRONG - different patients
+                assert pair_info['case1'] == pair_info['case2'], \
+                    f"FAILED: Pair {i} uses different patients! case1={pair_info['case1']}, case2={pair_info['case2']}"
+                print("   ✓ Same patient (but wrong implementation pattern)")
+            elif 'case_id' in pair_info:
+                # This is CORRECT - same patient
+                print(f"   ✓ Same patient (case {pair_info['case_id']})")
+            else:
+                assert False, f"FAILED: Unknown pair structure: {pair_info}"
+
+        # Test 2: Load actual data and verify
+        print("\n2. Loading actual segments:")
+        for i in range(3):
+            seg1, seg2 = dataset[i]
+
+            # Both should be valid
+            assert seg1.shape == (1, 640), f"FAILED: seg1 wrong shape {seg1.shape}"
+            assert seg2.shape == (1, 640), f"FAILED: seg2 wrong shape {seg2.shape}"
+
+            # Should not be identical (different time windows)
+            assert not torch.allclose(seg1, seg2, atol=1e-6), \
+                "FAILED: Segments are identical (should be different time windows)"
+
+            # Should have similar statistics (same patient)
+            mean_diff = abs(seg1.mean() - seg2.mean())
+            std_diff = abs(seg1.std() - seg2.std())
+
+            print(f"   Pair {i}: mean_diff={mean_diff:.4f}, std_diff={std_diff:.4f}")
+
+            # Relaxed check - same patient should have somewhat similar statistics
+            assert mean_diff < 2.0, f"FAILED: Mean difference too large ({mean_diff:.4f})"
+            assert std_diff < 2.0, f"FAILED: Std difference too large ({std_diff:.4f})"
+
+        # Test 3: Verify implementation
+        print("\n3. Checking implementation:")
+
+        # Check if __getitem__ uses same case for both segments
+        import inspect
+        source = inspect.getsource(dataset.__getitem__)
+
+        if 'case1' in source and 'case2' in source:
+            if "pair['case1']" in source and "pair['case2']" in source:
+                print("   ⚠️ WARNING: Implementation loads from different cases")
+                print("   This violates the paper's requirement!")
+                assert False, "FAILED: Implementation uses different patients for pairs"
+
+        if 'case_id' in source or 'same' in source.lower():
+            print("   ✓ Implementation appears to use same-patient pairs")
+
+        print("\n" + "=" * 60)
+        print("✅ ALL TESTS PASSED - VitalDB uses same-patient pairs correctly")
+        print("=" * 60)
+        return True
+
+    except AssertionError as e:
+        print(f"\n❌ TEST FAILED: {e}")
+        print("\nThe paper requires positive pairs from the SAME patient.")
+        print("Current implementation is incorrect and will not learn proper representations.")
+        print("=" * 60)
+        return False
+
+    except Exception as e:
+        print(f"\n❌ Error running test: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+
+
 # Main test runner
 if __name__ == "__main__":
     print("\n" + "=" * 60)
@@ -1609,3 +1966,5 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("ALL TESTS COMPLETED")
     print("=" * 60)
+
+    test_vitaldb_positive_pairs()

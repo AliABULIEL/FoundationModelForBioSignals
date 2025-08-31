@@ -179,7 +179,7 @@ class SSLModel(nn.Module):
             device = next(encoder.parameters()).device
             dummy = torch.randn(1, 1, dummy_size).to(device)
             embedding_dim = encoder(dummy).shape[1]
-
+        ssl_config = self.config.get_ssl_config('infonce')
         if ssl_method == 'simsiam':
             simsiam_config = self.config.get_ssl_config('simsiam')
             proj_dim = simsiam_config.get('projection_dim', 2048)
@@ -206,9 +206,9 @@ class SSLModel(nn.Module):
             )
 
             self.criterion = SimSiamLoss(config_path=config_path)
-            self.momentum_encoder = None
-            self.momentum_projection = None
-            self.momentum_rate = 0.0
+            self.momentum_encoder = deepcopy(encoder)
+            self.momentum_projection = deepcopy(projection_head)
+            self.momentum_rate = ssl_config.get('momentum_rate', 0.99)
 
         else:  # infonce
             ssl_config = self.config.get_ssl_config('infonce')

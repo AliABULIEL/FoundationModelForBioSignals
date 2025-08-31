@@ -40,7 +40,7 @@ model:
   embedding_dim: 256
   projection_dim: 128
   n_blocks: 16           # Paper specifies 16 MBConv blocks
-  width_multiplier: 1.0
+  width_multiplier: 0.5
   depth_multiplier: 1.0
   dropout_rate: 0.1
   drop_path_rate: 0.1
@@ -84,9 +84,9 @@ simsiam:
 # SSL training parameters (Apple paper)
 ssl:
   # Loss function
-  temperature: 0.07    # InfoNCE temperature
-  lambda_koleo: 0.05      # KoLeo regularization weight
-  momentum_rate: 0.99    # Momentum encoder update rate
+  temperature: 0.04  # Not 0.07
+  lambda_koleo: 0.1  # Not 0.05
+  momentum_rate: 0.996  # Not 0.99
 
   # Augmentations (paper Table 1)
   augmentations_ppg:
@@ -219,6 +219,7 @@ vitaldb:
     ppg: "PLETH"
     ecg: "ECG_II"
     acc: "ACC"
+  segments_per_case: 2
   sampling_rates:
     ppg: 100
     ecg: 500
