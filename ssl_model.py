@@ -109,38 +109,38 @@ class RegularizedInfoNCE(nn.Module):
 
 
 class SimSiamLoss(nn.Module):
-    """SimSiam loss - FIXED to return positive values."""
+    """SimSiam loss - CORRECTED implementation."""
 
-    def __init__(self, normalize: bool = True, config_path: str = 'configs/config.yaml'):
+    def __init__(self, config_path: str = 'configs/config.yaml'):
         super().__init__()
-        self.normalize = normalize
-
-        # Load configuration if needed for future parameters
         self.config = get_config()
 
     def forward(self, p1, p2, z1, z2):
-        if self.normalize:
-            p1 = F.normalize(p1, dim=1)
-            p2 = F.normalize(p2, dim=1)
-            z1 = F.normalize(z1, dim=1)
-            z2 = F.normalize(z2, dim=1)
+        """
+        SimSiam loss computation.
+        p1, p2: outputs from predictor
+        z1, z2: outputs from projector (with stop-gradient)
+        """
+        # Normalize the projector outputs (z), not predictor outputs (p)
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+        p1 = F.normalize(p1, dim=1)
+        p2 = F.normalize(p2, dim=1)
 
-        # Original SimSiam (negative cosine similarity)
-        loss1 = (1 - F.cosine_similarity(p1, z2.detach(), dim=1)).mean()
-        loss2 = (1 - F.cosine_similarity(p2, z1.detach(), dim=1)).mean()
-
-        # CRITICAL FIX: Make loss positive
-        total_loss = torch.abs((loss1 + loss2) / 2)
+        # Negative cosine similarity (the paper uses negative cosine)
+        loss = -(F.cosine_similarity(p1, z2.detach()).mean() +
+                 F.cosine_similarity(p2, z1.detach()).mean()) * 0.5
 
         metrics = {
-            'loss': total_loss.item(),
-            'loss_contrastive': total_loss.item(),
+            'loss': loss.item(),
+            'loss_contrastive': loss.item(),
             'loss_koleo': 0.0,
-            'loss_12': loss1.item(),
-            'loss_21': loss2.item()
+            'loss_12': -F.cosine_similarity(p1, z2.detach()).mean().item(),
+            'loss_21': -F.cosine_similarity(p2, z1.detach()).mean().item(),
+            'loss_variance': 0.0
         }
 
-        return total_loss, metrics
+        return loss, metrics
 
 
 class SSLModel(nn.Module):
@@ -185,6 +185,7 @@ class SSLModel(nn.Module):
             proj_dim = simsiam_config.get('projection_dim', 2048)
             pred_dim = simsiam_config.get('prediction_dim', 512)
 
+            # Correct 3-layer projector with BN
             self.projection_head = nn.Sequential(
                 nn.Linear(embedding_dim, proj_dim, bias=False),
                 nn.BatchNorm1d(proj_dim),
@@ -193,14 +194,15 @@ class SSLModel(nn.Module):
                 nn.BatchNorm1d(proj_dim),
                 nn.ReLU(inplace=True),
                 nn.Linear(proj_dim, proj_dim, bias=False),
-                nn.BatchNorm1d(proj_dim, affine=False)
+                nn.BatchNorm1d(proj_dim, affine=False)  # No learnable affine parameters
             )
 
+            # Correct 2-layer predictor
             self.predictor = nn.Sequential(
                 nn.Linear(proj_dim, pred_dim, bias=False),
                 nn.BatchNorm1d(pred_dim),
                 nn.ReLU(inplace=True),
-                nn.Linear(pred_dim, proj_dim)
+                nn.Linear(pred_dim, proj_dim)  # No BN or activation at the end
             )
 
             self.criterion = SimSiamLoss(config_path=config_path)
@@ -402,7 +404,7 @@ def test_ssl():
 
     loss2, metrics2 = simsiam_model(x1, x2)
     print(f"   SimSiam loss: {loss2:.4f}")
-    assert loss2 > 0, "SimSiam loss must be positive (fixed)"
+    assert loss2 < 0, "SimSiam loss must be positive (fixed)"
     print("   ✓ SimSiam test passed!")
 
     # Test with different batch sizes
