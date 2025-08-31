@@ -163,6 +163,10 @@ evaluation:
   # Linear probe
   ridge_alpha: 1.0
   cv_folds: 5
+  batch_size: 512
+  num_workers: 4
+
+
 
   # Metrics
   metrics:
@@ -199,3 +203,45 @@ paper_benchmarks:
     activity_classification_auc: 0.90  # Example
     step_counting_mae: 5.0             # Example
     fall_detection_auc: 0.95           # Example
+
+
+
+# Add these sections to your existing config.yaml
+
+# VitalDB settings
+vitaldb:
+  cache_dir: "data/vitaldb_cache"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  max_pairs_per_case: 10
+  cases_limit: 6000  # Limit number of cases to use (optional)
+  track_mapping:
+    ppg: "PLETH"
+    ecg: "ECG_II"
+    acc: "ACC"
+  sampling_rates:
+    ppg: 100
+    ecg: 500
+    acc: 100
+
+# Pre-training settings
+pretrain:
+  dataset: "vitaldb"
+  epochs: 50
+  batch_size: 128
+  learning_rate: 0.0001
+  num_workers: 8
+  save_freq: 10
+  early_stopping_patience: 15
+
+# Fine-tuning settings
+finetune:
+  dataset: "but_ppg"
+  epochs: 20
+  batch_size: 64
+  learning_rate: 0.00001
+  num_workers: 4
+  freeze_encoder: false
+  save_freq: 5
+  early_stopping_patience: 10
+

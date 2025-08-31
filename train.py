@@ -41,7 +41,8 @@ class Trainer:
             experiment_name: Optional[str] = None,
             device_manager: Optional[DeviceManager] = None,
             downsample: bool = False,
-            ssl_method: str = 'infonce'
+            ssl_method: str = 'infonce',
+            phase: str = ""
     ):
         """
         Initialize trainer with device manager.
@@ -56,6 +57,7 @@ class Trainer:
         self.early_stopping_patience = None
         self.downsample = downsample
         self.ssl_method = ssl_method
+        self.phase = phase
 
         # Load configuration
         self.config = get_config()
@@ -122,34 +124,53 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    def setup_data(self, modality: str = 'ppg'):
-        """Setup data loaders with device-optimized settings."""
-        print(f"\nSetting up {modality.upper()} data loaders...")
+    def setup_data(self, modality: str = 'ppg', dataset_type: Optional[str] = None):
+        """Setup data loaders with dataset type support."""
+
+        if dataset_type is None:
+            if self.phase == 'pretrain':
+                dataset_type = 'vitaldb'
+            else:
+                dataset_type = 'but_ppg'
+
+        print(f"\nSetting up {modality.upper()} data loaders (dataset: {dataset_type})...")
 
         # Use device manager to determine optimal settings
         num_workers = self.device_manager.get_num_workers()
         pin_memory = self.device_manager.is_cuda
 
         # Get batch size from config
-        batch_size = self.training_config.get('batch_size', 64)
+        if self.phase == 'pretrain':
+            phase_config = self.config.config.get('pretrain', {})
+        elif self.phase == 'finetune':
+            phase_config = self.config.config.get('finetune', {})
+        else:
+            phase_config = self.training_config
+
+        batch_size = phase_config.get('batch_size', self.training_config.get('batch_size', 64))
+        num_workers = phase_config.get('num_workers', self.device_manager.get_num_workers())
+        pin_memory = self.device_manager.is_cuda
 
         # Create data loaders with optimizations
+        from data import create_dataloaders
         self.train_loader, self.val_loader, self.test_loader = create_dataloaders(
-            data_dir=self.config.data_dir,
+            data_dir=self.config.data_dir if dataset_type == 'but_ppg' else None,
             modality=modality,
             batch_size=batch_size,
             num_workers=num_workers,
             config_path='configs/config.yaml',
+            dataset_type=dataset_type,  # IMPORTANT: Pass dataset type
             pin_memory=pin_memory,
             prefetch_factor=2 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
-            quality_filter=False,  # Use all data
             downsample=self.downsample
         )
 
+        print(f"  Dataset: {dataset_type.upper()}")
         print(f"  Train batches: {len(self.train_loader)}")
         print(f"  Val batches: {len(self.val_loader)}")
         print(f"  Test batches: {len(self.test_loader)}")
+        print(f"  Batch size: {batch_size}")
         print(f"  Workers: {num_workers}, Pin memory: {pin_memory}")
 
         # Create augmentation (it will use global device manager internally)
@@ -481,6 +502,27 @@ class Trainer:
     ):
         """Main training loop with device optimizations."""
         # Setup
+        if self.phase == 'pretrain':
+            phase_config = self.config.config.get('pretrain', {})
+            default_epochs = phase_config.get('epochs', 50)
+            default_patience = phase_config.get('early_stopping_patience', 15)
+        elif self.phase == 'finetune':
+            phase_config = self.config.config.get('finetune', {})
+            default_epochs = phase_config.get('epochs', 20)
+            default_patience = phase_config.get('early_stopping_patience', 10)
+        else:
+            default_epochs = self.training_config.get('num_epochs', 30)
+            default_patience = self.training_config.get('early_stopping_patience', 30)
+
+        if num_epochs is None:
+            num_epochs = default_epochs
+
+        if early_stopping_patience is None:
+            self.early_stopping_patience = default_patience
+        else:
+            self.early_stopping_patience = early_stopping_patience
+
+            # Setup (this will now use phase-aware setup_data)
         self.setup_data(modality)
         self.setup_model(modality)
         self.setup_optimizer()
@@ -506,12 +548,10 @@ class Trainer:
         self.early_stopping_patience = self.training_config.get('early_stopping_patience', 30)
 
         print(f"\nStarting training:")
+        print(f"  Phase: {self.phase if self.phase else 'standard'}")
         print(f"  Modality: {modality.upper()}")
         print(f"  Device: {self.device_manager.type}")
         print(f"  Epochs: {start_epoch} -> {num_epochs}")
-        print(f"  Batch size: {self.training_config.get('batch_size', 64)}")
-        print(
-            f"  Effective batch size: {self.training_config.get('batch_size', 64) * self.gradient_accumulation_steps}")
         print(f"  Early stopping patience: {self.early_stopping_patience}")
 
         # Show initial memory stats
