@@ -25,13 +25,13 @@ def prefetch_vitaldb_data(modality='ppg', max_cases=6000):
     print(f"Pre-caching {modality.upper()} data (track: {track_name})...")
 
     # Get all cases
-    all_cases = vitaldb.list_cases()[:max_cases]
+    all_cases = vitaldb.find_cases()[:max_cases]
 
     # Filter cases that have the required track
     valid_cases = []
     print("Filtering cases with required signal...")
     for case_id in tqdm(all_cases, desc="Checking"):
-        tracks = vitaldb.list_tracks(case_id)
+        tracks = vitaldb.tracklist(case_id)
         if tracks and track_name in tracks:
             valid_cases.append(case_id)
 
