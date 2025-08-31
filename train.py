@@ -502,8 +502,8 @@ class Trainer:
         if num_epochs is None:
             num_epochs = self.training_config.get('num_epochs', 30)
 
-        if early_stopping_patience is None:
-            self.early_stopping_patience = self.config.get('early_stopping_patience', 30)
+
+        self.early_stopping_patience = self.config.get('early_stopping_patience', 30)
 
         print(f"\nStarting training:")
         print(f"  Modality: {modality.upper()}")
