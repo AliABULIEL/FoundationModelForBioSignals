@@ -219,7 +219,7 @@ vitaldb:
     ppg: "PLETH"
     ecg: "ECG_II"
     acc: "ACC"
-  segments_per_case: 2
+  segments_per_case: 10
   sampling_rates:
     ppg: 100
     ecg: 500
