@@ -42,7 +42,7 @@ class Trainer:
             device_manager: Optional[DeviceManager] = None,
             downsample: bool = False,
             ssl_method: str = 'infonce',
-            phase: str = ""
+            phase: str = "",
     ):
         """
         Initialize trainer with device manager.
@@ -58,6 +58,7 @@ class Trainer:
         self.downsample = downsample
         self.ssl_method = ssl_method
         self.phase = phase
+        self.pretrained_path = None
 
         # Load configuration
         self.config = get_config()
@@ -114,21 +115,6 @@ class Trainer:
         print(f"  Mixed Precision: {self.use_amp}")
         print(f"  Gradient Accumulation: {self.gradient_accumulation_steps}")
         print(f"  SSL Method: {self.ssl_method}")
-        if self.phase == 'finetune' and self.pretrained_path:
-            # Load pretrained encoder
-            pretrained = torch.load(self.pretrained_path, map_location=self.device, weights_only=False)
-
-            if 'encoder_state_dict' in pretrained:
-                encoder_state = pretrained['encoder_state_dict']
-            else:
-                encoder_state = pretrained
-
-            # Load into model's encoder
-            self.model.encoder.load_state_dict(encoder_state, strict=False)
-            print(f"✓ Loaded pretrained encoder from {self.pretrained_path}")
-
-            # Use fine-tuning learning rate
-            self.learning_rate = 1e-5  # Or from config/args
 
 
     def _set_seeds(self, seed: int):
@@ -213,25 +199,32 @@ class Trainer:
             config_path='configs/config.yaml',
             ssl_method=self.ssl_method
         )
-
-        if self.phase == 'finetune' and hasattr(self, 'pretrained_path'):
-            print(f"Loading pretrained encoder from: {self.pretrained_path}")
-            checkpoint = torch.load(self.pretrained_path, map_location=self.device, weights_only=False)
-
-            if 'encoder_state_dict' in checkpoint:
-                encoder_state = checkpoint['encoder_state_dict']
-            else:
-                encoder_state = checkpoint
-
-            # Load weights into encoder
-            missing, unexpected = self.model.encoder.load_state_dict(encoder_state, strict=False)
-            print(f"✓ Loaded pretrained encoder")
-            if missing:
-                print(f"  Warning: Missing keys: {len(missing)}")
-            if unexpected:
-                print(f"  Warning: Unexpected keys: {len(unexpected)}")
-        # Move to device (model already on device from initialization)
         self.model = self.model.to(self.device)
+        if self.phase == 'finetune' and hasattr(self, 'pretrained_path') and self.pretrained_path:
+            print(f"Loading pretrained encoder from: {self.pretrained_path}")
+            try:
+                checkpoint = torch.load(self.pretrained_path, map_location=self.device, weights_only=False)
+
+                if 'encoder_state_dict' in checkpoint:
+                    encoder_state = checkpoint['encoder_state_dict']
+                else:
+                    encoder_state = checkpoint
+
+                # Load weights
+                self.model.encoder.load_state_dict(encoder_state, strict=False)
+                print(f"✓ Successfully loaded pretrained encoder")
+
+                # Verify weights were loaded (not random)
+                with torch.no_grad():
+                    dummy_input = torch.randn(1, 1, 640).to(self.device)
+                    output = self.model.encoder(dummy_input)
+                    print(f"  Encoder output stats - mean: {output.mean().item():.4f}, std: {output.std().item():.4f}")
+
+            except Exception as e:
+                print(f"ERROR loading pretrained model: {e}")
+                raise
+        # Move to device (model already on device from initialization)
+
 
         # Use DataParallel if multiple GPUs
         if self.device_manager.is_cuda and torch.cuda.device_count() > 1:
@@ -267,7 +260,13 @@ class Trainer:
         optimizer_type = self.training_config.get('optimizer', 'adam').lower()
         learning_rate = self.training_config.get('learning_rate', 0.0001)
         weight_decay = self.training_config.get('weight_decay', 0.00001)
-
+        if self.phase == 'finetune':
+            learning_rate = self.config.get('finetune.learning_rate', 1e-5)
+            print(f"  Using fine-tuning learning rate: {learning_rate}")
+        elif self.phase == 'pretrain':
+            learning_rate = self.config.get('pretrain.learning_rate', 1e-4)
+        else:
+            learning_rate = self.training_config.get('learning_rate', 1e-4)
         # Create optimizer based on config
         if optimizer_type == 'adam':
             self.optimizer = optim.Adam(
@@ -330,13 +329,7 @@ class Trainer:
         else:
             self.scaler = None
 
-        if self.phase == 'finetune':
-            learning_rate = self.config.get('finetune.learning_rate', 1e-5)
-            print(f"  Using fine-tuning learning rate: {learning_rate}")
-        elif self.phase == 'pretrain':
-            learning_rate = self.config.get('pretrain.learning_rate', 1e-4)
-        else:
-            learning_rate = self.training_config.get('learning_rate', 1e-4)
+
 
         weight_decay = self.training_config.get('weight_decay', 1e-5)
         print(f"  Optimizer: {optimizer_type}")
