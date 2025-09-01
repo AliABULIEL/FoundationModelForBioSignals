@@ -220,18 +220,18 @@ class DownstreamEvaluator:
             },
             'bmi_classification': {
                 'type': 'classification',
-                'threshold': 30,
+                'threshold': 25,
                 'label_key': 'bmi'
             },
             'bmi_regression': {
                 'type': 'regression',
                 'label_key': 'bmi'
             },
-            'bp_classification': {
-                'type': 'classification',
-                'threshold': 140,
-                'label_key': 'bp_systolic'
-            }
+            # 'bp_classification': {
+            #     'type': 'classification',
+            #     'threshold': 140,
+            #     'label_key': 'bp_systolic'
+            # }
         }
         
         # Build tasks dict from config list

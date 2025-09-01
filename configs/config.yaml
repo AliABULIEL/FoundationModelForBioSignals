@@ -173,7 +173,7 @@ evaluation:
     - "sex_classification"    # M vs F
     - "bmi_classification"     # >30 vs ≤30
     - "bmi_regression"
-    - "bp_classification"      # Hypertensive vs normal
+#    - "bp_classification"      # Hypertensive vs normal
     - "spo2_prediction"
     - "hr_estimation"
     - "activity_classification"  # For ACC: activity type classification
