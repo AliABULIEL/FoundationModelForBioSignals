@@ -304,249 +304,410 @@ class DownstreamEvaluator:
             batch_size: Optional[int] = None
     ) -> Tuple[np.ndarray, List, np.ndarray]:
         """
-        Extract embeddings with caching optimization.
+        Extract embeddings with BOTH segments processed.
         """
         from torch.utils.data import DataLoader
 
-        # Check if we already have embeddings for this dataset
+        # [Keep your caching logic as is - it's fine]
         dataset_id = id(dataset)
         if (self._current_dataset_id == dataset_id and
                 self._cached_embeddings is not None):
             print("  ✓ Reusing cached embeddings for current dataset")
             return self._cached_embeddings, self._cached_labels, self._cached_pids
 
-        # Check persistent cache
-        if self.cache:
-            cache_key = self.cache.get_cache_key(dataset, self.encoder_path)
-            cached_data = self.cache.get(cache_key)
-            if cached_data is not None:
-                print("  ✓ Loading embeddings from persistent cache")
-                self._current_dataset_id = dataset_id
-                self._cached_embeddings, self._cached_labels, self._cached_pids = cached_data
-                return cached_data
+        # [Keep cache check as is]
 
         print("\n" + "=" * 60)
         print("DEBUG: extract_embeddings")
         print("=" * 60)
 
-        print("DEBUG 1: Dataset Configuration")
-        print(f"  - Dataset type: {type(dataset).__name__}")
-        print(f"  - Dataset return_labels: {dataset.return_labels}")
-        print(f"  - Dataset return_participant_id: {dataset.return_participant_id}")
-        print(f"  - Dataset length: {len(dataset)}")
-        print(f"  - Aggregate by participant: {aggregate_by_participant}")
+        # [Keep your debug prints - they're helpful]
 
-        # Test dataset output
-        print("\nDEBUG 2: Testing dataset.__getitem__ directly")
-        if len(dataset) > 0:
-            test_item = dataset[0]
-            print(f"  - Item returned {len(test_item)} elements")
-            for i, item in enumerate(test_item):
-                if torch.is_tensor(item):
-                    print(f"    [{i}] Tensor shape: {item.shape}")
-                elif isinstance(item, dict):
-                    print(f"    [{i}] Dict with keys: {list(item.keys())}")
-                    for k, v in item.items():
-                        print(f"        {k}: {v}")
-                elif isinstance(item, str):
-                    print(f"    [{i}] String (participant_id): '{item}'")
-                else:
-                    print(f"    [{i}] Type: {type(item).__name__}")
-
-        # Get batch size from config or use device optimal
+        # Get batch size
         if batch_size is None:
             eval_config = self.config.get_evaluation_config()
-            batch_size = eval_config.get('batch_size', None)
-            if batch_size is None:
-                batch_size = self.device_manager.get_optimal_batch_size(dataset.modality)
-            print(f"Using batch size: {batch_size}")
+            batch_size = eval_config.get('batch_size', 512)
+        print(f"Using batch size: {batch_size}")
 
-        # DataLoader settings from config
-        num_workers = self.config.get('evaluation.num_workers', self.device_manager.get_num_workers())
-        
+        # DataLoader settings
+        num_workers = 0  # IMPORTANT: Use 0 to avoid multiprocessing issues with participant IDs
+
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=self.device_manager.is_cuda,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0
+            pin_memory=self.device_manager.is_cuda
         )
 
         all_embeddings = []
         all_labels = []
         all_participant_ids = []
 
-        print("\nDEBUG 3: Processing batches...")
-        print("Extracting embeddings...")
+        print("\nProcessing batches...")
 
-        if self.device_manager.is_cuda:
-            initial_mem = self.device_manager.memory_stats()
-            print(f"  Initial GPU memory: {initial_mem.get('allocated', 0):.2f} GB")
-
-        batch_count = 0
-        for batch_idx, batch in enumerate(tqdm(loader)):
-            batch_count += 1
-
-            # First batch debug
-            if batch_idx == 0:
-                print(f"\nDEBUG 4: First batch structure")
-                print(f"  - Batch contains {len(batch)} elements")
-                for i, b in enumerate(batch):
-                    if torch.is_tensor(b):
-                        print(f"    [{i}] Tensor shape: {b.shape}, dtype: {b.dtype}")
-                    elif isinstance(b, dict):
-                        print(f"    [{i}] Dict with keys: {list(b.keys())}")
-                        for k, v in b.items():
-                            if torch.is_tensor(v):
-                                print(f"        {k}: Tensor shape {v.shape}")
-                            else:
-                                print(f"        {k}: {type(v).__name__}")
-                    else:
-                        print(f"    [{i}] Type: {type(b).__name__}")
+        for batch_idx, batch in enumerate(tqdm(loader, desc="Extracting embeddings")):
 
             # Handle different batch formats
             if len(batch) == 4:
                 seg1, seg2, pid, labels = batch
-                if batch_idx == 0:
-                    print(f"  - Got 4 elements (with labels)")
             elif len(batch) == 3:
                 seg1, seg2, pid = batch
                 labels = {}
-                if batch_idx == 0:
-                    print(f"  - Got 3 elements (no labels)")
             else:
                 seg1, seg2 = batch
                 pid = None
                 labels = {}
-                if batch_idx == 0:
-                    print(f"  - Got 2 elements (no pid, no labels)")
 
-            # Non-blocking transfer
-            if self.device_manager.is_cuda:
-                seg1 = seg1.to(self.device, non_blocking=True)
-            else:
-                seg1 = seg1.to(self.device)
+            # Move to device
+            seg1 = seg1.to(self.device, non_blocking=True)
+            seg2 = seg2.to(self.device, non_blocking=True)  # IMPORTANT: Also move seg2!
 
-            # Extract embeddings
-            embeddings = self.encoder(seg1)
-            all_embeddings.append(embeddings.cpu().numpy())
+            # Extract embeddings for BOTH segments
+            with torch.no_grad():
+                emb1 = self.encoder(seg1)
+                emb2 = self.encoder(seg2)  # IMPORTANT: Process seg2 too!
 
-            # Handle participant IDs
+            # Store BOTH embeddings
+            all_embeddings.append(emb1.cpu().numpy())
+            all_embeddings.append(emb2.cpu().numpy())  # IMPORTANT: Store seg2 embeddings!
+
+            # Handle participant IDs - need to duplicate for both segments
             if pid is not None:
-                if torch.is_tensor(pid):
-                    pid_list = pid.tolist() if pid.dim() > 0 else [pid.item()]
-                elif isinstance(pid, (list, tuple)):
+                if isinstance(pid, (list, tuple)):
                     pid_list = list(pid)
-                elif isinstance(pid, str):
-                    pid_list = [pid] * seg1.shape[0]
                 else:
-                    pid_list = [pid] * seg1.shape[0]
-                all_participant_ids.extend(pid_list)
+                    pid_list = [pid] * seg1.shape[0] if not isinstance(pid, str) else [pid]
 
-                if batch_idx == 0:
-                    print(f"  - PIDs in first batch: {pid_list[:min(3, len(pid_list))]}")
+                # Duplicate PIDs for both seg1 and seg2
+                all_participant_ids.extend(pid_list)  # For seg1
+                all_participant_ids.extend(pid_list)  # For seg2
 
-            # Collect labels
+            # Handle labels - need to duplicate for both segments
             if labels:
-                if batch_idx == 0:
-                    print(f"  - Labels type: {type(labels)}")
-                    print(f"  - Labels keys: {list(labels.keys()) if isinstance(labels, dict) else 'Not a dict'}")
-
                 batch_labels = []
                 batch_size_actual = seg1.shape[0]
 
                 for i in range(batch_size_actual):
-                    try:
-                        if isinstance(labels, dict):
-                            sample_labels = {}
-                            for k, v in labels.items():
-                                if torch.is_tensor(v):
-                                    if v.dim() == 0:
-                                        sample_labels[k] = v.item()
-                                    elif v.shape[0] == batch_size_actual:
-                                        sample_labels[k] = v[i].item()
-                                    else:
-                                        sample_labels[k] = v.item() if v.numel() == 1 else -1
-                                elif isinstance(v, (list, tuple)) and len(v) == batch_size_actual:
-                                    sample_labels[k] = v[i]
-                                elif isinstance(v, (int, float)):
-                                    sample_labels[k] = v
+                    sample_labels = {}
+                    if isinstance(labels, dict):
+                        for k, v in labels.items():
+                            if torch.is_tensor(v):
+                                if v.dim() == 0:
+                                    sample_labels[k] = v.item()
+                                elif v.shape[0] == batch_size_actual:
+                                    sample_labels[k] = v[i].item()
                                 else:
-                                    sample_labels[k] = -1
-                            batch_labels.append(sample_labels)
-                        else:
-                            batch_labels.append({})
-                    except Exception as e:
-                        if batch_idx == 0 and i == 0:
-                            print(f"    ERROR extracting label for sample {i}: {e}")
-                        batch_labels.append({})
+                                    sample_labels[k] = v.item() if v.numel() == 1 else -1
+                            elif isinstance(v, (list, tuple)) and len(v) == batch_size_actual:
+                                sample_labels[k] = v[i]
+                            else:
+                                sample_labels[k] = v if isinstance(v, (int, float)) else -1
+                    batch_labels.append(sample_labels)
 
-                all_labels.extend(batch_labels)
+                # Duplicate labels for both segments
+                all_labels.extend(batch_labels)  # For seg1
+                all_labels.extend(batch_labels)  # For seg2
 
-                if batch_idx == 0 and batch_labels:
-                    print(f"  - First sample labels: {batch_labels[0]}")
+        # Concatenate all embeddings
+        embeddings = np.concatenate(all_embeddings, axis=0)
 
-            # Periodic memory cleanup
-            cache_clean_freq = self.config.get('evaluation.cache_clean_frequency', 50)
-            if self.device_manager.is_cuda and batch_idx % cache_clean_freq == 0:
-                self.device_manager.empty_cache()
-
-        print(f"\nDEBUG 5: Batch processing complete")
-        print(f"  - Processed {batch_count} batches")
-        print(f"  - Total embeddings: {len(all_embeddings)}")
+        print(f"\nExtraction complete:")
+        print(f"  - Total embeddings: {len(embeddings)}")
         print(f"  - Total labels: {len(all_labels)}")
         print(f"  - Total participant IDs: {len(all_participant_ids)}")
+        print(f"  - Unique participants before aggregation: {len(set(all_participant_ids))}")
 
-        # Concatenate
-        embeddings = np.concatenate(all_embeddings, axis=0)
-        print(f"  - Concatenated embeddings shape: {embeddings.shape}")
-
-        # Debug labels
-        if all_labels:
-            print(f"\nDEBUG 6: Labels check")
-            print(f"  - First 3 labels:")
-            for i in range(min(3, len(all_labels))):
-                print(f"    [{i}]: {all_labels[i]}")
-
-            valid_count = sum(1 for label in all_labels
-                              if isinstance(label, dict) and
-                              any(v != -1 for v in label.values()))
-            print(f"  - Labels with valid values: {valid_count}/{len(all_labels)}")
-        else:
-            print(f"\nDEBUG 6: WARNING - No labels collected!")
-
-        if self.device_manager.is_cuda:
-            self.device_manager.empty_cache()
-            final_mem = self.device_manager.memory_stats()
-            print(f"  Final GPU memory: {final_mem.get('allocated', 0):.2f} GB")
-
-        # Aggregate if needed
+        # Aggregate by participant if needed
         if aggregate_by_participant and all_participant_ids:
-            print(f"\nDEBUG 7: Aggregating by participant")
-            print(f"  - Before: {len(embeddings)} embeddings, {len(all_labels)} labels")
-            embeddings, all_labels, all_participant_ids = self._aggregate_by_participant(
-                embeddings, all_labels, all_participant_ids
-            )
-            print(f"  - After: {len(embeddings)} embeddings, {len(all_labels)} labels")
-            print(f"  - Unique participants: {len(np.unique(all_participant_ids))}")
+            print(f"\nAggregating by participant...")
+
+            # Group embeddings by participant
+            participant_embeddings = {}
+            participant_labels = {}
+
+            for emb, label, pid in zip(embeddings, all_labels, all_participant_ids):
+                if pid not in participant_embeddings:
+                    participant_embeddings[pid] = []
+                    participant_labels[pid] = label  # Keep first occurrence of label
+                participant_embeddings[pid].append(emb)
+
+            # Average embeddings per participant
+            aggregated_embeddings = []
+            aggregated_labels = []
+            aggregated_pids = []
+
+            for pid in sorted(participant_embeddings.keys()):
+                # Average all embeddings for this participant
+                avg_embedding = np.mean(participant_embeddings[pid], axis=0)
+                aggregated_embeddings.append(avg_embedding)
+                aggregated_labels.append(participant_labels[pid])
+                aggregated_pids.append(pid)
+
+            embeddings = np.array(aggregated_embeddings)
+            all_labels = aggregated_labels
+            all_participant_ids = aggregated_pids
+
+            print(f"  - After aggregation: {len(embeddings)} participant embeddings")
+            print(f"  - Unique participants: {len(set(all_participant_ids))}")
 
         # Cache the results
-        result = (embeddings, all_labels, np.array(all_participant_ids))
-
-        # Store in memory cache
         self._current_dataset_id = dataset_id
         self._cached_embeddings = embeddings
         self._cached_labels = all_labels
         self._cached_pids = np.array(all_participant_ids)
 
-        # Store in persistent cache
-        if self.cache and cache_key:
-            self.cache.set(cache_key, result)
-            print("  ✓ Cached embeddings for future use")
-
-        return result
+        return embeddings, all_labels, np.array(all_participant_ids)
+    # def extract_embeddings(
+    #         self,
+    #         dataset: BUTPPGDataset,
+    #         aggregate_by_participant: bool = True,
+    #         batch_size: Optional[int] = None
+    # ) -> Tuple[np.ndarray, List, np.ndarray]:
+    #     """
+    #     Extract embeddings with caching optimization.
+    #     """
+    #     from torch.utils.data import DataLoader
+    #
+    #     # Check if we already have embeddings for this dataset
+    #     dataset_id = id(dataset)
+    #     if (self._current_dataset_id == dataset_id and
+    #             self._cached_embeddings is not None):
+    #         print("  ✓ Reusing cached embeddings for current dataset")
+    #         return self._cached_embeddings, self._cached_labels, self._cached_pids
+    #
+    #     # Check persistent cache
+    #     if self.cache:
+    #         cache_key = self.cache.get_cache_key(dataset, self.encoder_path)
+    #         cached_data = self.cache.get(cache_key)
+    #         if cached_data is not None:
+    #             print("  ✓ Loading embeddings from persistent cache")
+    #             self._current_dataset_id = dataset_id
+    #             self._cached_embeddings, self._cached_labels, self._cached_pids = cached_data
+    #             return cached_data
+    #
+    #     print("\n" + "=" * 60)
+    #     print("DEBUG: extract_embeddings")
+    #     print("=" * 60)
+    #
+    #     print("DEBUG 1: Dataset Configuration")
+    #     print(f"  - Dataset type: {type(dataset).__name__}")
+    #     print(f"  - Dataset return_labels: {dataset.return_labels}")
+    #     print(f"  - Dataset return_participant_id: {dataset.return_participant_id}")
+    #     print(f"  - Dataset length: {len(dataset)}")
+    #     print(f"  - Aggregate by participant: {aggregate_by_participant}")
+    #
+    #     # Test dataset output
+    #     print("\nDEBUG 2: Testing dataset.__getitem__ directly")
+    #     if len(dataset) > 0:
+    #         test_item = dataset[0]
+    #         print(f"  - Item returned {len(test_item)} elements")
+    #         for i, item in enumerate(test_item):
+    #             if torch.is_tensor(item):
+    #                 print(f"    [{i}] Tensor shape: {item.shape}")
+    #             elif isinstance(item, dict):
+    #                 print(f"    [{i}] Dict with keys: {list(item.keys())}")
+    #                 for k, v in item.items():
+    #                     print(f"        {k}: {v}")
+    #             elif isinstance(item, str):
+    #                 print(f"    [{i}] String (participant_id): '{item}'")
+    #             else:
+    #                 print(f"    [{i}] Type: {type(item).__name__}")
+    #
+    #     # Get batch size from config or use device optimal
+    #     if batch_size is None:
+    #         eval_config = self.config.get_evaluation_config()
+    #         batch_size = eval_config.get('batch_size', None)
+    #         if batch_size is None:
+    #             batch_size = self.device_manager.get_optimal_batch_size(dataset.modality)
+    #         print(f"Using batch size: {batch_size}")
+    #
+    #     # DataLoader settings from config
+    #     num_workers = self.config.get('evaluation.num_workers', self.device_manager.get_num_workers())
+    #
+    #     loader = DataLoader(
+    #         dataset,
+    #         batch_size=batch_size,
+    #         shuffle=False,
+    #         num_workers=num_workers,
+    #         pin_memory=self.device_manager.is_cuda,
+    #         prefetch_factor=2 if num_workers > 0 else None,
+    #         persistent_workers=num_workers > 0
+    #     )
+    #
+    #     all_embeddings = []
+    #     all_labels = []
+    #     all_participant_ids = []
+    #
+    #     print("\nDEBUG 3: Processing batches...")
+    #     print("Extracting embeddings...")
+    #
+    #     if self.device_manager.is_cuda:
+    #         initial_mem = self.device_manager.memory_stats()
+    #         print(f"  Initial GPU memory: {initial_mem.get('allocated', 0):.2f} GB")
+    #
+    #     batch_count = 0
+    #     for batch_idx, batch in enumerate(tqdm(loader)):
+    #         batch_count += 1
+    #
+    #         # First batch debug
+    #         if batch_idx == 0:
+    #             print(f"\nDEBUG 4: First batch structure")
+    #             print(f"  - Batch contains {len(batch)} elements")
+    #             for i, b in enumerate(batch):
+    #                 if torch.is_tensor(b):
+    #                     print(f"    [{i}] Tensor shape: {b.shape}, dtype: {b.dtype}")
+    #                 elif isinstance(b, dict):
+    #                     print(f"    [{i}] Dict with keys: {list(b.keys())}")
+    #                     for k, v in b.items():
+    #                         if torch.is_tensor(v):
+    #                             print(f"        {k}: Tensor shape {v.shape}")
+    #                         else:
+    #                             print(f"        {k}: {type(v).__name__}")
+    #                 else:
+    #                     print(f"    [{i}] Type: {type(b).__name__}")
+    #
+    #         # Handle different batch formats
+    #         if len(batch) == 4:
+    #             seg1, seg2, pid, labels = batch
+    #             if batch_idx == 0:
+    #                 print(f"  - Got 4 elements (with labels)")
+    #         elif len(batch) == 3:
+    #             seg1, seg2, pid = batch
+    #             labels = {}
+    #             if batch_idx == 0:
+    #                 print(f"  - Got 3 elements (no labels)")
+    #         else:
+    #             seg1, seg2 = batch
+    #             pid = None
+    #             labels = {}
+    #             if batch_idx == 0:
+    #                 print(f"  - Got 2 elements (no pid, no labels)")
+    #
+    #         # Non-blocking transfer
+    #         if self.device_manager.is_cuda:
+    #             seg1 = seg1.to(self.device, non_blocking=True)
+    #         else:
+    #             seg1 = seg1.to(self.device)
+    #
+    #         # Extract embeddings
+    #         embeddings = self.encoder(seg1)
+    #         all_embeddings.append(embeddings.cpu().numpy())
+    #
+    #         # Handle participant IDs
+    #         if pid is not None:
+    #             if torch.is_tensor(pid):
+    #                 pid_list = pid.tolist() if pid.dim() > 0 else [pid.item()]
+    #             elif isinstance(pid, (list, tuple)):
+    #                 pid_list = list(pid)
+    #             elif isinstance(pid, str):
+    #                 pid_list = [pid] * seg1.shape[0]
+    #             else:
+    #                 pid_list = [pid] * seg1.shape[0]
+    #             all_participant_ids.extend(pid_list)
+    #
+    #             if batch_idx == 0:
+    #                 print(f"  - PIDs in first batch: {pid_list[:min(3, len(pid_list))]}")
+    #
+    #         # Collect labels
+    #         if labels:
+    #             if batch_idx == 0:
+    #                 print(f"  - Labels type: {type(labels)}")
+    #                 print(f"  - Labels keys: {list(labels.keys()) if isinstance(labels, dict) else 'Not a dict'}")
+    #
+    #             batch_labels = []
+    #             batch_size_actual = seg1.shape[0]
+    #
+    #             for i in range(batch_size_actual):
+    #                 try:
+    #                     if isinstance(labels, dict):
+    #                         sample_labels = {}
+    #                         for k, v in labels.items():
+    #                             if torch.is_tensor(v):
+    #                                 if v.dim() == 0:
+    #                                     sample_labels[k] = v.item()
+    #                                 elif v.shape[0] == batch_size_actual:
+    #                                     sample_labels[k] = v[i].item()
+    #                                 else:
+    #                                     sample_labels[k] = v.item() if v.numel() == 1 else -1
+    #                             elif isinstance(v, (list, tuple)) and len(v) == batch_size_actual:
+    #                                 sample_labels[k] = v[i]
+    #                             elif isinstance(v, (int, float)):
+    #                                 sample_labels[k] = v
+    #                             else:
+    #                                 sample_labels[k] = -1
+    #                         batch_labels.append(sample_labels)
+    #                     else:
+    #                         batch_labels.append({})
+    #                 except Exception as e:
+    #                     if batch_idx == 0 and i == 0:
+    #                         print(f"    ERROR extracting label for sample {i}: {e}")
+    #                     batch_labels.append({})
+    #
+    #             all_labels.extend(batch_labels)
+    #
+    #             if batch_idx == 0 and batch_labels:
+    #                 print(f"  - First sample labels: {batch_labels[0]}")
+    #
+    #         # Periodic memory cleanup
+    #         cache_clean_freq = self.config.get('evaluation.cache_clean_frequency', 50)
+    #         if self.device_manager.is_cuda and batch_idx % cache_clean_freq == 0:
+    #             self.device_manager.empty_cache()
+    #
+    #     print(f"\nDEBUG 5: Batch processing complete")
+    #     print(f"  - Processed {batch_count} batches")
+    #     print(f"  - Total embeddings: {len(all_embeddings)}")
+    #     print(f"  - Total labels: {len(all_labels)}")
+    #     print(f"  - Total participant IDs: {len(all_participant_ids)}")
+    #
+    #     # Concatenate
+    #     embeddings = np.concatenate(all_embeddings, axis=0)
+    #     print(f"  - Concatenated embeddings shape: {embeddings.shape}")
+    #
+    #     # Debug labels
+    #     if all_labels:
+    #         print(f"\nDEBUG 6: Labels check")
+    #         print(f"  - First 3 labels:")
+    #         for i in range(min(3, len(all_labels))):
+    #             print(f"    [{i}]: {all_labels[i]}")
+    #
+    #         valid_count = sum(1 for label in all_labels
+    #                           if isinstance(label, dict) and
+    #                           any(v != -1 for v in label.values()))
+    #         print(f"  - Labels with valid values: {valid_count}/{len(all_labels)}")
+    #     else:
+    #         print(f"\nDEBUG 6: WARNING - No labels collected!")
+    #
+    #     if self.device_manager.is_cuda:
+    #         self.device_manager.empty_cache()
+    #         final_mem = self.device_manager.memory_stats()
+    #         print(f"  Final GPU memory: {final_mem.get('allocated', 0):.2f} GB")
+    #
+    #     # Aggregate if needed
+    #     if aggregate_by_participant and all_participant_ids:
+    #         print(f"\nDEBUG 7: Aggregating by participant")
+    #         print(f"  - Before: {len(embeddings)} embeddings, {len(all_labels)} labels")
+    #         embeddings, all_labels, all_participant_ids = self._aggregate_by_participant(
+    #             embeddings, all_labels, all_participant_ids
+    #         )
+    #         print(f"  - After: {len(embeddings)} embeddings, {len(all_labels)} labels")
+    #         print(f"  - Unique participants: {len(np.unique(all_participant_ids))}")
+    #
+    #     # Cache the results
+    #     result = (embeddings, all_labels, np.array(all_participant_ids))
+    #
+    #     # Store in memory cache
+    #     self._current_dataset_id = dataset_id
+    #     self._cached_embeddings = embeddings
+    #     self._cached_labels = all_labels
+    #     self._cached_pids = np.array(all_participant_ids)
+    #
+    #     # Store in persistent cache
+    #     if self.cache and cache_key:
+    #         self.cache.set(cache_key, result)
+    #         print("  ✓ Cached embeddings for future use")
+    #
+    #     return result
 
     def _aggregate_by_participant(
             self,

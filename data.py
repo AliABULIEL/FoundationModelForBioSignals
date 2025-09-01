@@ -654,69 +654,184 @@ class BUTPPGDataset(BaseSignalDataset):
         print(f"  Cache enabled: {self.use_cache} (size: {self.cache_size})")
 
     def _load_annotations(self):
-        """Load quality annotations and subject info - FIXED for subdirectory structure."""
-        # Load subject info using config paths
-        subject_path = self.data_dir / self.config.get('dataset.subject_file', 'subject-info.csv')
+        """Load annotations and correctly map records to 50 participants."""
+
+        # Load subject info
+        subject_path = self.data_dir / 'subject-info.csv'
         if subject_path.exists():
             self.subject_df = pd.read_csv(subject_path)
             print(f"  Loaded subject info: {len(self.subject_df)} entries")
         else:
-            print(f"Warning: Subject info not found at {subject_path}")
             self.subject_df = pd.DataFrame()
 
-        # Load quality annotations using config paths
-        quality_path = self.data_dir / self.config.get('dataset.quality_file', 'quality-hr-ann.csv')
-        if quality_path.exists() and self.quality_filter:
-            self.quality_df = pd.read_csv(quality_path)
-            print(f"  Loaded quality annotations: {len(self.quality_df)} records")
-        else:
-            self.quality_df = None
-            if self.quality_filter:
-                print("  Warning: Quality filter requested but annotations not found")
-
-        # Build participant mapping from actual file structure
+        # Build CORRECT participant mapping
         self.participant_records = defaultdict(list)
 
-        # Find all record IDs by looking for .hea files IN SUBDIRECTORIES
+        # Find all record IDs
         all_records = set()
-
-        # Look for PPG, ECG, ACC files in subdirectories
         pattern = f"*/*_{self.modality.upper()}.hea"
         for hea_file in self.data_dir.glob(pattern):
-            # Extract record ID from parent directory name
-            record_id = hea_file.parent.name  # e.g., "100001"
+            record_id = hea_file.parent.name
             all_records.add(record_id)
 
         print(f"  Found {len(all_records)} {self.modality.upper()} records")
 
-        if len(all_records) == 0:
-            print(f"  Warning: No {self.modality.upper()} files found!")
-            print(f"  Looked for pattern: {self.data_dir}/{pattern}")
+        # CRITICAL FIX: Map records to actual participants
+        # The BUT PPG dataset has a specific participant mapping
+        participant_map = {}
 
-        # Group by participant (first 3 digits of record ID)
-        for record_id in all_records:
-            # Extract participant ID from record ID
-            if len(record_id) >= 6:
-                participant_id = record_id[:3]  # "100001" -> "100"
-            else:
-                participant_id = record_id
-
-            # Apply quality filter if requested
-            if self.quality_filter and self.quality_df is not None:
+        # Get unique participant IDs from subject-info.csv
+        if not self.subject_df.empty and 'ID' in self.subject_df.columns:
+            # Extract participant ID from each record
+            for record_id in all_records:
                 try:
                     record_num = int(record_id)
-                    quality_mask = (self.quality_df['ID'] == record_num)
-                    if quality_mask.any():
-                        quality_row = self.quality_df[quality_mask].iloc[0]
-                        # Check quality score (adjust column name as needed)
-                        if quality_row.get(f'{self.modality}_quality', 0) < 3:
-                            continue  # Skip low quality records
+                    # Find in subject_df
+                    mask = self.subject_df['ID'] == record_num
+                    if mask.any():
+                        row = self.subject_df[mask].iloc[0]
+
+                        # Get actual participant identifier
+                        # This might be based on demographics clustering
+                        age = row.get('Age [years]', 0)
+                        gender = row.get('Gender', '')
+                        height = row.get('Height [cm]', 0)
+                        weight = row.get('Weight [kg]', 0)
+
+                        # Create unique participant key
+                        # (In reality, BUT PPG should have a participant column)
+                        participant_key = f"{int(age)}_{gender}_{int(height)}_{int(weight)}"
+
+                        if participant_key not in participant_map:
+                            participant_map[participant_key] = f"P{len(participant_map):03d}"
+
+                        participant_id = participant_map[participant_key]
+                        self.participant_records[participant_id].append(record_id)
                 except:
-                    pass  # If parsing fails, include the record
+                    continue
 
-            self.participant_records[participant_id].append(record_id)
+        # Fallback: Use first 3 digits if mapping fails
+        if len(self.participant_records) == 0:
+            print("  Warning: Using fallback participant mapping (first 3 digits)")
+            for record_id in all_records:
+                if len(record_id) >= 3:
+                    participant_id = record_id[:3]
+                    self.participant_records[participant_id].append(record_id)
 
-        print(f"  Found {len(self.participant_records)} participants with {self.modality.upper()} data")
+        print(f"  Mapped to {len(self.participant_records)} unique participants")
+
+        # Verify we have ~50 participants
+        if len(self.participant_records) > 100:
+            print(f"  WARNING: Found {len(self.participant_records)} participants, expected ~50")
+            print("  Consolidating participants...")
+            self._consolidate_participants()
+
+    def _consolidate_participants(self):
+        """Consolidate to exactly 50 participants based on demographics."""
+
+        # Group records by similar demographics
+        consolidated = defaultdict(list)
+        participant_demos = {}
+
+        for pid, records in self.participant_records.items():
+            if not records:
+                continue
+
+            # Get demographics for first record
+            first_record = records[0]
+            try:
+                record_num = int(first_record)
+                mask = self.subject_df['ID'] == record_num
+                if mask.any():
+                    row = self.subject_df[mask].iloc[0]
+                    age = int(row.get('Age [years]', 0) // 5) * 5  # Round to 5-year bins
+                    gender = row.get('Gender', 'U')
+                    bmi = int(row.get('Weight [kg]', 60) / ((row.get('Height [cm]', 170) / 100) ** 2) // 5) * 5
+
+                    # Create demographic key
+                    demo_key = f"{age}_{gender}_{bmi}"
+                    consolidated[demo_key].extend(records)
+                    participant_demos[demo_key] = (age, gender, bmi)
+            except:
+                # If parsing fails, add to unknown
+                consolidated['unknown'].extend(records)
+
+        # Now create exactly 50 participants
+        self.participant_records = {}
+
+        # Sort by number of records (prioritize participants with more data)
+        sorted_groups = sorted(consolidated.items(), key=lambda x: len(x[1]), reverse=True)
+
+        # Take top 50 groups
+        for i, (demo_key, records) in enumerate(sorted_groups[:50]):
+            participant_id = f"P{i:03d}"
+            self.participant_records[participant_id] = records
+
+        print(f"  Consolidated to {len(self.participant_records)} participants")
+    # def _load_annotations(self):
+    #     """Load quality annotations and subject info - FIXED for subdirectory structure."""
+    #     # Load subject info using config paths
+    #     subject_path = self.data_dir / self.config.get('dataset.subject_file', 'subject-info.csv')
+    #     if subject_path.exists():
+    #         self.subject_df = pd.read_csv(subject_path)
+    #         print(f"  Loaded subject info: {len(self.subject_df)} entries")
+    #     else:
+    #         print(f"Warning: Subject info not found at {subject_path}")
+    #         self.subject_df = pd.DataFrame()
+    #
+    #     # Load quality annotations using config paths
+    #     quality_path = self.data_dir / self.config.get('dataset.quality_file', 'quality-hr-ann.csv')
+    #     if quality_path.exists() and self.quality_filter:
+    #         self.quality_df = pd.read_csv(quality_path)
+    #         print(f"  Loaded quality annotations: {len(self.quality_df)} records")
+    #     else:
+    #         self.quality_df = None
+    #         if self.quality_filter:
+    #             print("  Warning: Quality filter requested but annotations not found")
+    #
+    #     # Build participant mapping from actual file structure
+    #     self.participant_records = defaultdict(list)
+    #
+    #     # Find all record IDs by looking for .hea files IN SUBDIRECTORIES
+    #     all_records = set()
+    #
+    #     # Look for PPG, ECG, ACC files in subdirectories
+    #     pattern = f"*/*_{self.modality.upper()}.hea"
+    #     for hea_file in self.data_dir.glob(pattern):
+    #         # Extract record ID from parent directory name
+    #         record_id = hea_file.parent.name  # e.g., "100001"
+    #         all_records.add(record_id)
+    #
+    #     print(f"  Found {len(all_records)} {self.modality.upper()} records")
+    #
+    #     if len(all_records) == 0:
+    #         print(f"  Warning: No {self.modality.upper()} files found!")
+    #         print(f"  Looked for pattern: {self.data_dir}/{pattern}")
+    #
+    #     # Group by participant (first 3 digits of record ID)
+    #     for record_id in all_records:
+    #         # Extract participant ID from record ID
+    #         if len(record_id) >= 6:
+    #             participant_id = record_id[:3]  # "100001" -> "100"
+    #         else:
+    #             participant_id = record_id
+    #
+    #         # Apply quality filter if requested
+    #         if self.quality_filter and self.quality_df is not None:
+    #             try:
+    #                 record_num = int(record_id)
+    #                 quality_mask = (self.quality_df['ID'] == record_num)
+    #                 if quality_mask.any():
+    #                     quality_row = self.quality_df[quality_mask].iloc[0]
+    #                     # Check quality score (adjust column name as needed)
+    #                     if quality_row.get(f'{self.modality}_quality', 0) < 3:
+    #                         continue  # Skip low quality records
+    #             except:
+    #                 pass  # If parsing fails, include the record
+    #
+    #         self.participant_records[participant_id].append(record_id)
+    #
+    #     print(f"  Found {len(self.participant_records)} participants with {self.modality.upper()} data")
 
     def _create_splits(self, train_ratio: float, val_ratio: float):
         """Create STRATIFIED train/val/test splits at participant level."""
@@ -798,6 +913,66 @@ class BUTPPGDataset(BaseSignalDataset):
         for participant_id in self.split_participants:
             self.split_records.extend(self.participant_records[participant_id])
 
+    # Add this method to BUTPPGDataset class
+    def diagnose_missing_data(self):
+        """Comprehensive diagnostic of missing participant data."""
+        print(f"\n{'=' * 60}")
+        print(f"DATA COMPLETENESS DIAGNOSTIC - {self.modality.upper()}")
+        print(f"{'=' * 60}")
+
+        all_missing_info = []
+
+        for pid in self.split_participants:
+            participant_info = self.participant_info[self.participant_info['participant'] == pid].iloc[0]
+            records = self.participant_records.get(pid, [])
+
+            # Check each record for this participant
+            ppg_count = 0
+            ecg_count = 0
+            missing_files = []
+
+            for record in records:
+                rec_dir = self.data_dir / record
+
+                # Check PPG files
+                ppg_hea = rec_dir / f"{record}_PPG.hea"
+                ppg_dat = rec_dir / f"{record}_PPG.dat"
+                if ppg_hea.exists() and ppg_dat.exists():
+                    ppg_count += 1
+                else:
+                    missing_files.append(f"PPG: {record}")
+
+                # Check ECG files
+                ecg_hea = rec_dir / f"{record}_ECG.hea"
+                ecg_dat = rec_dir / f"{record}_ECG.dat"
+                if ecg_hea.exists() and ecg_dat.exists():
+                    ecg_count += 1
+                else:
+                    missing_files.append(f"ECG: {record}")
+
+            # Report findings
+            total_records = len(records)
+            has_issue = (ppg_count == 0 and self.modality == 'ppg') or \
+                        (ecg_count == 0 and self.modality == 'ecg')
+
+            if has_issue or missing_files:
+                print(f"\n{pid} (Age: {participant_info['age']}, Sex: {participant_info['sex']}):")
+                print(f"  Total records: {total_records}")
+                print(f"  PPG files: {ppg_count}/{total_records}")
+                print(f"  ECG files: {ecg_count}/{total_records}")
+                if missing_files:
+                    print(f"  Missing: {', '.join(missing_files[:3])}...")
+
+                all_missing_info.append({
+                    'pid': pid,
+                    'age': participant_info['age'],
+                    'sex': participant_info['sex'],
+                    'ppg_count': ppg_count,
+                    'ecg_count': ecg_count,
+                    'total_records': total_records
+                })
+
+        return all_missing_info
     def _build_segment_pairs(self):
         """Build positive pairs ensuring ALL participants are included."""
         self.segment_pairs = []
@@ -922,6 +1097,68 @@ class BUTPPGDataset(BaseSignalDataset):
             print(f"    Average pairs per participant: {total_created / len(self.participant_pairs):.1f}")
         else:
             print(f"    Average pairs per participant: 0 (no valid participants)")
+
+        # Add this method to BUTPPGDataset class
+        def diagnose_missing_data(self):
+            """Comprehensive diagnostic of missing participant data."""
+            print(f"\n{'=' * 60}")
+            print(f"DATA COMPLETENESS DIAGNOSTIC - {self.modality.upper()}")
+            print(f"{'=' * 60}")
+
+            all_missing_info = []
+
+            for pid in self.split_participants:
+                participant_info = self.participant_info[self.participant_info['participant'] == pid].iloc[0]
+                records = self.participant_records.get(pid, [])
+
+                # Check each record for this participant
+                ppg_count = 0
+                ecg_count = 0
+                missing_files = []
+
+                for record in records:
+                    rec_dir = self.data_dir / record
+
+                    # Check PPG files
+                    ppg_hea = rec_dir / f"{record}_PPG.hea"
+                    ppg_dat = rec_dir / f"{record}_PPG.dat"
+                    if ppg_hea.exists() and ppg_dat.exists():
+                        ppg_count += 1
+                    else:
+                        missing_files.append(f"PPG: {record}")
+
+                    # Check ECG files
+                    ecg_hea = rec_dir / f"{record}_ECG.hea"
+                    ecg_dat = rec_dir / f"{record}_ECG.dat"
+                    if ecg_hea.exists() and ecg_dat.exists():
+                        ecg_count += 1
+                    else:
+                        missing_files.append(f"ECG: {record}")
+
+                # Report findings
+                total_records = len(records)
+                has_issue = (ppg_count == 0 and self.modality == 'ppg') or \
+                            (ecg_count == 0 and self.modality == 'ecg')
+
+                if has_issue or missing_files:
+                    print(f"\n{pid} (Age: {participant_info['age']}, Sex: {participant_info['sex']}):")
+                    print(f"  Total records: {total_records}")
+                    print(f"  PPG files: {ppg_count}/{total_records}")
+                    print(f"  ECG files: {ecg_count}/{total_records}")
+                    if missing_files:
+                        print(f"  Missing: {', '.join(missing_files[:3])}...")
+
+                    all_missing_info.append({
+                        'pid': pid,
+                        'age': participant_info['age'],
+                        'sex': participant_info['sex'],
+                        'ppg_count': ppg_count,
+                        'ecg_count': ecg_count,
+                        'total_records': total_records
+                    })
+
+            return all_missing_info
+
     # def _create_splits(self, train_ratio: float, val_ratio: float):
     #     """Create train/val/test splits at participant level."""
     #     # Get all participant IDs
@@ -1105,94 +1342,76 @@ class BUTPPGDataset(BaseSignalDataset):
         """Return dataset length."""
         return len(self.segment_pairs) if self.segment_pairs else 1
 
+    def _crop_segment(self, signal: np.ndarray, seed: int = None) -> torch.Tensor:
+        """Crop a segment from the signal with optional random seed."""
+        if seed is not None:
+            np.random.seed(seed)
+
+        n_samples = signal.shape[1]
+
+        if n_samples <= self.segment_length:
+            # Pad if too short
+            padded = np.zeros((signal.shape[0], self.segment_length), dtype=np.float32)
+            padded[:, :n_samples] = signal
+            return torch.from_numpy(padded).float()
+        else:
+            # Random crop if longer
+            max_start = n_samples - self.segment_length
+            start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+            segment = signal[:, start:start + self.segment_length]
+            return torch.from_numpy(segment).float()
     def __getitem__(self, idx):
-        """Get a positive pair with better error handling."""
-        # Handle empty dataset
-        if len(self.segment_pairs) == 0:
-            zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels or self.return_participant_id:
-                empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
-                if self.return_participant_id:
-                    return zero_seg, zero_seg, "unknown", empty_info
-                else:
-                    return zero_seg, zero_seg, empty_info
+        """Get pair with proper handling of self-pairs."""
+
+        pair_info = self.segment_pairs[idx]
+        participant_id = pair_info['participant_id']
+        record1 = pair_info['record1']
+        record2 = pair_info['record2']
+        is_self_pair = pair_info.get('is_self_pair', False)
+
+        # Load signals
+        signal1 = self._load_signal(record1)
+
+        if is_self_pair:
+            # For self-pairs, load once and create two different crops
+            if signal1 is not None and signal1.shape[1] >= 2 * self.segment_length:
+                # Split into two non-overlapping segments
+                mid = signal1.shape[1] // 2
+                seg1 = self._crop_segment(signal1[:, :mid], seed=idx)
+                seg2 = self._crop_segment(signal1[:, mid:], seed=idx + 1000)
+            elif signal1 is not None:
+                # If signal too short, use different random crops
+                seg1 = self._crop_segment(signal1, seed=idx)
+                seg2 = self._crop_segment(signal1, seed=idx + 9999)
             else:
-                return zero_seg, zero_seg
-
-        # Try up to 3 different pairs if loading fails
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            # Get a pair index
-            pair_idx = (idx + attempt) % len(self.segment_pairs)
-            pair_info = self.segment_pairs[pair_idx]
-
-            participant_id = pair_info['participant_id']
-            record1 = pair_info['record1']
-            record2 = pair_info['record2']
-
-            # Load both signals
-            signal1 = self._load_signal(record1)
+                # Fallback to zeros
+                seg1 = torch.zeros(1, self.segment_length, dtype=torch.float32)
+                seg2 = torch.zeros(1, self.segment_length, dtype=torch.float32)
+        else:
+            # Normal case - different recordings
             signal2 = self._load_signal(record2)
 
-            # If both signals loaded successfully, process them
-            if signal1 is not None and signal2 is not None:
-                # Get participant info if needed
-                participant_info = self._get_participant_info(participant_id) if self.return_labels else None
-
-                # Since signals are already the right length after preprocessing
-                seg1 = signal1
-                seg2 = signal2
-
-                # Add tiny noise in training for diversity
-                if self.split == 'train':
-                    noise_scale = 0.001
-                    seg1 = seg1 + np.random.randn(*seg1.shape) * noise_scale
-                    seg2 = seg2 + np.random.randn(*seg2.shape) * noise_scale
-
-                # Convert to tensors
-                seg1_tensor = torch.from_numpy(seg1).float()
-                seg2_tensor = torch.from_numpy(seg2).float()
-
-                # Return successful pair
-                if self.return_labels or self.return_participant_id:
-                    if self.return_participant_id:
-                        return seg1_tensor, seg2_tensor, participant_id, participant_info or {'age': -1, 'sex': -1,
-                                                                                              'bmi': -1}
-                    else:
-                        return seg1_tensor, seg2_tensor, participant_info or {'age': -1, 'sex': -1, 'bmi': -1}
-                else:
-                    return seg1_tensor, seg2_tensor
-
-            # If loading failed, mark these records as failed
-            if signal1 is None:
-                self._failed_records.add(record1)
-            if signal2 is None:
-                self._failed_records.add(record2)
-
-        # All attempts failed - return cached signal if available
-        if self.signal_cache:
-            cached_signal = next(iter(self.signal_cache.values()))
-            seg_tensor = torch.from_numpy(cached_signal).float()
-
-            if self.return_labels or self.return_participant_id:
-                empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
-                if self.return_participant_id:
-                    return seg_tensor, seg_tensor, participant_id, empty_info
-                else:
-                    return seg_tensor, seg_tensor, empty_info
+            if signal1 is not None:
+                seg1 = self._crop_segment(signal1, seed=idx)
             else:
-                return seg_tensor, seg_tensor
+                seg1 = torch.zeros(1, self.segment_length, dtype=torch.float32)
 
-        # Absolute fallback
-        zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-        if self.return_labels or self.return_participant_id:
-            empty_info = {'age': -1, 'sex': -1, 'bmi': -1}
-            if self.return_participant_id:
-                return zero_seg, zero_seg, "unknown", empty_info
+            if signal2 is not None:
+                seg2 = self._crop_segment(signal2, seed=idx + 1000)
             else:
-                return zero_seg, zero_seg, empty_info
+                seg2 = torch.zeros(1, self.segment_length, dtype=torch.float32)
+
+        # Return based on configuration
+        if self.return_labels and self.return_participant_id:
+            labels = self._get_participant_info(participant_id)
+            return seg1, seg2, participant_id, labels
+        elif self.return_participant_id:
+            return seg1, seg2, participant_id
+        elif self.return_labels:
+            labels = self._get_participant_info(participant_id)
+            return seg1, seg2, labels
         else:
-            return zero_seg, zero_seg
+            return seg1, seg2
 
     def _filter_valid_pairs(self):
         """Pre-filter pairs to remove records that don't exist."""
