@@ -21,8 +21,8 @@ dataset:
   cache_size: 500
 
   # NEW: Pair generation settings for BUT PPG
-  pairs_per_participant: 20  # Target pairs per participant
-  max_pairs_per_participant: 100  # Hard limit to prevent explosion
+  pairs_per_participant: 50  # Target pairs per participant
+  max_pairs_per_participant: 150  # Hard limit to prevent explosion
   min_recordings_for_pairs: 2  # Minimum recordings needed
 
   # Data split ratios
@@ -110,10 +110,10 @@ ssl:
 
   # Augmentations (paper Table 1)
   augmentations_ppg:
-    cutout: 0.4  # Paper value
-    magnitude_warp: 0.25
-    gaussian_noise: 0.25
-    time_warp: 0.15
+    cutout: 0.7  # Paper value
+    magnitude_warp: 0.5
+    gaussian_noise: 0.5
+    time_warp: 0.3
     channel_permute: 0.0
 
   augmentations_ecg:
