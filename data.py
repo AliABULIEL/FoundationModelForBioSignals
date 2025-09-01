@@ -158,7 +158,14 @@ class VitalDBDataset(BaseSignalDataset):
         # Get modality config
         modality_config = self.config.get_modality_config(modality)
         self.target_fs = modality_config.get('target_fs')
-        self.segment_length_sec = modality_config.get('segment_length')
+        self.downsample = self.config.get('downsample.enabled', False)
+
+        if self.downsample:
+            self.segment_length_sec = self.config.get('downsample.segment_length_sec', 5)
+            original_length = modality_config.get('segment_length', 10)
+            print(f"  ⚡ Downsampling enabled: {original_length}s → {self.segment_length_sec}s segments")
+        else:
+            self.segment_length_sec = modality_config.get('segment_length', 10)
         self.segment_length = int(self.segment_length_sec * self.target_fs)
         self.band_low = modality_config.get('band_low')
         self.band_high = modality_config.get('band_high')
