@@ -258,11 +258,13 @@ pretrain:
 # Fine-tuning settings
 finetune:
   dataset: "but_ppg"
-  epochs: 20
-  batch_size: 64
-  learning_rate: 0.00001
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.0001
   num_workers: 4
   freeze_encoder: false
   save_freq: 5
   early_stopping_patience: 10
+
+
 
