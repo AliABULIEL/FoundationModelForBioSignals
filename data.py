@@ -719,163 +719,40 @@ class BUTPPGDataset(BaseSignalDataset):
         print(f"  Found {len(self.participant_records)} participants with {self.modality.upper()} data")
 
     def _create_splits(self, train_ratio: float, val_ratio: float):
-        """Create stratified train/val/test splits at participant level."""
+        """Create train/val/test splits at participant level."""
+        # Get all participant IDs
         all_participants = list(self.participant_records.keys())
 
         if len(all_participants) == 0:
-            print("  Warning: No participants found!")
+            print("  Warning: No participants found! Check data structure.")
             self.split_participants = []
             self.split_records = []
             return
 
-        # Get participant demographics for stratification
-        participant_df = []
-        for pid in all_participants:
-            info = self._get_participant_info(pid)
-            if info['age'] > 0:  # Valid participant
-                participant_df.append({
-                    'participant_id': pid,
-                    'age': info['age'],
-                    'sex': info['sex'],
-                    'bmi': info.get('bmi', -1)
-                })
+        # Sort for reproducibility
+        all_participants.sort()
 
-        if not participant_df:
-            # Fallback to random split
-            self._create_random_splits(all_participants, train_ratio, val_ratio)
-            return
+        # Set random seed for reproducible splits
+        np.random.seed(self.random_seed)
+        np.random.shuffle(all_participants)
 
-        df = pd.DataFrame(participant_df)
+        # Calculate split sizes
+        n_total = len(all_participants)
+        n_train = int(n_total * train_ratio)
+        n_val = int(n_total * val_ratio)
 
-        # Create stratification groups
-        df['age_group'] = pd.cut(df['age'],
-                                 bins=[0, 30, 50, 100],
-                                 labels=['young', 'middle', 'older'])
-        df['bmi_group'] = pd.cut(df['bmi'].clip(lower=15, upper=40),
-                                 bins=[0, 25, 30, 100],
-                                 labels=['normal', 'overweight', 'obese'])
-
-        # Composite stratification key
-        df['strat_key'] = (df['age_group'].astype(str) + '_' +
-                           df['sex'].astype(str))
-
-        # Stratified split
-        from sklearn.model_selection import train_test_split
-
-        # First split: train+val vs test
-        train_val_df, test_df = train_test_split(
-            df,
-            test_size=1 - train_ratio - val_ratio,
-            stratify=df['strat_key'],
-            random_state=self.random_seed
-        )
-
-        # Second split: train vs val
-        train_df, val_df = train_test_split(
-            train_val_df,
-            test_size=val_ratio / (train_ratio + val_ratio),
-            stratify=train_val_df['strat_key'],
-            random_state=self.random_seed
-        )
-
-        # Assign participants to splits
+        # Split participants
         if self.split == 'train':
-            self.split_participants = train_df['participant_id'].tolist()
+            self.split_participants = all_participants[:n_train]
         elif self.split == 'val':
-            self.split_participants = val_df['participant_id'].tolist()
+            self.split_participants = all_participants[n_train:n_train + n_val]
         else:  # test
-            self.split_participants = test_df['participant_id'].tolist()
+            self.split_participants = all_participants[n_train + n_val:]
 
         # Get all records for split participants
         self.split_records = []
         for participant_id in self.split_participants:
             self.split_records.extend(self.participant_records[participant_id])
-
-        # Print distribution statistics
-        self._print_split_statistics(train_df, val_df, test_df)
-
-    def _print_split_statistics(self, train_df, val_df, test_df):
-        """Print detailed statistics about the splits."""
-        print("\n" + "=" * 60)
-        print("SPLIT STATISTICS")
-        print("=" * 60)
-
-        for split_name, split_df in [('Train', train_df),
-                                     ('Val', val_df),
-                                     ('Test', test_df)]:
-            print(f"\n{split_name} Set:")
-            print(f"  Participants: {len(split_df)}")
-            print(f"  Age: {split_df['age'].mean():.1f} ± {split_df['age'].std():.1f}")
-            print(f"  Age range: {split_df['age'].min():.0f} - {split_df['age'].max():.0f}")
-            print(f"  Age ≥50: {(split_df['age'] >= 50).sum()} ({(split_df['age'] >= 50).mean() * 100:.1f}%)")
-            print(f"  Male ratio: {(split_df['sex'] == 1).mean():.2f}")
-
-            valid_bmi = split_df[split_df['bmi'] > 0]
-            if len(valid_bmi) > 0:
-                print(f"  BMI: {valid_bmi['bmi'].mean():.1f} ± {valid_bmi['bmi'].std():.1f}")
-                print(f"  BMI ≥25: {(valid_bmi['bmi'] >= 25).mean() * 100:.1f}%")
-
-    def analyze_dataset_distribution(self):
-        """Analyze and return distribution statistics."""
-        stats = {
-            'n_participants': len(self.split_participants),
-            'n_records': len(self.split_records),
-            'n_pairs': len(self.segment_pairs),
-            'demographics': {'age': [], 'sex': [], 'bmi': []}
-        }
-
-        for pid in self.split_participants:
-            info = self._get_participant_info(pid)
-            if info['age'] > 0:
-                stats['demographics']['age'].append(info['age'])
-                stats['demographics']['sex'].append(info['sex'])
-                if info['bmi'] > 0:
-                    stats['demographics']['bmi'].append(info['bmi'])
-
-        # Calculate summary statistics
-        for key in ['age', 'bmi']:
-            if stats['demographics'][key]:
-                values = np.array(stats['demographics'][key])
-                stats[f'{key}_mean'] = values.mean()
-                stats[f'{key}_std'] = values.std()
-                stats[f'{key}_median'] = np.median(values)
-
-        return stats
-    # def _create_splits(self, train_ratio: float, val_ratio: float):
-    #     """Create train/val/test splits at participant level."""
-    #     # Get all participant IDs
-    #     all_participants = list(self.participant_records.keys())
-    #
-    #     if len(all_participants) == 0:
-    #         print("  Warning: No participants found! Check data structure.")
-    #         self.split_participants = []
-    #         self.split_records = []
-    #         return
-    #
-    #     # Sort for reproducibility
-    #     all_participants.sort()
-    #
-    #     # Set random seed for reproducible splits
-    #     np.random.seed(self.random_seed)
-    #     np.random.shuffle(all_participants)
-    #
-    #     # Calculate split sizes
-    #     n_total = len(all_participants)
-    #     n_train = int(n_total * train_ratio)
-    #     n_val = int(n_total * val_ratio)
-    #
-    #     # Split participants
-    #     if self.split == 'train':
-    #         self.split_participants = all_participants[:n_train]
-    #     elif self.split == 'val':
-    #         self.split_participants = all_participants[n_train:n_train + n_val]
-    #     else:  # test
-    #         self.split_participants = all_participants[n_train + n_val:]
-    #
-    #     # Get all records for split participants
-    #     self.split_records = []
-    #     for participant_id in self.split_participants:
-    #         self.split_records.extend(self.participant_records[participant_id])
 
     def _build_segment_pairs(self):
         """Build positive pairs with diversity strategy for SSL training."""
