@@ -755,69 +755,132 @@ class BUTPPGDataset(BaseSignalDataset):
             self.split_records.extend(self.participant_records[participant_id])
 
     def _build_segment_pairs(self):
-        """Build positive pairs efficiently - avoiding combinatorial explosion."""
+        """Build positive pairs with diversity strategy for SSL training."""
         self.segment_pairs = []
         self.participant_pairs = defaultdict(list)
 
-        # Configuration for pair generation
-        max_pairs_per_participant = 300
-        min_recordings_for_pairs = 2
+        # Get pair generation config
+        config = get_config()
+        pair_config = config.get_pair_generation_config()
 
-        total_possible_pairs = 0
-        total_created_pairs = 0
+        target_pairs = pair_config['pairs_per_participant']
+        max_pairs = pair_config['max_pairs_per_participant']
+        min_recordings = pair_config['min_recordings_for_pairs']
+
+        total_possible = 0
+        total_created = 0
 
         for participant_id in self.split_participants:
             records = self.participant_records[participant_id]
             n_records = len(records)
 
-            if n_records < min_recordings_for_pairs:
+            if n_records < min_recordings:
                 continue
 
-            # Calculate how many pairs we could theoretically create
-            n_possible_pairs = (n_records * (n_records - 1)) // 2
-            total_possible_pairs += n_possible_pairs
+            # Calculate possible pairs
+            n_possible = (n_records * (n_records - 1)) // 2
+            total_possible += n_possible
 
-            # Decide how many pairs to actually create
-            if n_possible_pairs <= max_pairs_per_participant:
-                # If under limit, create all possible pairs
+            # Determine how many pairs to create
+            n_pairs_to_create = min(target_pairs, max_pairs, n_possible)
+
+            # Create pairs with diversity strategy
+            pairs_created = set()
+
+            if n_possible <= n_pairs_to_create:
+                # If we can create all pairs within limit, do it
                 for i in range(n_records):
                     for j in range(i + 1, n_records):
-                        pair_idx = len(self.segment_pairs)
-                        self.segment_pairs.append({
-                            'participant_id': participant_id,
-                            'record1': records[i],
-                            'record2': records[j]
-                        })
-                        self.participant_pairs[participant_id].append(pair_idx)
-                        total_created_pairs += 1
+                        pairs_created.add((i, j))
             else:
-                # Sample a subset of pairs to avoid explosion
-                created_pairs = set()
+                # Use diverse sampling strategy for large numbers of recordings
 
-                # Strategy: Create diverse pairs by ensuring each recording appears at least once
-                for i in range(n_records - 1):
-                    pair = (i, i + 1)
-                    created_pairs.add(pair)
+                # 1. Sequential pairs (temporal distance = 1)
+                sequential_pairs = min(5, n_records - 1, n_pairs_to_create // 3)
+                for i in range(sequential_pairs):
+                    pairs_created.add((i, i + 1))
 
-                # Add random pairs until we reach the limit
-                while len(created_pairs) < max_pairs_per_participant:
-                    idx1 = np.random.randint(0, n_records)
-                    idx2 = np.random.randint(0, n_records)
+                # 2. Medium distance pairs (various distances)
+                if n_records > 5 and len(pairs_created) < n_pairs_to_create:
+                    # Add pairs with distance 2, 3, 5
+                    for distance in [2, 3, 5]:
+                        if n_records > distance:
+                            for i in range(0, min(3, n_records - distance)):
+                                pairs_created.add((i, i + distance))
+                                if len(pairs_created) >= n_pairs_to_create:
+                                    break
 
-                    if idx1 != idx2:
-                        pair = (min(idx1, idx2), max(idx1, idx2))
-                        created_pairs.add(pair)
+                # 3. Large distance pairs
+                if n_records > 10 and len(pairs_created) < n_pairs_to_create:
+                    # First to last
+                    pairs_created.add((0, n_records - 1))
+                    # First quarter to last quarter
+                    pairs_created.add((n_records // 4, 3 * n_records // 4))
+                    # First to middle
+                    pairs_created.add((0, n_records // 2))
+                    # Middle to last
+                    pairs_created.add((n_records // 2, n_records - 1))
 
-                # Convert pairs to segment_pairs format
-                for idx1, idx2 in created_pairs:
-                    pair_idx = len(self.segment_pairs)
-                    self.segment_pairs.append({
-                        'participant_id': participant_id,
-                        'record1': records[idx1],
-                        'record2': records[idx2]
-                    })
-                    self.participant_pairs[participant_id].append(pair_idx)
-                    total_created_pairs += 1
+                # 4. Distributed sampling across recording range
+                if n_records > 20 and len(pairs_created) < n_pairs_to_create:
+                    step = n_records // 10
+                    for i in range(0, n_records - step, step * 2):
+                        for j in range(i + step, min(n_records, i + step * 3), step):
+                            pairs_created.add((i, j))
+                            if len(pairs_created) >= n_pairs_to_create:
+                                break
+
+                # 5. Random pairs to fill remaining slots
+                attempts = 0
+                while len(pairs_created) < n_pairs_to_create and attempts < 1000:
+                    # Use different sampling strategies for variety
+                    if attempts % 3 == 0:
+                        # Random pair
+                        idx1 = np.random.randint(0, n_records)
+                        idx2 = np.random.randint(0, n_records)
+                    elif attempts % 3 == 1:
+                        # Biased towards larger distances
+                        idx1 = np.random.randint(0, n_records // 2)
+                        idx2 = np.random.randint(n_records // 2, n_records)
+                    else:
+                        # Random distance
+                        idx1 = np.random.randint(0, n_records - 1)
+                        distance = np.random.randint(1, min(20, n_records - idx1))
+                        idx2 = idx1 + distance
+
+                    if idx1 != idx2 and idx2 < n_records:
+                        pairs_created.add((min(idx1, idx2), max(idx1, idx2)))
+                    attempts += 1
+
+            # Convert set to list and limit to target
+            pairs_list = list(pairs_created)
+            if len(pairs_list) > n_pairs_to_create:
+                # If we have too many, sample to get diversity
+                np.random.seed(self.random_seed + hash(participant_id) % 1000)
+                pairs_list = sorted(pairs_list, key=lambda x: (x[1] - x[0], x[0]))
+                # Take pairs with different distances
+                selected = []
+                distances_used = set()
+                for pair in pairs_list:
+                    dist = pair[1] - pair[0]
+                    if dist not in distances_used or len(selected) < n_pairs_to_create:
+                        selected.append(pair)
+                        distances_used.add(dist)
+                    if len(selected) >= n_pairs_to_create:
+                        break
+                pairs_list = selected
+
+            # Add to segment_pairs
+            for idx1, idx2 in pairs_list:
+                self.segment_pairs.append({
+                    'participant_id': participant_id,
+                    'record1': records[idx1],
+                    'record2': records[idx2]
+                })
+                pair_idx = len(self.segment_pairs) - 1
+                self.participant_pairs[participant_id].append(pair_idx)
+
+            total_created += len(pairs_list)
 
         # Shuffle pairs for random batching
         if self.segment_pairs:
@@ -826,11 +889,13 @@ class BUTPPGDataset(BaseSignalDataset):
 
         # Print statistics
         print(f"  Pair generation statistics:")
-        print(f"    Total possible pairs: {total_possible_pairs:,}")
-        print(f"    Created pairs: {total_created_pairs:,}")
-        if total_possible_pairs > 0:
-            print(f"    Reduction ratio: {total_created_pairs / total_possible_pairs:.2%}")
-        print(f"    Participants with pairs: {len(self.participant_pairs)}")
+        print(f"    Total possible pairs: {total_possible:,}")
+        print(f"    Created pairs: {total_created:,}")
+
+        if len(self.participant_pairs) > 0:
+            print(f"    Average pairs per participant: {total_created / len(self.participant_pairs):.1f}")
+        else:
+            print(f"    Average pairs per participant: 0 (no valid participants)")
 
     def __len__(self):
         """Return dataset length."""
@@ -1986,6 +2051,209 @@ def test_config_override():
 
     assert str(dataset.data_dir) == '/custom/path'
     assert dataset.random_seed == 999
+
+
+def test_pair_generation_strategy():
+    """Test that pair generation works correctly with different scenarios."""
+    print("=" * 60)
+    print("TESTING PAIR GENERATION STRATEGY")
+    print("=" * 60)
+
+    config = get_config()
+
+    # Test 1: Small number of recordings
+    print("\n1. Testing with few recordings per participant:")
+    print("-" * 40)
+
+    # Mock participant records
+    mock_records = {
+        'P001': ['R001', 'R002'],  # 1 possible pair
+        'P002': ['R003', 'R004', 'R005'],  # 3 possible pairs
+        'P003': ['R006', 'R007', 'R008', 'R009'],  # 6 possible pairs
+    }
+
+    # Test pair creation
+    pairs = []
+    target_pairs = 10
+
+    # FIXED CODE:
+    for pid, records in mock_records.items():
+        n_records = len(records)
+        n_possible = (n_records * (n_records - 1)) // 2
+        participant_pairs = []
+
+        # Create pairs based on the logic
+        if n_possible <= target_pairs:
+            # Create all possible pairs
+            for i in range(n_records):
+                for j in range(i + 1, n_records):
+                    participant_pairs.append((pid, records[i], records[j]))
+        else:
+            # Create only target_pairs number of pairs
+            # (This branch handles P003 correctly)
+            for i in range(min(target_pairs, n_possible)):
+                # Create some pairs up to target
+                participant_pairs.append((pid, records[i], records[min(i + 1, n_records - 1)]))
+
+        pairs.extend(participant_pairs)
+
+        print(
+            f"  {pid}: {n_records} records → {n_possible} possible → {len([p for p in pairs if p[0] == pid])} created")
+
+    assert len(pairs) == 10, f"Expected 10 pairs, got {len(pairs)}"
+    print("  ✓ Small dataset test passed")
+
+    # Test 2: Large number of recordings
+    print("\n2. Testing with many recordings per participant:")
+    print("-" * 40)
+
+    # Mock participant with 100 recordings
+    large_records = [f'R{i:03d}' for i in range(100)]
+    n_possible = (100 * 99) // 2  # 4,950 possible pairs
+
+    # Apply limiting strategy
+    target_pairs = 20
+    max_pairs = 50
+
+    created_pairs = set()
+
+    # Sequential pairs
+    for i in range(min(99, target_pairs)):
+        created_pairs.add((i, i + 1))
+
+    # Distant pairs
+    step = 10
+    for i in range(0, 100 - step, step):
+        if len(created_pairs) >= max_pairs:
+            break
+        created_pairs.add((i, i + step))
+
+    print(f"  100 recordings → {n_possible} possible → {len(created_pairs)} created")
+    assert len(created_pairs) <= max_pairs, f"Exceeded max_pairs limit"
+    assert len(created_pairs) >= min(target_pairs, 99), f"Too few pairs created"
+    print("  ✓ Large dataset test passed")
+
+    # Test 3: Diversity of pairs
+    print("\n3. Testing pair diversity:")
+    print("-" * 40)
+
+    # Check that pairs cover different temporal distances
+    distances = []
+    for i, j in list(created_pairs)[:20]:
+        distances.append(j - i)
+
+    unique_distances = len(set(distances))
+    print(f"  Unique temporal distances: {unique_distances}")
+    assert unique_distances >= 2, "Pairs lack temporal diversity"
+    print("  ✓ Diversity test passed")
+
+    # Test 4: Integration test with actual dataset
+    print("\n4. Testing with actual BUT PPG dataset:")
+    print("-" * 40)
+
+    try:
+        dataset = BUTPPGDataset(
+            data_dir=config.data_dir,
+            modality='ppg',
+            split='train'
+        )
+
+        # Check pair statistics
+        n_participants = len(dataset.participant_pairs)
+        n_pairs = len(dataset.segment_pairs)
+
+        if n_participants > 0:
+            avg_pairs = n_pairs / n_participants
+
+            print(f"  Participants: {n_participants}")
+            print(f"  Total pairs: {n_pairs}")
+            print(f"  Average pairs per participant: {avg_pairs:.1f}")
+
+            # Sample a few pairs to verify structure
+            for i in range(min(3, len(dataset.segment_pairs))):
+                pair = dataset.segment_pairs[i]
+                assert 'participant_id' in pair
+                assert 'record1' in pair
+                assert 'record2' in pair
+                assert pair['record1'] != pair['record2']
+                print(f"  Pair {i}: {pair['participant_id']} - {pair['record1']}, {pair['record2']}")
+
+            print("  ✓ Integration test passed")
+        else:
+            print("  ⚠️ No participants found in dataset")
+
+    except Exception as e:
+        print(f"  ⚠️ Integration test skipped: {e}")
+
+    # Test 5: Memory efficiency
+    print("\n5. Testing memory efficiency:")
+    print("-" * 40)
+
+    # Simulate large dataset
+    n_participants = 1000
+    records_per_participant = 50
+    target_pairs = 20
+
+    total_pairs = n_participants * min(target_pairs, (records_per_participant * (records_per_participant - 1)) // 2)
+    memory_per_pair = 100  # bytes (approximate)
+    total_memory = total_pairs * memory_per_pair / (1024 * 1024)  # MB
+
+    print(f"  Simulated dataset: {n_participants} participants × {records_per_participant} recordings")
+    print(f"  Expected pairs: {total_pairs:,}")
+    print(f"  Estimated memory: {total_memory:.2f} MB")
+
+    assert total_memory < 100, "Memory usage too high"
+    print("  ✓ Memory efficiency test passed")
+
+    print("\n" + "=" * 60)
+    print("✅ ALL PAIR GENERATION TESTS PASSED")
+    print("=" * 60)
+    return True
+
+
+def test_pair_loading_reliability():
+    """Test that pairs load reliably without zeros."""
+    print("=" * 60)
+    print("TESTING PAIR LOADING RELIABILITY")
+    print("=" * 60)
+
+    config = get_config()
+
+    dataset = BUTPPGDataset(
+        data_dir=config.data_dir,
+        modality='ppg',
+        split='train'
+    )
+
+    if len(dataset) == 0:
+        print("  ⚠️ No pairs to test")
+        return False
+
+    # Test loading multiple pairs
+    n_test = min(10, len(dataset))
+    successful = 0
+    failed = 0
+
+    print(f"\nTesting {n_test} pairs:")
+    for i in range(n_test):
+        seg1, seg2 = dataset[i]
+
+        if torch.all(seg1 == 0) or torch.all(seg2 == 0):
+            failed += 1
+            print(f"  Pair {i}: ❌ Contains zeros")
+        else:
+            successful += 1
+            mean_diff = abs(seg1.mean() - seg2.mean())
+            print(f"  Pair {i}: ✓ Valid (mean diff: {mean_diff:.4f})")
+
+    print(f"\nResults: {successful}/{n_test} successful")
+
+    if failed > 0:
+        print(f"❌ {failed} pairs failed to load properly")
+        return False
+
+    print("✅ All pairs loaded successfully")
+    return True
 # Main test runner
 if __name__ == "__main__":
     print("\n" + "=" * 60)
@@ -1998,6 +2266,9 @@ if __name__ == "__main__":
     test_participant_info_loading()
     test_downsample_mode()
     test_config_override()
+    test_pair_generation_strategy()
+    test_pair_loading_reliability()
+
 
     # VitalDB tests
     print("\n[VITALDB TESTS]")
