@@ -10,17 +10,23 @@ downsample:
   # Optional preprocessed data directory
   preprocessed_dir: null  # Set to path if using preprocessed data
 dataset:
+  # General dataset settings
   name: "BUT_PPG"
   data_dir: "data/but_ppg/dataset"
-  quality_file: "quality-hr-ann.csv"
   subject_file: "subject-info.csv"
-  # Cache settings
+  quality_file: "quality-hr-ann.csv"
+  train_ratio: 0.5
+  val_ratio: 0.2
   use_cache: true
   cache_size: 500
 
+  # NEW: Pair generation settings for BUT PPG
+  pairs_per_participant: 20  # Target pairs per participant
+  max_pairs_per_participant: 100  # Hard limit to prevent explosion
+  min_recordings_for_pairs: 2  # Minimum recordings needed
+
   # Data split ratios
-  train_ratio: 0.6
-  val_ratio: 0.2
+
   # test_ratio is computed as 1 - train_ratio - val_ratio
 
   # Segment overlap for data augmentation
