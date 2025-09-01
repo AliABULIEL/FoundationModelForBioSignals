@@ -116,7 +116,6 @@ class Trainer:
         print(f"  Gradient Accumulation: {self.gradient_accumulation_steps}")
         print(f"  SSL Method: {self.ssl_method}")
 
-
     def _set_seeds(self, seed: int):
         """Set random seeds for reproducibility."""
         random.seed(seed)
@@ -225,7 +224,6 @@ class Trainer:
                 raise
         # Move to device (model already on device from initialization)
 
-
         # Use DataParallel if multiple GPUs
         if self.device_manager.is_cuda and torch.cuda.device_count() > 1:
             print(f"  Using {torch.cuda.device_count()} GPUs with DataParallel")
@@ -328,8 +326,6 @@ class Trainer:
             print("  Using Automatic Mixed Precision (AMP)")
         else:
             self.scaler = None
-
-
 
         weight_decay = self.training_config.get('weight_decay', 1e-5)
         print(f"  Optimizer: {optimizer_type}")
@@ -461,7 +457,10 @@ class Trainer:
         # Add memory stats if CUDA
         if self.device_manager.is_cuda:
             mem_stats = self.device_manager.memory_stats()
-            stats['gpu_memory_gb'] = mem_stats.get('allocated', 0)
+        if epoch % 5 == 0:
+            print(f"\nDetailed metrics at epoch {epoch}:")
+            print(f"  Loss components:")
+            print(f"    {stats}")
 
         return stats
 
@@ -576,7 +575,6 @@ class Trainer:
         # Training parameters from config
         if num_epochs is None:
             num_epochs = self.training_config.get('num_epochs', 30)
-
 
         self.early_stopping_patience = self.training_config.get('early_stopping_patience', 30)
 

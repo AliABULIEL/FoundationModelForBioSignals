@@ -134,7 +134,8 @@ ssl:
 training:
   # Batch and epochs
   batch_size: 64         # Smaller for M1 (paper uses 256)
-  num_epochs: 30        # Paper uses 300, we'll use less for testing
+  num_epochs: 30
+  warmup_epochs: 5 # Paper uses 300, we'll use less for testing
 
   # Optimizer
   optimizer: "adam"
