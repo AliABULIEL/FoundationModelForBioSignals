@@ -82,6 +82,7 @@ class ConfigLoader:
     def seed(self) -> int:
         """Get random seed for reproducibility."""
         return self.get('seed', default=42)
+
     def get(self, key_path: str, default: Any = None) -> Any:
         """
         Get a configuration value using dot notation.
@@ -187,6 +188,21 @@ class ConfigLoader:
     def get_downsample_config(self) -> Dict[str, Any]:
         """Get downsampling configuration."""
         return self.get_section('downsample')
+
+    # Just add this one method to ConfigLoader:
+
+    def get_pair_generation_config(self) -> Dict[str, int]:
+        """
+        Get pair generation configuration for BUT PPG dataset.
+
+        Returns:
+            Dictionary with pair generation parameters
+        """
+        return {
+            'pairs_per_participant': self.get('dataset.pairs_per_participant', default=20),
+            'max_pairs_per_participant': self.get('dataset.max_pairs_per_participant', default=100),
+            'min_recordings_for_pairs': self.get('dataset.min_recordings_for_pairs', default=2)
+        }
 
     def get_augmentation_config(self, modality: str, ssl_method: str = 'infonce') -> Dict[str, float]:
         """
