@@ -145,8 +145,8 @@ class VitalDBDataset(BaseSignalDataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Split ratios from config
-        train_ratio = train_ratio if train_ratio else vitaldb_config.get('train_ratio', 0.8)
-        val_ratio = val_ratio if val_ratio else vitaldb_config.get('val_ratio', 0.1)
+        train_ratio = train_ratio if train_ratio else vitaldb_config.get('train_ratio', 0.6)
+        val_ratio = val_ratio if val_ratio else vitaldb_config.get('val_ratio', 0.2)
         self.segments_per_case = vitaldb_config.get('segments_per_case', 20)  # NEW: segments per patient
 
         # Modality settings
@@ -565,18 +565,12 @@ class BUTPPGDataset(BaseSignalDataset):
             data_dir: Optional[str] = None,
             modality: str = 'ppg',
             split: str = 'train',
-            config_path: str = 'configs/config.yaml',
             quality_filter: bool = False,
             return_participant_id: bool = False,
             return_labels: bool = False,
             segment_overlap: float = 0.5,
-            train_ratio: float = 0.8,
-            val_ratio: float = 0.1,
             random_seed: Optional[int] = None,
-            use_cache: bool = True,
-            cache_size: int = 500,
             preprocessed_dir: Optional[str] = None,
-            downsample: bool = False,
             **kwargs  # Accept extra kwargs for compatibility
     ):
         # Load configuration
@@ -591,10 +585,12 @@ class BUTPPGDataset(BaseSignalDataset):
         self.return_labels = return_labels
         self.segment_overlap = segment_overlap
         self.random_seed = random_seed if random_seed is not None else self.config.seed
-        self.downsample = downsample
+        self.downsample = self.config.get('downsample.enabled', False)
 
         # Optimization settings
+        use_cache = self.config.get('dataset.use_cache', True)
         self.use_cache = use_cache
+        cache_size = self.config.get('dataset.cache_size', 500)
         self.cache_size = cache_size
         self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
 
@@ -618,6 +614,14 @@ class BUTPPGDataset(BaseSignalDataset):
         self.segment_length = int(self.segment_length_sec * self.target_fs)
         self.band_low = modality_config.get('band_low')
         self.band_high = modality_config.get('band_high')
+
+        train_ratio = self.config.get('dataset.train_ratio', 0.6)
+
+        val_ratio = self.config.get('dataset.val_ratio', 0.2)
+
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+
 
         # Load annotations
         self._load_annotations()
@@ -1005,6 +1009,7 @@ class BUTPPGDataset(BaseSignalDataset):
 
         # Try preprocessed data
         preprocessed = self._load_preprocessed(record_id)
+
         if preprocessed is not None:
             self._add_to_cache(record_id, preprocessed)
             return preprocessed
@@ -1057,6 +1062,7 @@ class BUTPPGDataset(BaseSignalDataset):
 
             # Preprocess and cache
             processed = self._preprocess_signal(signal_data)
+            processed = (processed - np.mean(processed)) / (np.std(processed) + 1e-6)
             if processed is not None:
                 self._add_to_cache(record_id, processed)
             else:
@@ -1282,12 +1288,10 @@ def test_data_loading():
     print(f"   Data directory: {data_dir}")
 
     ppg_dataset = BUTPPGDataset(
-        data_dir=data_dir,
         modality='ppg',
         split='train',
         quality_filter=False,
         use_cache=True,
-        cache_size=10
     )
     print(f"Modality: {ppg_dataset.modality}")
     print(f"Target FS: {ppg_dataset.target_fs}")  # Should be 64 for PPG
@@ -1939,8 +1943,42 @@ def test_vitaldb_positive_pairs():
         return False
 
 
+def test_downsample_mode():
+    """Test that downsample mode works correctly."""
+    config = get_config()
+
+    # Test with downsample enabled
+    dataset_down = BUTPPGDataset(
+        modality='ppg',
+        split='train',
+        downsample=True  # Force downsample
+    )
+
+    expected_length = config.get('downsample.segment_length_sec', 5)
+    expected_samples = int(expected_length * dataset_down.target_fs)
+
+    print(f"Downsample mode:")
+    print(f"  Expected: {expected_length}s = {expected_samples} samples")
+    print(f"  Actual: {dataset_down.segment_length_sec}s = {dataset_down.segment_length} samples")
+
+    assert dataset_down.segment_length_sec == expected_length
+    assert dataset_down.segment_length == expected_samples
 
 
+def test_config_override():
+    """Test that parameter overrides work correctly."""
+    config = get_config()
+
+    # Test that parameters override config
+    dataset = BUTPPGDataset(
+        modality='ppg',
+        split='train',
+        data_dir='/custom/path',  # Override
+        random_seed=999  # Override
+    )
+
+    assert str(dataset.data_dir) == '/custom/path'
+    assert dataset.random_seed == 999
 # Main test runner
 if __name__ == "__main__":
     print("\n" + "=" * 60)
@@ -1951,6 +1989,8 @@ if __name__ == "__main__":
     print("\n[BUT PPG TESTS]")
     test_data_loading()
     test_participant_info_loading()
+    test_downsample_mode()
+    test_config_override()
 
     # VitalDB tests
     print("\n[VITALDB TESTS]")

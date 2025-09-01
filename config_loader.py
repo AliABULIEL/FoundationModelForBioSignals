@@ -73,6 +73,15 @@ class ConfigLoader:
             self._config_path = config_path
         self._load_config()
 
+    @property
+    def data_dir(self) -> str:
+        """Get data directory path."""
+        return self.get('dataset.data_dir', default='data/but_ppg/dataset')
+
+    @property
+    def seed(self) -> int:
+        """Get random seed for reproducibility."""
+        return self.get('seed', default=42)
     def get(self, key_path: str, default: Any = None) -> Any:
         """
         Get a configuration value using dot notation.
@@ -170,6 +179,14 @@ class ConfigLoader:
             Dictionary containing modality-specific configuration
         """
         return self.get_section('dataset').get(modality, {})
+
+    def get_dataset_config(self) -> Dict[str, Any]:
+        """Get complete dataset configuration."""
+        return self.get_section('dataset')
+
+    def get_downsample_config(self) -> Dict[str, Any]:
+        """Get downsampling configuration."""
+        return self.get_section('downsample')
 
     def get_augmentation_config(self, modality: str, ssl_method: str = 'infonce') -> Dict[str, float]:
         """
