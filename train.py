@@ -114,6 +114,21 @@ class Trainer:
         print(f"  Mixed Precision: {self.use_amp}")
         print(f"  Gradient Accumulation: {self.gradient_accumulation_steps}")
         print(f"  SSL Method: {self.ssl_method}")
+        if self.phase == 'finetune' and self.pretrained_path:
+            # Load pretrained encoder
+            pretrained = torch.load(self.pretrained_path, map_location=self.device, weights_only=False)
+
+            if 'encoder_state_dict' in pretrained:
+                encoder_state = pretrained['encoder_state_dict']
+            else:
+                encoder_state = pretrained
+
+            # Load into model's encoder
+            self.model.encoder.load_state_dict(encoder_state, strict=False)
+            print(f"✓ Loaded pretrained encoder from {self.pretrained_path}")
+
+            # Use fine-tuning learning rate
+            self.learning_rate = 1e-5  # Or from config/args
 
 
     def _set_seeds(self, seed: int):
@@ -199,6 +214,22 @@ class Trainer:
             ssl_method=self.ssl_method
         )
 
+        if self.phase == 'finetune' and hasattr(self, 'pretrained_path'):
+            print(f"Loading pretrained encoder from: {self.pretrained_path}")
+            checkpoint = torch.load(self.pretrained_path, map_location=self.device, weights_only=False)
+
+            if 'encoder_state_dict' in checkpoint:
+                encoder_state = checkpoint['encoder_state_dict']
+            else:
+                encoder_state = checkpoint
+
+            # Load weights into encoder
+            missing, unexpected = self.model.encoder.load_state_dict(encoder_state, strict=False)
+            print(f"✓ Loaded pretrained encoder")
+            if missing:
+                print(f"  Warning: Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"  Warning: Unexpected keys: {len(unexpected)}")
         # Move to device (model already on device from initialization)
         self.model = self.model.to(self.device)
 
@@ -299,6 +330,15 @@ class Trainer:
         else:
             self.scaler = None
 
+        if self.phase == 'finetune':
+            learning_rate = self.config.get('finetune.learning_rate', 1e-5)
+            print(f"  Using fine-tuning learning rate: {learning_rate}")
+        elif self.phase == 'pretrain':
+            learning_rate = self.config.get('pretrain.learning_rate', 1e-4)
+        else:
+            learning_rate = self.training_config.get('learning_rate', 1e-4)
+
+        weight_decay = self.training_config.get('weight_decay', 1e-5)
         print(f"  Optimizer: {optimizer_type}")
         print(f"  Learning rate: {learning_rate}")
         print(f"  Weight decay: {weight_decay}")
