@@ -719,7 +719,7 @@ class BUTPPGDataset(BaseSignalDataset):
         print(f"  Found {len(self.participant_records)} participants with {self.modality.upper()} data")
 
     def _create_splits(self, train_ratio: float, val_ratio: float):
-        """Create train/val/test splits at participant level."""
+        """Create STRATIFIED train/val/test splits at participant level."""
         # Get all participant IDs
         all_participants = list(self.participant_records.keys())
 
@@ -729,25 +729,69 @@ class BUTPPGDataset(BaseSignalDataset):
             self.split_records = []
             return
 
-        # Sort for reproducibility
-        all_participants.sort()
+        # Collect participant info for stratification
+        participant_info = []
+        for pid in all_participants:
+            info = self._get_participant_info(pid)
+            # Only include participants with valid age data
+            if info['age'] > 0:
+                participant_info.append({
+                    'pid': pid,
+                    'age': info['age'],
+                    'sex': info['sex'],
+                    'age_group': 'old' if info['age'] >= 50 else 'young'
+                })
 
-        # Set random seed for reproducible splits
-        np.random.seed(self.random_seed)
-        np.random.shuffle(all_participants)
+        # If no valid info, fallback to random
+        if not participant_info:
+            print("  Warning: No valid demographic info, using random split")
+            np.random.seed(self.random_seed)
+            np.random.shuffle(all_participants)
+            n_total = len(all_participants)
+            n_train = int(n_total * train_ratio)
+            n_val = int(n_total * val_ratio)
 
-        # Calculate split sizes
-        n_total = len(all_participants)
-        n_train = int(n_total * train_ratio)
-        n_val = int(n_total * val_ratio)
+            if self.split == 'train':
+                self.split_participants = all_participants[:n_train]
+            elif self.split == 'val':
+                self.split_participants = all_participants[n_train:n_train + n_val]
+            else:
+                self.split_participants = all_participants[n_train + n_val:]
+        else:
+            # Stratified split
+            df = pd.DataFrame(participant_info)
 
-        # Split participants
-        if self.split == 'train':
-            self.split_participants = all_participants[:n_train]
-        elif self.split == 'val':
-            self.split_participants = all_participants[n_train:n_train + n_val]
-        else:  # test
-            self.split_participants = all_participants[n_train + n_val:]
+            # Group by age category
+            young_pids = df[df['age_group'] == 'young']['pid'].tolist()
+            old_pids = df[df['age_group'] == 'old']['pid'].tolist()
+
+            # Shuffle within groups
+            np.random.seed(self.random_seed)
+            np.random.shuffle(young_pids)
+            np.random.shuffle(old_pids)
+
+            # Calculate splits for each group
+            n_train_young = int(len(young_pids) * train_ratio)
+            n_val_young = int(len(young_pids) * val_ratio)
+
+            n_train_old = int(len(old_pids) * train_ratio)
+            n_val_old = int(len(old_pids) * val_ratio)
+
+            # Combine stratified splits
+            if self.split == 'train':
+                self.split_participants = young_pids[:n_train_young] + old_pids[:n_train_old]
+            elif self.split == 'val':
+                self.split_participants = (young_pids[n_train_young:n_train_young + n_val_young] +
+                                           old_pids[n_train_old:n_train_old + n_val_old])
+            else:  # test
+                self.split_participants = (young_pids[n_train_young + n_val_young:] +
+                                           old_pids[n_train_old + n_val_old:])
+
+            # Print split statistics
+            print(f"  {self.split.capitalize()} split: {len(self.split_participants)} participants")
+            split_old = sum(1 for p in self.split_participants if self._get_participant_info(p)['age'] >= 50)
+            print(
+                f"    Age ≥50: {split_old}/{len(self.split_participants)} ({split_old / len(self.split_participants) * 100:.1f}%)")
 
         # Get all records for split participants
         self.split_records = []
@@ -755,7 +799,7 @@ class BUTPPGDataset(BaseSignalDataset):
             self.split_records.extend(self.participant_records[participant_id])
 
     def _build_segment_pairs(self):
-        """Build positive pairs with diversity strategy for SSL training."""
+        """Build positive pairs ensuring ALL participants are included."""
         self.segment_pairs = []
         self.participant_pairs = defaultdict(list)
 
@@ -769,13 +813,32 @@ class BUTPPGDataset(BaseSignalDataset):
 
         total_possible = 0
         total_created = 0
+        participants_with_pairs = 0
+        participants_without_pairs = []
 
         for participant_id in self.split_participants:
             records = self.participant_records[participant_id]
             n_records = len(records)
 
-            if n_records < min_recordings:
+            # CRITICAL FIX: Handle participants with few recordings
+            if n_records == 0:
+                participants_without_pairs.append(participant_id)
                 continue
+            elif n_records == 1:
+                # Create self-pair for participants with only 1 recording
+                self.segment_pairs.append({
+                    'participant_id': participant_id,
+                    'record1': records[0],
+                    'record2': records[0]  # Same record
+                })
+                pair_idx = len(self.segment_pairs) - 1
+                self.participant_pairs[participant_id].append(pair_idx)
+                participants_with_pairs += 1
+                total_created += 1
+                continue
+
+            # For participants with 2+ recordings
+            participants_with_pairs += 1
 
             # Calculate possible pairs
             n_possible = (n_records * (n_records - 1)) // 2
@@ -802,7 +865,6 @@ class BUTPPGDataset(BaseSignalDataset):
 
                 # 2. Medium distance pairs (various distances)
                 if n_records > 5 and len(pairs_created) < n_pairs_to_create:
-                    # Add pairs with distance 2, 3, 5
                     for distance in [2, 3, 5]:
                         if n_records > distance:
                             for i in range(0, min(3, n_records - distance)):
@@ -812,63 +874,23 @@ class BUTPPGDataset(BaseSignalDataset):
 
                 # 3. Large distance pairs
                 if n_records > 10 and len(pairs_created) < n_pairs_to_create:
-                    # First to last
                     pairs_created.add((0, n_records - 1))
-                    # First quarter to last quarter
-                    pairs_created.add((n_records // 4, 3 * n_records // 4))
-                    # First to middle
-                    pairs_created.add((0, n_records // 2))
-                    # Middle to last
-                    pairs_created.add((n_records // 2, n_records - 1))
+                    if n_records > 4:
+                        pairs_created.add((n_records // 4, 3 * n_records // 4))
+                        pairs_created.add((0, n_records // 2))
+                        pairs_created.add((n_records // 2, n_records - 1))
 
-                # 4. Distributed sampling across recording range
-                if n_records > 20 and len(pairs_created) < n_pairs_to_create:
-                    step = n_records // 10
-                    for i in range(0, n_records - step, step * 2):
-                        for j in range(i + step, min(n_records, i + step * 3), step):
-                            pairs_created.add((i, j))
-                            if len(pairs_created) >= n_pairs_to_create:
-                                break
-
-                # 5. Random pairs to fill remaining slots
+                # 4. Random pairs to fill remaining slots
                 attempts = 0
                 while len(pairs_created) < n_pairs_to_create and attempts < 1000:
-                    # Use different sampling strategies for variety
-                    if attempts % 3 == 0:
-                        # Random pair
-                        idx1 = np.random.randint(0, n_records)
-                        idx2 = np.random.randint(0, n_records)
-                    elif attempts % 3 == 1:
-                        # Biased towards larger distances
-                        idx1 = np.random.randint(0, n_records // 2)
-                        idx2 = np.random.randint(n_records // 2, n_records)
-                    else:
-                        # Random distance
-                        idx1 = np.random.randint(0, n_records - 1)
-                        distance = np.random.randint(1, min(20, n_records - idx1))
-                        idx2 = idx1 + distance
-
-                    if idx1 != idx2 and idx2 < n_records:
+                    idx1 = np.random.randint(0, n_records)
+                    idx2 = np.random.randint(0, n_records)
+                    if idx1 != idx2:
                         pairs_created.add((min(idx1, idx2), max(idx1, idx2)))
                     attempts += 1
 
-            # Convert set to list and limit to target
-            pairs_list = list(pairs_created)
-            if len(pairs_list) > n_pairs_to_create:
-                # If we have too many, sample to get diversity
-                np.random.seed(self.random_seed + hash(participant_id) % 1000)
-                pairs_list = sorted(pairs_list, key=lambda x: (x[1] - x[0], x[0]))
-                # Take pairs with different distances
-                selected = []
-                distances_used = set()
-                for pair in pairs_list:
-                    dist = pair[1] - pair[0]
-                    if dist not in distances_used or len(selected) < n_pairs_to_create:
-                        selected.append(pair)
-                        distances_used.add(dist)
-                    if len(selected) >= n_pairs_to_create:
-                        break
-                pairs_list = selected
+            # Convert to list
+            pairs_list = list(pairs_created)[:n_pairs_to_create]
 
             # Add to segment_pairs
             for idx1, idx2 in pairs_list:
@@ -891,11 +913,193 @@ class BUTPPGDataset(BaseSignalDataset):
         print(f"  Pair generation statistics:")
         print(f"    Total possible pairs: {total_possible:,}")
         print(f"    Created pairs: {total_created:,}")
+        print(f"    Participants with pairs: {participants_with_pairs}/{len(self.split_participants)}")
+
+        if participants_without_pairs:
+            print(f"    WARNING: {len(participants_without_pairs)} participants have no recordings")
 
         if len(self.participant_pairs) > 0:
             print(f"    Average pairs per participant: {total_created / len(self.participant_pairs):.1f}")
         else:
             print(f"    Average pairs per participant: 0 (no valid participants)")
+    # def _create_splits(self, train_ratio: float, val_ratio: float):
+    #     """Create train/val/test splits at participant level."""
+    #     # Get all participant IDs
+    #     all_participants = list(self.participant_records.keys())
+    #
+    #     if len(all_participants) == 0:
+    #         print("  Warning: No participants found! Check data structure.")
+    #         self.split_participants = []
+    #         self.split_records = []
+    #         return
+    #
+    #     # Sort for reproducibility
+    #     all_participants.sort()
+    #
+    #     # Set random seed for reproducible splits
+    #     np.random.seed(self.random_seed)
+    #     np.random.shuffle(all_participants)
+    #
+    #     # Calculate split sizes
+    #     n_total = len(all_participants)
+    #     n_train = int(n_total * train_ratio)
+    #     n_val = int(n_total * val_ratio)
+    #
+    #     # Split participants
+    #     if self.split == 'train':
+    #         self.split_participants = all_participants[:n_train]
+    #     elif self.split == 'val':
+    #         self.split_participants = all_participants[n_train:n_train + n_val]
+    #     else:  # test
+    #         self.split_participants = all_participants[n_train + n_val:]
+    #
+    #     # Get all records for split participants
+    #     self.split_records = []
+    #     for participant_id in self.split_participants:
+    #         self.split_records.extend(self.participant_records[participant_id])
+    #
+    # def _build_segment_pairs(self):
+    #     """Build positive pairs with diversity strategy for SSL training."""
+    #     self.segment_pairs = []
+    #     self.participant_pairs = defaultdict(list)
+    #
+    #     # Get pair generation config
+    #     config = get_config()
+    #     pair_config = config.get_pair_generation_config()
+    #
+    #     target_pairs = pair_config['pairs_per_participant']
+    #     max_pairs = pair_config['max_pairs_per_participant']
+    #     min_recordings = pair_config['min_recordings_for_pairs']
+    #
+    #     total_possible = 0
+    #     total_created = 0
+    #
+    #     for participant_id in self.split_participants:
+    #         records = self.participant_records[participant_id]
+    #         n_records = len(records)
+    #
+    #         if n_records < min_recordings:
+    #             continue
+    #
+    #         # Calculate possible pairs
+    #         n_possible = (n_records * (n_records - 1)) // 2
+    #         total_possible += n_possible
+    #
+    #         # Determine how many pairs to create
+    #         n_pairs_to_create = min(target_pairs, max_pairs, n_possible)
+    #
+    #         # Create pairs with diversity strategy
+    #         pairs_created = set()
+    #
+    #         if n_possible <= n_pairs_to_create:
+    #             # If we can create all pairs within limit, do it
+    #             for i in range(n_records):
+    #                 for j in range(i + 1, n_records):
+    #                     pairs_created.add((i, j))
+    #         else:
+    #             # Use diverse sampling strategy for large numbers of recordings
+    #
+    #             # 1. Sequential pairs (temporal distance = 1)
+    #             sequential_pairs = min(5, n_records - 1, n_pairs_to_create // 3)
+    #             for i in range(sequential_pairs):
+    #                 pairs_created.add((i, i + 1))
+    #
+    #             # 2. Medium distance pairs (various distances)
+    #             if n_records > 5 and len(pairs_created) < n_pairs_to_create:
+    #                 # Add pairs with distance 2, 3, 5
+    #                 for distance in [2, 3, 5]:
+    #                     if n_records > distance:
+    #                         for i in range(0, min(3, n_records - distance)):
+    #                             pairs_created.add((i, i + distance))
+    #                             if len(pairs_created) >= n_pairs_to_create:
+    #                                 break
+    #
+    #             # 3. Large distance pairs
+    #             if n_records > 10 and len(pairs_created) < n_pairs_to_create:
+    #                 # First to last
+    #                 pairs_created.add((0, n_records - 1))
+    #                 # First quarter to last quarter
+    #                 pairs_created.add((n_records // 4, 3 * n_records // 4))
+    #                 # First to middle
+    #                 pairs_created.add((0, n_records // 2))
+    #                 # Middle to last
+    #                 pairs_created.add((n_records // 2, n_records - 1))
+    #
+    #             # 4. Distributed sampling across recording range
+    #             if n_records > 20 and len(pairs_created) < n_pairs_to_create:
+    #                 step = n_records // 10
+    #                 for i in range(0, n_records - step, step * 2):
+    #                     for j in range(i + step, min(n_records, i + step * 3), step):
+    #                         pairs_created.add((i, j))
+    #                         if len(pairs_created) >= n_pairs_to_create:
+    #                             break
+    #
+    #             # 5. Random pairs to fill remaining slots
+    #             attempts = 0
+    #             while len(pairs_created) < n_pairs_to_create and attempts < 1000:
+    #                 # Use different sampling strategies for variety
+    #                 if attempts % 3 == 0:
+    #                     # Random pair
+    #                     idx1 = np.random.randint(0, n_records)
+    #                     idx2 = np.random.randint(0, n_records)
+    #                 elif attempts % 3 == 1:
+    #                     # Biased towards larger distances
+    #                     idx1 = np.random.randint(0, n_records // 2)
+    #                     idx2 = np.random.randint(n_records // 2, n_records)
+    #                 else:
+    #                     # Random distance
+    #                     idx1 = np.random.randint(0, n_records - 1)
+    #                     distance = np.random.randint(1, min(20, n_records - idx1))
+    #                     idx2 = idx1 + distance
+    #
+    #                 if idx1 != idx2 and idx2 < n_records:
+    #                     pairs_created.add((min(idx1, idx2), max(idx1, idx2)))
+    #                 attempts += 1
+    #
+    #         # Convert set to list and limit to target
+    #         pairs_list = list(pairs_created)
+    #         if len(pairs_list) > n_pairs_to_create:
+    #             # If we have too many, sample to get diversity
+    #             np.random.seed(self.random_seed + hash(participant_id) % 1000)
+    #             pairs_list = sorted(pairs_list, key=lambda x: (x[1] - x[0], x[0]))
+    #             # Take pairs with different distances
+    #             selected = []
+    #             distances_used = set()
+    #             for pair in pairs_list:
+    #                 dist = pair[1] - pair[0]
+    #                 if dist not in distances_used or len(selected) < n_pairs_to_create:
+    #                     selected.append(pair)
+    #                     distances_used.add(dist)
+    #                 if len(selected) >= n_pairs_to_create:
+    #                     break
+    #             pairs_list = selected
+    #
+    #         # Add to segment_pairs
+    #         for idx1, idx2 in pairs_list:
+    #             self.segment_pairs.append({
+    #                 'participant_id': participant_id,
+    #                 'record1': records[idx1],
+    #                 'record2': records[idx2]
+    #             })
+    #             pair_idx = len(self.segment_pairs) - 1
+    #             self.participant_pairs[participant_id].append(pair_idx)
+    #
+    #         total_created += len(pairs_list)
+    #
+    #     # Shuffle pairs for random batching
+    #     if self.segment_pairs:
+    #         np.random.seed(self.random_seed)
+    #         np.random.shuffle(self.segment_pairs)
+    #
+    #     # Print statistics
+    #     print(f"  Pair generation statistics:")
+    #     print(f"    Total possible pairs: {total_possible:,}")
+    #     print(f"    Created pairs: {total_created:,}")
+    #
+    #     if len(self.participant_pairs) > 0:
+    #         print(f"    Average pairs per participant: {total_created / len(self.participant_pairs):.1f}")
+    #     else:
+    #         print(f"    Average pairs per participant: 0 (no valid participants)")
 
     def __len__(self):
         """Return dataset length."""
