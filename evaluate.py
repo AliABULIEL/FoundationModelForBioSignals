@@ -261,7 +261,13 @@ class DownstreamEvaluator:
             tasks = default_tasks
             
         return tasks
-
+    def clear_cache(self):
+        """Clear the embedding cache."""
+        self._current_dataset_id = None
+        self._cached_embeddings = None
+        self._cached_labels = None
+        self._cached_pids = None
+        print("✓ Cleared embedding cache")
     def _load_encoder(self):
         """Load pre-trained encoder."""
         # Get modality from checkpoint or default
@@ -1403,6 +1409,7 @@ class DownstreamEvaluator:
                 self._print_comparison(results_df)
 
         return results_df
+
 
     def _print_comparison(self, results_df: pd.DataFrame):
         """Print side-by-side comparison of different evaluation methods."""

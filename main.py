@@ -12,6 +12,8 @@ import logging
 from datetime import datetime
 import sys
 import os
+import pandas as pd
+
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -421,6 +423,8 @@ def run_evaluate_extended(args, device_manager):
         print(f"EVALUATING ON {dataset_type.upper()}")
         print(f"{'=' * 60}")
 
+        evaluator.clear_cache()
+
         # Run evaluation
         results_path = checkpoint_dir / f"downstream_results_{args.modality}_{dataset_type}.csv"
 
@@ -586,12 +590,12 @@ def run_finetune_extended(args, device_manager):
 
 def run_full_extended(args, device_manager):
     """
-    Extended full pipeline with flexible dataset support.
-    Can run: pretrain(VitalDB) -> finetune(VitalDB/BUT/both) -> evaluate(VitalDB/BUT/both) -> compare
+    Extended full pipeline with correct evaluation order:
+    pretrain(VitalDB) -> eval(VitalDB) -> finetune(BUT_PPG) -> eval(BUT_PPG) -> compare
     """
     logger.info("Running extended full pipeline")
 
-    results_to_compare = []
+    all_results = {}  # Store all results for comparison
 
     # Step 1: Pre-train (or skip if pretrained path provided)
     if args.pretrained_path:
@@ -604,50 +608,96 @@ def run_full_extended(args, device_manager):
         pretrain_dir = run_pretrain(args, device_manager)
         args.pretrained_path = str(pretrain_dir / "encoder.pt")
 
-    # Step 2: Fine-tune on specified dataset(s)
+    # Step 2: Evaluate pre-trained model on VitalDB
     logger.info("\n" + "=" * 60)
-    logger.info(f"PHASE 2: FINE-TUNING ON {args.finetune_dataset.upper()}")
+    logger.info("PHASE 2: EVALUATING PRE-TRAINED MODEL ON VITALDB")
     logger.info("=" * 60)
-    finetune_dir = run_finetune_extended(args, device_manager)
 
-    # Step 3: Evaluate on specified dataset(s)
+    args.checkpoint_dir = str(pretrain_dir)
+    args.dataset_type = 'vitaldb'
+    vitaldb_pretrain_results = run_evaluate_extended(args, device_manager)
+    all_results['vitaldb_pretrained'] = vitaldb_pretrain_results
+
+    # Step 3: Fine-tune on BUT PPG
     logger.info("\n" + "=" * 60)
-    logger.info(f"PHASE 3: EVALUATION ON {args.eval_dataset.upper()}")
+    logger.info("PHASE 3: FINE-TUNING ON BUT_PPG")
+    logger.info("=" * 60)
+
+    # Force fine-tuning dataset to BUT PPG for this pipeline
+    original_finetune_dataset = args.finetune_dataset
+    args.finetune_dataset = 'but_ppg'
+    finetune_dir = run_finetune_extended(args, device_manager)
+    args.finetune_dataset = original_finetune_dataset  # Restore original
+
+    # Step 4: Evaluate fine-tuned model on BUT PPG
+    logger.info("\n" + "=" * 60)
+    logger.info("PHASE 4: EVALUATING FINE-TUNED MODEL ON BUT_PPG")
     logger.info("=" * 60)
 
     args.checkpoint_dir = str(finetune_dir)
-    args.dataset_type = args.eval_dataset
-    results_path = run_evaluate_extended(args, device_manager)
+    args.dataset_type = 'but_ppg'
+    butppg_finetune_results = run_evaluate_extended(args, device_manager)
+    all_results['but_ppg_finetuned'] = butppg_finetune_results
 
-    # Step 4: Compare with paper benchmarks
+    # Optional Step 5: Evaluate fine-tuned model on VitalDB to see transfer effect
+    if args.eval_dataset == 'both':
+        logger.info("\n" + "=" * 60)
+        logger.info("PHASE 5: EVALUATING FINE-TUNED MODEL ON VITALDB (TRANSFER CHECK)")
+        logger.info("=" * 60)
+
+        args.dataset_type = 'vitaldb'
+        vitaldb_finetune_results = run_evaluate_extended(args, device_manager)
+        all_results['vitaldb_finetuned'] = vitaldb_finetune_results
+
+    # Step 6: Compare results
     logger.info("\n" + "=" * 60)
-    logger.info("PHASE 4: COMPARISON WITH BENCHMARKS")
+    logger.info("PHASE 6: COMPARISON AND SUMMARY")
     logger.info("=" * 60)
 
-    # Compare each dataset's results
-    if args.eval_dataset == 'both':
-        # Compare both VitalDB and BUT PPG results
-        for dataset_type in ['vitaldb', 'but_ppg']:
-            specific_results = finetune_dir / f"downstream_results_{args.modality}_{dataset_type}.csv"
-            if specific_results.exists():
-                args.results_path = str(specific_results)
-                args.dataset_type = dataset_type
-                run_compare_extended(args, device_manager)
+    # Print summary comparison
+    print("\n" + "=" * 70)
+    print("PERFORMANCE SUMMARY")
+    print("=" * 70)
 
-        # Also compare combined results
-        args.results_path = str(results_path)  # This should be the combined results
-        args.dataset_type = 'combined'
-        run_compare_extended(args, device_manager)
-    else:
-        args.results_path = str(results_path)
-        args.dataset_type = args.eval_dataset
-        run_compare_extended(args, device_manager)
+    if 'vitaldb_pretrained' in all_results:
+        print("\n1. Pre-trained Model on VitalDB:")
+        print(f"   Results saved: {all_results['vitaldb_pretrained']}")
+
+    if 'but_ppg_finetuned' in all_results:
+        print("\n2. Fine-tuned Model on BUT PPG:")
+        print(f"   Results saved: {all_results['but_ppg_finetuned']}")
+
+    if 'vitaldb_finetuned' in all_results:
+        print("\n3. Fine-tuned Model on VitalDB (Transfer):")
+        print(f"   Results saved: {all_results['vitaldb_finetuned']}")
+        print("   → Shows how BUT PPG fine-tuning affects VitalDB performance")
+
+    # Compare with paper benchmarks for each result
+    for result_name, result_path in all_results.items():
+        if result_path and Path(result_path).exists():
+            logger.info(f"\nComparing {result_name} with benchmarks...")
+            args.results_path = str(result_path)
+            args.dataset_type = 'vitaldb' if 'vitaldb' in result_name else 'but_ppg'
+            run_compare_extended(args, device_manager)
 
     logger.info("\n" + "=" * 60)
     logger.info("EXTENDED PIPELINE COMPLETED SUCCESSFULLY!")
     logger.info("=" * 60)
 
+    # Final summary
+    print("\n" + "=" * 70)
+    print("PIPELINE EXECUTION SUMMARY")
+    print("=" * 70)
+    print("✓ Pre-training on VitalDB: Complete")
+    print("✓ Evaluation on VitalDB (baseline): Complete")
+    print("✓ Fine-tuning on BUT PPG: Complete")
+    print("✓ Evaluation on BUT PPG: Complete")
+    if 'vitaldb_finetuned' in all_results:
+        print("✓ Transfer evaluation on VitalDB: Complete")
+    print("✓ Benchmark comparisons: Complete")
+
     device_manager.empty_cache()
+    return all_results
 
 
 def run_test(args):
