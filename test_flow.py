@@ -281,9 +281,9 @@ class VitalDBRealDataLoader:
 
         # Save splits
         splits = {
-            'train': train_cases,
-            'val': val_cases,
-            'test': test_cases
+            'train': [int(x) for x in train_cases],
+            'val': [int(x) for x in val_cases],
+            'test': [int(x) for x in test_cases]
         }
 
         splits_file = self.cache_dir / 'ppg_splits.json'
