@@ -160,6 +160,9 @@ class VitalDBRealDataLoader:
         ppg_cases = sorted(list(ppg_cases))
         print(f"\n✓ Total unique PPG cases: {len(ppg_cases)}")
 
+        # Convert to regular Python int for JSON serialization
+        ppg_cases = [int(case_id) for case_id in ppg_cases]
+
         # Save PPG cases list
         ppg_file = self.cache_dir / 'ppg_cases.json'
         with open(ppg_file, 'w') as f:
