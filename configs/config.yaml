@@ -63,8 +63,8 @@ model:
   n_blocks: 16           # Paper specifies 16 MBConv blocks
   width_multiplier: 0.5
   depth_multiplier: 1.0
-  dropout_rate: 0.1
-  drop_path_rate: 0.1
+  dropout_rate: 0.15
+  drop_path_rate: 0.15
 
 simsiam:
   # Architecture parameters
@@ -73,7 +73,7 @@ simsiam:
 
   # Training parameters optimized for small datasets
   batch_size: 32         # Can work with smaller batches than InfoNCE
-  learning_rate: 0.00005 # Higher than InfoNCE since no momentum
+  learning_rate: 0.0005 # Higher than InfoNCE since no momentum
   weight_decay: 0.0001   # Less regularization than InfoNCE
 
   # No temperature or momentum needed for SimSiam
@@ -110,16 +110,16 @@ ssl:
 
   # Augmentations (paper Table 1)
   augmentations_ppg:
-    cutout: 0.7  # Paper value
-    magnitude_warp: 0.5
-    gaussian_noise: 0.5
+    cutout: 0.4  # Paper value
+    magnitude_warp: 0.25
+    gaussian_noise: 0.25
     time_warp: 0.3
     channel_permute: 0.0
 
   augmentations_ecg:
-    cutout: 0.8  # Paper value
-    magnitude_warp: 0.5
-    gaussian_noise: 0.5
+    cutout: 0.4  # Paper value
+    magnitude_warp: 0.2
+    gaussian_noise: 0.2
     time_warp: 0.3
     channel_permute: 0.0
 
@@ -134,12 +134,12 @@ ssl:
 training:
   # Batch and epochs
   batch_size: 64         # Smaller for M1 (paper uses 256)
-  num_epochs: 30
-  warmup_epochs: 5 # Paper uses 300, we'll use less for testing
+  num_epochs: 200
+  warmup_epochs: 20 # Paper uses 300, we'll use less for testing
 
   # Optimizer
   optimizer: "adam"
-  learning_rate: 0.0001
+  learning_rate: 0.000005
   weight_decay: 0.00001
 
   # Learning rate schedule
@@ -234,13 +234,13 @@ vitaldb:
   cache_dir: "data/vitaldb_cache"
   train_ratio: 0.8
   val_ratio: 0.1
-  max_pairs_per_case: 10
+  max_pairs_per_case: 100
   cases_limit: 6000  # Limit number of cases to use (optional)
   track_mapping:
     ppg: "PLETH"
     ecg: "ECG_II"
     acc: "ACC"
-  segments_per_case: 15
+  segments_per_case: 35
   sampling_rates:
     ppg: 100
     ecg: 500
@@ -250,11 +250,11 @@ vitaldb:
 pretrain:
   dataset: "vitaldb"
   epochs: 50
-  batch_size: 128
+  batch_size: 64
   learning_rate: 0.0001
   num_workers: 8
   save_freq: 10
-  early_stopping_patience: 15
+  early_stopping_patience: 20
 
 # Fine-tuning settings
 finetune:
@@ -265,7 +265,7 @@ finetune:
   num_workers: 4
   freeze_encoder: false
   save_freq: 5
-  early_stopping_patience: 10
+  early_stopping_patience: 20
 
 
 
