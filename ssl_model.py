@@ -18,7 +18,8 @@ from config_loader import get_config  # Added ConfigLoader
 class SemiSupervisedLoss(nn.Module):
     def __init__(self, alpha=0.3, age_threshold=50):
         super().__init__()
-        self.alpha = alpha
+        self.config = get_config()
+        self.alpha = self.config.config.get('semi_supervised', {}).get('supervised_weight', 0.3)
         self.age_threshold = age_threshold
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
         self.mse_loss = nn.MSELoss()

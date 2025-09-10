@@ -551,26 +551,33 @@ class Trainer:
             'loss_contrastive': [],
             'loss_koleo': [],
             'loss_variance': [],
-            'supervised_loss': []  # ADD THIS
+            'supervised_loss': []
         }
 
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc=f"Epoch {epoch + 1} [Val]")
 
             for batch in pbar:
-                # Get positive pairs
-                if len(batch) == 3 and self.use_supervised:
+                has_labels = False
+                labels = None
+
+                # Handle both 2 and 3 element batches
+                if len(batch) == 3:
                     seg1, seg2, labels = batch
-                    # Compute supervised loss for monitoring (no gradients)
-                    _, _, predictions = self.model(seg1, seg2, return_predictions=True)
-                    _, sup_loss = self.semi_supervised_loss(loss, predictions, labels)
-                    val_metrics['supervised_loss'].append(sup_loss)
+                    has_labels = True
+                    # Move labels to device if present
+                    if self.device_manager.is_cuda:
+                        for key in labels:
+                            labels[key] = labels[key].to(self.device, non_blocking=True)
+                    else:
+                        for key in labels:
+                            labels[key] = labels[key].to(self.device)
                 elif len(batch) == 2:
                     seg1, seg2 = batch
                 else:
                     seg1, seg2 = batch[0], batch[1]
 
-                # Move to device with optimization
+                # Move to device
                 if self.device_manager.is_cuda:
                     seg1 = seg1.to(self.device, non_blocking=True)
                     seg2 = seg2.to(self.device, non_blocking=True)
@@ -578,32 +585,46 @@ class Trainer:
                     seg1 = seg1.to(self.device)
                     seg2 = seg2.to(self.device)
 
-                # No augmentation for validation
-                if self.use_amp and self.device_manager.supports_amp:
-                    with autocast():
-                        loss, metrics = self.model(seg1, seg2)
+                # Compute loss (with optional supervised component)
+                if self.use_supervised and has_labels and labels is not None:
+                    # Get predictions for supervised loss calculation
+                    if self.use_amp and self.device_manager.supports_amp:
+                        with autocast():
+                            ssl_loss, metrics, predictions = self.model(seg1, seg2, return_predictions=True)
+                            _, sup_loss_value = self.semi_supervised_loss(ssl_loss, predictions, labels)
+                    else:
+                        ssl_loss, metrics, predictions = self.model(seg1, seg2, return_predictions=True)
+                        _, sup_loss_value = self.semi_supervised_loss(ssl_loss, predictions, labels)
+
+                    val_metrics['supervised_loss'].append(sup_loss_value)
+                    loss = ssl_loss  # Use only SSL loss for validation tracking
                 else:
-                    loss, metrics = self.model(seg1, seg2)
+                    # Standard validation without supervised loss
+                    if self.use_amp and self.device_manager.supports_amp:
+                        with autocast():
+                            loss, metrics = self.model(seg1, seg2)
+                    else:
+                        loss, metrics = self.model(seg1, seg2)
+
+                    val_metrics['supervised_loss'].append(0.0)
 
                 val_losses.append(loss.item())
                 val_metrics['loss_contrastive'].append(metrics['loss_contrastive'])
                 val_metrics['loss_koleo'].append(metrics.get('loss_koleo', 0))
                 val_metrics['loss_variance'].append(metrics.get('loss_variance', 0))
 
-
                 pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-                # Compute validation statistics
-            stats = {
-                'loss': np.mean(val_losses),
-                'loss_contrastive': np.mean(val_metrics['loss_contrastive']),
-                'loss_koleo': np.mean(val_metrics['loss_koleo']),
-                'loss_variance': np.mean(val_metrics['loss_variance']),
-                'supervised_loss': np.mean(val_metrics['supervised_loss'])  # ADD THIS
-            }
+        # Compute validation statistics
+        stats = {
+            'loss': np.mean(val_losses),
+            'loss_contrastive': np.mean(val_metrics['loss_contrastive']),
+            'loss_koleo': np.mean(val_metrics['loss_koleo']),
+            'loss_variance': np.mean(val_metrics['loss_variance']),
+            'supervised_loss': np.mean(val_metrics['supervised_loss'])
+        }
 
-            return stats
-
+        return stats
     def apply_warmup(self, epoch: int):
         """Apply learning rate warmup."""
         if epoch < self.warmup_epochs:

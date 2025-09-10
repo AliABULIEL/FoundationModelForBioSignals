@@ -271,9 +271,11 @@ semi_supervised:
   enabled: true   # Set to true to enable semi-supervised learning
   mode: "multi_task"  # "multi_task" or "pseudo_label"
 
+
+
   # Loss weights
   ssl_weight: 0.7  # Weight for SSL loss (contrastive)
-  supervised_weight: 0.3  # Weight for supervised loss
+  supervised_weight: 0.01  # Weight for supervised loss
 
   # Supervised tasks to include
   tasks:
