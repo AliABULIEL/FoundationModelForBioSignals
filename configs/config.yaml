@@ -268,7 +268,7 @@ finetune:
   early_stopping_patience: 20
 
 semi_supervised:
-  enabled: true   # Set to true to enable semi-supervised learning
+  enabled: false   # Set to true to enable semi-supervised learning
   mode: "multi_task"  # "multi_task" or "pseudo_label"
 
 
