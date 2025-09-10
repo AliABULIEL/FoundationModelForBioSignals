@@ -1872,6 +1872,7 @@ def create_dataloaders(
         pin_memory: Optional[bool] = None,
         prefetch_factor: Optional[int] = 2,
         persistent_workers: Optional[bool] = None,
+        return_labels: bool = False,
         **dataset_kwargs
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -1928,6 +1929,7 @@ def create_dataloaders(
     common_kwargs = {
         'modality': modality,
         'config_path': config_path,
+        'return_labels': return_labels,
         **dataset_kwargs
     }
 
@@ -1940,15 +1942,28 @@ def create_dataloaders(
 
     # Collate function for handling empty batches
     def collate_fn(batch):
-        """Fast collate that handles bad samples."""
+        """Fast collate that handles bad samples and labels."""
         valid_batch = [item for item in batch if item[0].numel() > 0]
 
         if len(valid_batch) == 0:
-            # Return dummy sample if all samples are bad
             dummy = torch.zeros(1, 1, train_dataset.segment_length)
             return dummy, dummy
 
-        return torch.utils.data.dataloader.default_collate(valid_batch)
+        # Check if batch has labels
+        if len(valid_batch[0]) == 3:  # With labels
+            segs1 = torch.stack([item[0] for item in valid_batch])
+            segs2 = torch.stack([item[1] for item in valid_batch])
+
+            # Combine label dictionaries
+            labels_batch = {}
+            for key in ['age', 'sex', 'bmi', 'height', 'weight']:
+                values = [item[2].get(key, -1.0) for item in valid_batch]
+                labels_batch[key] = torch.tensor(values, dtype=torch.float32)
+
+            return segs1, segs2, labels_batch
+        else:
+            # No labels - use default collate
+            return torch.utils.data.dataloader.default_collate(valid_batch)
 
     # DataLoader settings
     dataloader_kwargs = {

@@ -15,6 +15,57 @@ from device import get_device_manager
 from config_loader import get_config  # Added ConfigLoader
 
 
+class SemiSupervisedLoss(nn.Module):
+    def __init__(self, alpha=0.3, age_threshold=50):
+        super().__init__()
+        self.alpha = alpha
+        self.age_threshold = age_threshold
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
+        self.mse_loss = nn.MSELoss()
+
+    def forward(self, ssl_loss, predictions, labels):
+        supervised_losses = []
+
+        # Convert age to binary classification
+        if 'age' in labels and 'age_class' in predictions:
+            age_values = labels['age']
+            valid_mask = age_values >= 0  # Valid ages
+
+            if valid_mask.any():
+                # Convert to binary: 1 if >50, 0 if <=50
+                age_binary = (age_values > self.age_threshold).long()
+                age_loss = self.ce_loss(
+                    predictions['age_class'][valid_mask],
+                    age_binary[valid_mask]
+                )
+                supervised_losses.append(age_loss)
+
+        # BMI regression
+        if 'bmi' in labels and 'bmi' in predictions:
+            valid_mask = labels['bmi'] > 0
+            if valid_mask.any():
+                bmi_loss = self.mse_loss(
+                    predictions['bmi'][valid_mask].squeeze(),
+                    labels['bmi'][valid_mask]
+                )
+                supervised_losses.append(bmi_loss)
+
+        # Sex classification (already 0/1)
+        if 'sex' in labels and 'sex' in predictions:
+            valid_mask = labels['sex'] >= 0
+            if valid_mask.any():
+                sex_loss = self.ce_loss(
+                    predictions['sex'][valid_mask],
+                    labels['sex'][valid_mask].long()
+                )
+                supervised_losses.append(sex_loss)
+
+        if supervised_losses:
+            supervised_loss = torch.mean(torch.stack(supervised_losses))
+            total_loss = (1 - self.alpha) * ssl_loss + self.alpha * supervised_loss
+            return total_loss, supervised_loss.item()
+        else:
+            return ssl_loss, 0.0
 class RegularizedInfoNCE(nn.Module):
     """InfoNCE loss with KoLeo regularization."""
 
@@ -154,16 +205,19 @@ class SSLModel(nn.Module):
             encoder: nn.Module,
             projection_head: nn.Module,
             config_path: str = 'configs/config.yaml',
-            ssl_method: str = 'infonce'
+            ssl_method: str = 'infonce',
+            use_supervised: bool = False
     ):
         super().__init__()
         self.ssl_method = ssl_method
+        self.use_supervised = use_supervised
 
         # Load configuration
         self.config = get_config()
         model_config = self.config.get_model_config()
 
         self.encoder = encoder
+
 
         # Check actual input size using config
         with torch.no_grad():
@@ -183,6 +237,28 @@ class SSLModel(nn.Module):
             dummy = torch.randn(1, 1, dummy_size).to(device)
             embedding_dim = encoder(dummy).shape[1]
         ssl_config = self.config.get_ssl_config('infonce')
+        if self.use_supervised:
+            # Add task-specific heads
+            self.age_classifier = nn.Sequential(
+                nn.Linear(embedding_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, 2)  # Binary: >50 or ≤50
+            )
+
+            self.bmi_regressor = nn.Sequential(
+                nn.Linear(embedding_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, 1)  # Regression
+            )
+
+            self.sex_classifier = nn.Sequential(
+                nn.Linear(embedding_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, 2)  # Binary: M/F
+            )
         if ssl_method == 'simsiam':
             simsiam_config = self.config.get_ssl_config('simsiam')
             proj_dim = simsiam_config.get('projection_dim', 2048)
@@ -273,17 +349,18 @@ class SSLModel(nn.Module):
                     (1 - self.momentum_rate) * param.data
             )
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, return_predictions=False):
+        # Get embeddings
         h1 = self.encoder(x1)
         h2 = self.encoder(x2)
 
+        # Calculate SSL loss based on method
         if self.ssl_method == 'simsiam':
             z1 = self.projection_head(h1)
             z2 = self.projection_head(h2)
             p1 = self.predictor(z1)
             p2 = self.predictor(z2)
             loss, metrics = self.criterion(p1, p2, z1, z2)
-
         else:  # infonce
             z1 = self.projection_head(h1)
             z2 = self.projection_head(h2)
@@ -295,6 +372,27 @@ class SSLModel(nn.Module):
                 z2_m = self.momentum_projection(h2_m)
 
             loss, metrics = self.criterion(z1, z2, z1_m, z2_m)
+
+        # Add supervised predictions if requested
+        if return_predictions and self.use_supervised:
+            predictions = {}
+
+            # Age classification (binary: >50)
+            if hasattr(self, 'age_classifier'):
+                age_logits = self.age_classifier(h1)  # Use h1 embeddings
+                predictions['age_class'] = age_logits
+
+            # BMI regression
+            if hasattr(self, 'bmi_regressor'):
+                bmi_pred = self.bmi_regressor(h1)
+                predictions['bmi'] = bmi_pred
+
+            # Sex classification (binary)
+            if hasattr(self, 'sex_classifier'):
+                sex_logits = self.sex_classifier(h1)
+                predictions['sex'] = sex_logits
+
+            return loss, metrics, predictions
 
         return loss, metrics
 
@@ -320,6 +418,11 @@ class SSLModel(nn.Module):
         if optimizer is not None:
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()
 
+        if self.use_supervised:
+            checkpoint['age_classifier_state_dict'] = self.age_classifier.state_dict()
+            checkpoint['bmi_regressor_state_dict'] = self.bmi_regressor.state_dict()
+            checkpoint['sex_classifier_state_dict'] = self.sex_classifier.state_dict()
+
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
 
@@ -340,6 +443,14 @@ class SSLModel(nn.Module):
         if optimizer and 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+        if checkpoint.get('use_supervised', False) and self.use_supervised:
+            if 'age_classifier_state_dict' in checkpoint:
+                self.age_classifier.load_state_dict(checkpoint['age_classifier_state_dict'])
+            if 'bmi_regressor_state_dict' in checkpoint:
+                self.bmi_regressor.load_state_dict(checkpoint['bmi_regressor_state_dict'])
+            if 'sex_classifier_state_dict' in checkpoint:
+                self.sex_classifier.load_state_dict(checkpoint['sex_classifier_state_dict'])
+
         return checkpoint.get('epoch', 0), checkpoint.get('best_loss', float('inf'))
 
 
@@ -347,9 +458,10 @@ def create_ssl_model(
         encoder: nn.Module,
         projection_head: nn.Module,
         config_path: str = 'configs/config.yaml',
-        ssl_method: str = 'infonce'
+        ssl_method: str = 'infonce',
+        use_supervised: bool = False
 ) -> SSLModel:
-    return SSLModel(encoder, projection_head, config_path, ssl_method)
+    return SSLModel(encoder, projection_head, config_path, ssl_method,use_supervised)
 
 
 def test_ssl():

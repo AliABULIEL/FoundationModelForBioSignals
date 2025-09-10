@@ -21,6 +21,10 @@ import warnings
 from typing import Dict, Tuple, Optional
 import time
 
+
+from ssl_model import SemiSupervisedLoss
+
+
 warnings.filterwarnings('ignore')
 
 # Import modules
@@ -64,6 +68,14 @@ class Trainer:
         # Load configuration
         self.config = get_config()
         self.training_config = self.config.get_training_config()
+
+        self.use_supervised = self.config.config.get('semi_supervised', {}).get('enabled', False)
+        self.semi_supervised_loss = None  # Initialize as None
+
+        if self.use_supervised:
+            alpha = self.config.config.get('semi_supervised', {}).get('supervised_weight', 0.3)
+            self.semi_supervised_loss = SemiSupervisedLoss(alpha=alpha)
+            print(f"  Semi-supervised: ENABLED (alpha={alpha})")
 
         # Set experiment name
         if experiment_name is None:
@@ -127,7 +139,9 @@ class Trainer:
 
     def setup_data(self, modality: str = 'ppg', dataset_type: Optional[str] = None):
         """Setup data loaders with dataset type support."""
-
+        semi_supervised_enabled = self.config.config.get('semi_supervised', {}).get('enabled', False)
+        # Only return labels during training phase
+        return_labels = semi_supervised_enabled and self.phase in ['pretrain', 'finetune', '']
         if dataset_type is None:
             if self.phase == 'pretrain':
                 dataset_type = 'vitaldb'
@@ -170,9 +184,12 @@ class Trainer:
             prefetch_factor=2 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
             downsample=self.downsample,
-            return_labels=False,  # SSL training doesn't need labels
+            return_labels=return_labels,  # SSL training doesn't need labels
             return_participant_id=False
         )
+        print(f"  Semi-supervised: {return_labels}")
+        if return_labels:
+            print(f"    (Enabled for {self.phase if self.phase else 'training'} phase)")
 
         print(f"  Dataset: {dataset_type.upper()}")
         print(f"  Train batches: {len(self.train_loader)}")
@@ -205,7 +222,8 @@ class Trainer:
             encoder=foundation_model.encoder,
             projection_head=foundation_model.projection_head,
             config_path='configs/config.yaml',
-            ssl_method=self.ssl_method
+            ssl_method=self.ssl_method,
+            use_supervised=self.use_supervised
         )
         self.model = self.model.to(self.device)
         if self.phase == 'finetune' and hasattr(self, 'pretrained_path') and self.pretrained_path:
@@ -258,6 +276,12 @@ class Trainer:
         if self.device_manager.is_cuda:
             mem_stats = self.device_manager.memory_stats()
             print(f"  GPU memory after model load: {mem_stats.get('allocated', 0):.2f} GB")
+
+        if self.use_supervised:
+            print(f"  Semi-supervised heads: ENABLED")
+            print(f"    - Age classifier (binary)")
+            print(f"    - BMI regressor")
+            print(f"    - Sex classifier (binary)")
 
     def setup_optimizer(self):
         """Setup optimizer and scheduler with optimizations."""
@@ -351,7 +375,8 @@ class Trainer:
         epoch_metrics = {
             'loss_contrastive': [],
             'loss_koleo': [],
-            'loss_variance': []
+            'loss_variance': [],
+            'supervised_loss': []  # ADD THIS
         }
 
         # Timing
@@ -370,9 +395,14 @@ class Trainer:
             # Measure data loading time
             data_time = time.time() - end
             data_times.append(data_time)
+            has_labels = False
+            labels = None
 
             # Get positive pairs
-            if len(batch) == 2:
+            if len(batch) == 3:  # With labels
+                seg1, seg2, labels = batch
+                has_labels = True
+            elif len(batch) == 2:  # No labels
                 seg1, seg2 = batch
             else:
                 seg1, seg2 = batch[0], batch[1]
@@ -381,21 +411,58 @@ class Trainer:
             if self.device_manager.is_cuda:
                 seg1 = seg1.to(self.device, non_blocking=True)
                 seg2 = seg2.to(self.device, non_blocking=True)
+                # ADD: Move labels to device
+                if has_labels and labels is not None:
+                    for key in labels:
+                        labels[key] = labels[key].to(self.device, non_blocking=True)
             else:
                 seg1 = seg1.to(self.device)
                 seg2 = seg2.to(self.device)
+                # ADD: Move labels to device
+                if has_labels and labels is not None:
+                    for key in labels:
+                        labels[key] = labels[key].to(self.device)
 
             # Apply augmentations
             seg1_aug, seg2_aug = self.augmentation(seg1, seg2)
 
             # Mixed precision forward pass (only if device supports it)
-            if self.use_amp and self.device_manager.supports_amp:
-                with autocast():
+            if self.use_supervised and has_labels and labels is not None:
+                # Semi-supervised forward pass
+                if self.use_amp and self.device_manager.supports_amp:
+                    with autocast():
+                        ssl_loss, metrics, predictions = self.model(
+                            seg1_aug, seg2_aug,
+                            return_predictions=True
+                        )
+                        total_loss, sup_loss_value = self.semi_supervised_loss(
+                            ssl_loss, predictions, labels
+                        )
+                        loss = total_loss / self.gradient_accumulation_steps
+                else:
+                    ssl_loss, metrics, predictions = self.model(
+                        seg1_aug, seg2_aug,
+                        return_predictions=True
+                    )
+                    total_loss, sup_loss_value = self.semi_supervised_loss(
+                        ssl_loss, predictions, labels
+                    )
+                    loss = total_loss / self.gradient_accumulation_steps
+
+                # Update metrics
+                metrics['supervised_loss'] = sup_loss_value
+                epoch_metrics['supervised_loss'].append(sup_loss_value)
+            else:
+                # Standard SSL forward pass (existing code)
+                if self.use_amp and self.device_manager.supports_amp:
+                    with autocast():
+                        loss, metrics = self.model(seg1_aug, seg2_aug)
+                        loss = loss / self.gradient_accumulation_steps
+                else:
                     loss, metrics = self.model(seg1_aug, seg2_aug)
                     loss = loss / self.gradient_accumulation_steps
-            else:
-                loss, metrics = self.model(seg1_aug, seg2_aug)
-                loss = loss / self.gradient_accumulation_steps
+
+                epoch_metrics['supervised_loss'].append(0.0)
 
             # Backward pass
             if self.use_amp and self.scaler is not None:
@@ -439,6 +506,7 @@ class Trainer:
                 'loss': f"{loss.item() * self.gradient_accumulation_steps:.4f}",
                 'cont': f"{metrics['loss_contrastive']:.4f}",
                 'koleo': f"{metrics.get('loss_koleo', 0):.4f}",
+                'sup': f"{metrics.get('supervised_loss', 0):.4f}",  # ADD THIS
                 'data_t': f"{np.mean(data_times[-10:]) if data_times else 0:.3f}",
                 'batch_t': f"{np.mean(batch_times[-10:]) if batch_times else 0:.3f}"
             })
@@ -458,6 +526,7 @@ class Trainer:
             'loss_contrastive': np.mean(epoch_metrics['loss_contrastive']),
             'loss_koleo': np.mean(epoch_metrics['loss_koleo']),
             'loss_variance': np.mean(epoch_metrics['loss_variance']),
+            'supervised_loss': np.mean(epoch_metrics['supervised_loss']),  # ADD THIS
             'lr': self.optimizer.param_groups[0]['lr'],
             'avg_data_time': np.mean(data_times) if data_times else 0,
             'avg_batch_time': np.mean(batch_times) if batch_times else 0
@@ -481,7 +550,8 @@ class Trainer:
         val_metrics = {
             'loss_contrastive': [],
             'loss_koleo': [],
-            'loss_variance': []
+            'loss_variance': [],
+            'supervised_loss': []  # ADD THIS
         }
 
         with torch.no_grad():
@@ -489,7 +559,13 @@ class Trainer:
 
             for batch in pbar:
                 # Get positive pairs
-                if len(batch) == 2:
+                if len(batch) == 3 and self.use_supervised:
+                    seg1, seg2, labels = batch
+                    # Compute supervised loss for monitoring (no gradients)
+                    _, _, predictions = self.model(seg1, seg2, return_predictions=True)
+                    _, sup_loss = self.semi_supervised_loss(loss, predictions, labels)
+                    val_metrics['supervised_loss'].append(sup_loss)
+                elif len(batch) == 2:
                     seg1, seg2 = batch
                 else:
                     seg1, seg2 = batch[0], batch[1]
@@ -514,17 +590,19 @@ class Trainer:
                 val_metrics['loss_koleo'].append(metrics.get('loss_koleo', 0))
                 val_metrics['loss_variance'].append(metrics.get('loss_variance', 0))
 
+
                 pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-        # Compute validation statistics
-        stats = {
-            'loss': np.mean(val_losses),
-            'loss_contrastive': np.mean(val_metrics['loss_contrastive']),
-            'loss_koleo': np.mean(val_metrics['loss_koleo']),
-            'loss_variance': np.mean(val_metrics['loss_variance'])
-        }
+                # Compute validation statistics
+            stats = {
+                'loss': np.mean(val_losses),
+                'loss_contrastive': np.mean(val_metrics['loss_contrastive']),
+                'loss_koleo': np.mean(val_metrics['loss_koleo']),
+                'loss_variance': np.mean(val_metrics['loss_variance']),
+                'supervised_loss': np.mean(val_metrics['supervised_loss'])  # ADD THIS
+            }
 
-        return stats
+            return stats
 
     def apply_warmup(self, epoch: int):
         """Apply learning rate warmup."""
@@ -634,13 +712,15 @@ class Trainer:
             print(f"    - Contrastive: {train_stats['loss_contrastive']:.4f}")
             print(f"    - KoLeo: {train_stats['loss_koleo']:.4f}")
             print(f"    - Variance: {train_stats['loss_variance']:.4f}")
+            if self.use_supervised:  # ADD THIS
+                print(f"    - Supervised: {train_stats.get('supervised_loss', 0):.4f}")
+
             print(f"  Val Loss: {val_stats['loss']:.4f}")
             print(f"    - Contrastive: {val_stats['loss_contrastive']:.4f}")
             print(f"    - KoLeo: {val_stats['loss_koleo']:.4f}")
             print(f"    - Variance: {val_stats['loss_variance']:.4f}")
-            print(f"  Learning Rate: {train_stats['lr']:.6f}")
-            print(f"  Timing: Train {train_time:.1f}s, Val {val_time:.1f}s")
-            print(f"  Avg batch time: {train_stats['avg_batch_time']:.3f}s")
+            if self.use_supervised:  # ADD THIS
+                print(f"    - Supervised: {val_stats.get('supervised_loss', 0):.4f}")
 
             if self.device_manager.is_cuda:
                 print(f"  GPU Memory: {train_stats.get('gpu_memory_gb', 0):.2f} GB")
@@ -784,13 +864,14 @@ class Trainer:
         history = {
             'train': self.train_history,
             'val': self.val_history,
-            'config': self.config.config,  # Save full config
+            'config': self.config.config,
             'experiment_name': self.experiment_name,
             'best_val_loss': self.best_val_loss,
             'modality': getattr(self, 'modality', 'unknown'),
             'device': self.device_manager.type,
             'device_properties': self.device_manager.get_properties(),
-            'ssl_method': self.ssl_method
+            'ssl_method': self.ssl_method,
+            'use_supervised': self.use_supervised  # ADD THIS
         }
 
         # Save as JSON

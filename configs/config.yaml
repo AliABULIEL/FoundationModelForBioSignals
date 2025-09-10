@@ -267,5 +267,36 @@ finetune:
   save_freq: 5
   early_stopping_patience: 20
 
+semi_supervised:
+  enabled: true   # Set to true to enable semi-supervised learning
+  mode: "multi_task"  # "multi_task" or "pseudo_label"
 
+  # Loss weights
+  ssl_weight: 0.7  # Weight for SSL loss (contrastive)
+  supervised_weight: 0.3  # Weight for supervised loss
+
+  # Supervised tasks to include
+  tasks:
+    - "age_classification"
+    - "bmi_regression"
+    - "sex_classification"
+
+  # Pseudo-labeling settings (if using pseudo_label mode)
+  pseudo_label:
+    threshold: 0.9  # Confidence threshold for pseudo-labels
+    update_interval: 10  # Update pseudo-labels every N epochs
+    weight: 0.5  # Weight for pseudo-labeled samples
+
+  # Different augmentations for labeled vs unlabeled
+  augmentations_labeled:
+    cutout: 0.2
+    magnitude_warp: 0.15
+    gaussian_noise: 0.15
+    time_warp: 0.1
+
+  augmentations_unlabeled:
+    cutout: 0.4
+    magnitude_warp: 0.25
+    gaussian_noise: 0.25
+    time_warp: 0.15
 
