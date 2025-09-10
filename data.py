@@ -413,14 +413,25 @@ class VitalDBDataset(BaseSignalDataset):
 
     def __getitem__(self, idx):
         """Get TWO segments from SAME patient - with optional demographics."""
+
+        # Helper function to create standardized empty demographics
+        def get_empty_demographics():
+            return {
+                'age': -1.0,
+                'sex': -1.0,
+                'bmi': -1.0,
+                'height': -1.0,
+                'weight': -1.0
+            }
+
         if len(self.cases) == 0:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels:
-                empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
-                if self.return_participant_id:
-                    return zero_seg, zero_seg, -1, empty_demo  # Match order: seg1, seg2, ID, labels
-                else:
-                    return zero_seg, zero_seg, empty_demo
+            empty_demo = get_empty_demographics()
+
+            if self.return_labels and self.return_participant_id:
+                return zero_seg, zero_seg, -1, empty_demo
+            elif self.return_labels:
+                return zero_seg, zero_seg, empty_demo
             elif self.return_participant_id:
                 return zero_seg, zero_seg, -1
             else:
@@ -447,13 +458,16 @@ class VitalDBDataset(BaseSignalDataset):
 
             if signal is None or not isinstance(signal, np.ndarray):
                 zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-                if self.return_labels:
-                    empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
-                    if self.return_participant_id:
-                        return (zero_seg, zero_seg), empty_demo, case_id
-                    else:
-                        return (zero_seg, zero_seg), empty_demo
-                return zero_seg, zero_seg
+                empty_demo = get_empty_demographics()
+
+                if self.return_labels and self.return_participant_id:
+                    return zero_seg, zero_seg, case_id, empty_demo
+                elif self.return_labels:
+                    return zero_seg, zero_seg, empty_demo
+                elif self.return_participant_id:
+                    return zero_seg, zero_seg, case_id
+                else:
+                    return zero_seg, zero_seg
 
             # Handle 2D array
             if signal.ndim == 2:
@@ -465,13 +479,16 @@ class VitalDBDataset(BaseSignalDataset):
             if len(signal) < 2 * self.segment_length:
                 # Not enough data for two segments
                 zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-                if self.return_labels:
-                    empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
-                    if self.return_participant_id:
-                        return (zero_seg, zero_seg), empty_demo, case_id
-                    else:
-                        return (zero_seg, zero_seg), empty_demo
-                return zero_seg, zero_seg
+                empty_demo = get_empty_demographics()
+
+                if self.return_labels and self.return_participant_id:
+                    return zero_seg, zero_seg, case_id, empty_demo
+                elif self.return_labels:
+                    return zero_seg, zero_seg, empty_demo
+                elif self.return_participant_id:
+                    return zero_seg, zero_seg, case_id
+                else:
+                    return zero_seg, zero_seg
 
             # Preprocess full signal
             full_signal = self._preprocess_full_signal(signal)
@@ -482,13 +499,16 @@ class VitalDBDataset(BaseSignalDataset):
 
         if full_signal is None or full_signal.shape[1] < 2 * self.segment_length:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            if self.return_labels:
-                empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
-                if self.return_participant_id:
-                    return (zero_seg, zero_seg), empty_demo, case_id
-                else:
-                    return (zero_seg, zero_seg), empty_demo
-            return zero_seg, zero_seg
+            empty_demo = get_empty_demographics()
+
+            if self.return_labels and self.return_participant_id:
+                return zero_seg, zero_seg, case_id, empty_demo
+            elif self.return_labels:
+                return zero_seg, zero_seg, empty_demo
+            elif self.return_participant_id:
+                return zero_seg, zero_seg, case_id
+            else:
+                return zero_seg, zero_seg
 
         # Extract TWO DIFFERENT segments from SAME signal
         max_start = full_signal.shape[1] - self.segment_length
@@ -508,17 +528,32 @@ class VitalDBDataset(BaseSignalDataset):
         seg1 = torch.from_numpy(seg1).float()
         seg2 = torch.from_numpy(seg2).float()
 
-        # Return based on flags - ADD DEMOGRAPHICS SUPPORT HERE
+        # Return based on flags
         if self.return_labels:
             # Get demographics for this case
-            demographics = self._get_participant_info(case_id)
+            raw_demographics = self._get_participant_info(case_id)
+
+            # Standardize demographics to ensure consistent structure for batching
+            demographics = {
+                'age': float(raw_demographics.get('age', -1.0)),
+                'sex': float(raw_demographics.get('sex', -1.0)),
+                'bmi': float(raw_demographics.get('bmi', -1.0)),
+                'height': float(raw_demographics.get('height', -1.0)),
+                'weight': float(raw_demographics.get('weight', -1.0))
+            }
+
+            # Ensure all values are valid floats (not None, NaN, etc.)
+            for key in demographics:
+                val = demographics[key]
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    demographics[key] = -1.0
 
             if self.return_participant_id:
-                return seg1, seg2, case_id, demographics  # Match BUT PPG order: seg1, seg2, ID, labels
+                return seg1, seg2, case_id, demographics  # Match BUT PPG order
             else:
-                return seg1, seg2, demographics  # Match BUT PPG: seg1, seg2, labels
+                return seg1, seg2, demographics
         elif self.return_participant_id:
-            return seg1, seg2, case_id  # Match BUT PPG: seg1, seg2, ID
+            return seg1, seg2, case_id
         else:
             return seg1, seg2
 
