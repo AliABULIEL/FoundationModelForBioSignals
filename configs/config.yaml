@@ -139,7 +139,7 @@ training:
 
   # Optimizer
   optimizer: "adam"
-  learning_rate: 0.000005
+  learning_rate: 0.00005
   weight_decay: 0.00001
 
   # Learning rate schedule
