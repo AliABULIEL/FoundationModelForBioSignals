@@ -25,7 +25,7 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-from data import BUTPPGDataset
+from data import BUTPPGDataset, BaseSignalDataset
 from model import EfficientNet1D
 from device import DeviceManager, get_device_manager
 from config_loader import get_config  # Added ConfigLoader
@@ -430,10 +430,28 @@ class DownstreamEvaluator:
 
             # Handle participant IDs - need to duplicate for both segments
             if pid is not None:
-                if isinstance(pid, (list, tuple)):
-                    pid_list = list(pid)
+                batch_size_actual = seg1.shape[0]
+
+                # Handle VitalDB case IDs (integers)
+                if self.current_dataset_type == 'vitaldb':
+                    # VitalDB returns a single case_id per batch item
+                    if torch.is_tensor(pid):
+                        pid_list = pid.cpu().numpy().tolist()
+                    elif isinstance(pid, (list, tuple)):
+                        pid_list = list(pid)
+                    elif isinstance(pid, (int, np.integer)):
+                        # Single case ID for whole batch (shouldn't happen but handle it)
+                        pid_list = [pid] * batch_size_actual
+                    else:
+                        pid_list = [pid] * batch_size_actual
                 else:
-                    pid_list = [pid] * seg1.shape[0] if not isinstance(pid, str) else [pid]
+                    # BUT PPG handling (existing code)
+                    if torch.is_tensor(pid):
+                        pid_list = pid.tolist() if pid.dim() > 0 else [pid.item()]
+                    elif isinstance(pid, (list, tuple)):
+                        pid_list = list(pid)
+                    else:
+                        pid_list = [str(pid)] * batch_size_actual
 
                 # Duplicate PIDs for both seg1 and seg2
                 all_participant_ids.extend(pid_list)  # For seg1
@@ -443,23 +461,45 @@ class DownstreamEvaluator:
             if labels:
                 batch_labels = []
                 batch_size_actual = seg1.shape[0]
-
-                for i in range(batch_size_actual):
-                    sample_labels = {}
-                    if isinstance(labels, dict):
-                        for k, v in labels.items():
-                            if torch.is_tensor(v):
-                                if v.dim() == 0:
-                                    sample_labels[k] = v.item()
-                                elif v.shape[0] == batch_size_actual:
-                                    sample_labels[k] = v[i].item()
+                if self.current_dataset_type == 'vitaldb':
+                    # VitalDB returns demographics directly
+                    for i in range(batch_size_actual):
+                        if isinstance(labels, dict):
+                            # Check if it's a batched dict or single dict
+                            sample_labels = {}
+                            for k, v in labels.items():
+                                if torch.is_tensor(v):
+                                    if v.shape[0] == batch_size_actual:
+                                        sample_labels[k] = v[i].item()
+                                    else:
+                                        sample_labels[k] = v.item()
+                                elif isinstance(v, (list, tuple)) and len(v) == batch_size_actual:
+                                    sample_labels[k] = v[i]
                                 else:
-                                    sample_labels[k] = v.item() if v.numel() == 1 else -1
-                            elif isinstance(v, (list, tuple)) and len(v) == batch_size_actual:
-                                sample_labels[k] = v[i]
-                            else:
-                                sample_labels[k] = v if isinstance(v, (int, float)) else -1
-                    batch_labels.append(sample_labels)
+                                    sample_labels[k] = v
+                            batch_labels.append(sample_labels)
+                        else:
+                            batch_labels.append({})
+                else:
+                    batch_labels = []
+                    batch_size_actual = seg1.shape[0]
+
+                    for i in range(batch_size_actual):
+                        sample_labels = {}
+                        if isinstance(labels, dict):
+                            for k, v in labels.items():
+                                if torch.is_tensor(v):
+                                    if v.dim() == 0:
+                                        sample_labels[k] = v.item()
+                                    elif v.shape[0] == batch_size_actual:
+                                        sample_labels[k] = v[i].item()
+                                    else:
+                                        sample_labels[k] = v.item() if v.numel() == 1 else -1
+                                elif isinstance(v, (list, tuple)) and len(v) == batch_size_actual:
+                                    sample_labels[k] = v[i]
+                                else:
+                                    sample_labels[k] = v if isinstance(v, (int, float)) else -1
+                        batch_labels.append(sample_labels)
 
                 # Duplicate labels for both segments
                 all_labels.extend(batch_labels)  # For seg1
@@ -772,7 +812,9 @@ class DownstreamEvaluator:
             participant_ids: List
     ) -> Tuple[np.ndarray, List[Dict], np.ndarray]:
         """Aggregate embeddings by participant."""
+        participant_ids = [str(pid) for pid in participant_ids]
         unique_pids = np.unique(participant_ids)
+
 
         aggregated_embeddings = np.zeros((len(unique_pids), embeddings.shape[1]),
                                          dtype=np.float32)
@@ -1245,7 +1287,7 @@ class DownstreamEvaluator:
 
     def evaluate_all_tasks(
             self,
-            dataset: BUTPPGDataset,
+            dataset: BaseSignalDataset,
             save_path: Optional[str] = None,
     ) -> pd.DataFrame:
         """
@@ -1257,7 +1299,12 @@ class DownstreamEvaluator:
         print("=" * 50)
 
         # Determine which evaluation methods to use
-        n_participants = len(dataset.participant_records)
+        if hasattr(dataset, 'cases'):  # VitalDB
+            n_participants = len(dataset.cases)
+        elif hasattr(dataset, 'participant_records'):  # BUT PPG
+            n_participants = len(dataset.participant_records)
+        else:
+            n_participants = len(dataset)
         
         # Get evaluation modes from config
         eval_config = self.config.get_evaluation_config()
@@ -1496,117 +1543,141 @@ def test_evaluation():
 
 
 def test_label_extraction():
-    """Test to identify the label extraction issue in the evaluation pipeline."""
+    """Test to identify the label extraction issue in the evaluation pipeline for both datasets."""
     print("=" * 60)
     print("Testing Label Extraction Pipeline")
     print("=" * 60)
 
-    from data import BUTPPGDataset
     from torch.utils.data import DataLoader
-    
     config = get_config()
 
-    # Create a test dataset
-    print("\n1. Creating test dataset...")
-    dataset = BUTPPGDataset(
-        data_dir=config.data_dir,
-        modality='ppg',
-        split='test',
-        return_labels=True,
-        return_participant_id=True,
-        use_cache=False,
-        downsample=True
-    )
+    # Test both dataset types
+    for dataset_type in ['but_ppg', 'vitaldb']:
+        print(f"\n{'=' * 60}")
+        print(f"TESTING {dataset_type.upper()}")
+        print(f"{'=' * 60}")
 
-    print(f"   Dataset created with {len(dataset)} samples")
-    print(f"   return_labels: {dataset.return_labels}")
-    print(f"   return_participant_id: {dataset.return_participant_id}")
-
-    # Test single item
-    print("\n2. Testing single item from dataset...")
-    if len(dataset) > 0:
-        item = dataset[0]
-        print(f"   Item has {len(item)} elements")
-
-        if len(item) == 4:
-            seg1, seg2, pid, labels = item
-            print(f"   - Seg1 shape: {seg1.shape}")
-            print(f"   - Seg2 shape: {seg2.shape}")
-            print(f"   - PID: {pid}")
-            print(f"   - Labels type: {type(labels)}")
-            print(f"   - Labels content: {labels}")
-
-            # Check label values
-            if isinstance(labels, dict):
-                for k, v in labels.items():
-                    valid = v != -1 if isinstance(v, (int, float)) else False
-                    print(f"     {k}: {v} (valid: {valid})")
+        # Create appropriate dataset
+        if dataset_type == 'vitaldb':
+            from data import VitalDBDataset
+            dataset = VitalDBDataset(
+                modality='ppg',
+                split='test',
+                return_labels=True,
+                return_participant_id=True,
+                use_cache=True
+            )
         else:
-            print(f"   ERROR: Expected 4 items, got {len(item)}")
+            from data import BUTPPGDataset
+            dataset = BUTPPGDataset(
+                data_dir=config.data_dir,
+                modality='ppg',
+                split='test',
+                return_labels=True,
+                return_participant_id=True,
+                use_cache=False,
+                downsample=True
+            )
 
-    # Test DataLoader behavior
-    print("\n3. Testing DataLoader behavior...")
-    
-    batch_size = config.get('evaluation.batch_size', 4)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        print(f"\n1. Creating {dataset_type} test dataset...")
+        print(f"   Dataset created with {len(dataset)} samples")
+        print(f"   return_labels: {dataset.return_labels}")
+        print(f"   return_participant_id: {dataset.return_participant_id}")
 
-    for i, batch in enumerate(loader):
-        if i == 0:  # First batch only
-            print(f"   Batch has {len(batch)} elements")
+        # Test single item
+        print(f"\n2. Testing single item from {dataset_type} dataset...")
+        if len(dataset) > 0:
+            item = dataset[0]
+            print(f"   Item has {len(item)} elements")
 
-            if len(batch) == 4:
-                seg1, seg2, pid, labels = batch
+            if len(item) == 4:
+                seg1, seg2, pid, labels = item
                 print(f"   - Seg1 shape: {seg1.shape}")
                 print(f"   - Seg2 shape: {seg2.shape}")
-                print(f"   - PID type: {type(pid)}")
-                if torch.is_tensor(pid):
-                    print(f"     PID tensor shape: {pid.shape}")
-                    print(f"     PID values: {pid.tolist()}")
+                print(f"   - PID: {pid} (type: {type(pid).__name__})")
                 print(f"   - Labels type: {type(labels)}")
+                print(f"   - Labels content: {labels}")
 
+                # Check label values
                 if isinstance(labels, dict):
-                    print(f"   - Label keys: {list(labels.keys())}")
                     for k, v in labels.items():
-                        if torch.is_tensor(v):
-                            print(f"     {k}: Tensor shape {v.shape}, dtype {v.dtype}")
-                            print(f"        Values: {v.tolist()}")
-                        else:
-                            print(f"     {k}: {type(v).__name__} = {v}")
+                        valid = v != -1 if isinstance(v, (int, float)) else False
+                        print(f"     {k}: {v} (valid: {valid})")
+            else:
+                print(f"   ERROR: Expected 4 items, got {len(item)}")
 
-                    # Test extraction logic
-                    print("\n   Testing label extraction logic:")
-                    batch_size = seg1.shape[0]
-                    for sample_idx in range(batch_size):
-                        sample_labels = {}
-                        for k, v in labels.items():
-                            if torch.is_tensor(v):
-                                if v.dim() == 0:
-                                    sample_labels[k] = v.item()
-                                elif v.shape[0] == batch_size:
-                                    sample_labels[k] = v[sample_idx].item()
+        # Test DataLoader behavior
+        print(f"\n3. Testing DataLoader behavior for {dataset_type}...")
+
+        batch_size = 4  # Small batch for testing
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        for i, batch in enumerate(loader):
+            if i == 0:  # First batch only
+                print(f"   Batch has {len(batch)} elements")
+
+                if len(batch) == 4:
+                    seg1, seg2, pid, labels = batch
+                    print(f"   - Seg1 shape: {seg1.shape}")
+                    print(f"   - Seg2 shape: {seg2.shape}")
+                    print(f"   - PID type: {type(pid)}")
+
+                    # Handle different PID types
+                    if torch.is_tensor(pid):
+                        print(f"     PID tensor shape: {pid.shape}")
+                        print(f"     PID values: {pid.tolist()[:min(3, len(pid))]}")
+                    elif isinstance(pid, (list, tuple)):
+                        print(f"     PID list: {pid[:min(3, len(pid))]}")
+
+                    print(f"   - Labels type: {type(labels)}")
+
+                    if isinstance(labels, dict):
+                        print(f"   - Label keys: {list(labels.keys())}")
+
+                        # Test extraction logic
+                        print(f"\n   Testing label extraction logic for {dataset_type}:")
+                        batch_size_actual = seg1.shape[0]
+
+                        for sample_idx in range(min(3, batch_size_actual)):
+                            sample_labels = {}
+                            for k, v in labels.items():
+                                if torch.is_tensor(v):
+                                    if v.dim() == 0:
+                                        sample_labels[k] = v.item()
+                                    elif v.shape[0] == batch_size_actual:
+                                        sample_labels[k] = v[sample_idx].item()
+                                    else:
+                                        sample_labels[k] = -1
                                 else:
-                                    sample_labels[k] = -1
-                            else:
-                                sample_labels[k] = v
-                        print(f"     Sample {sample_idx}: {sample_labels}")
-            break
+                                    sample_labels[k] = v
+                            print(f"     Sample {sample_idx}: {sample_labels}")
+                break
 
-    # Test participant info retrieval
-    print("\n4. Testing participant info retrieval...")
-    if len(dataset.participant_records) > 0:
-        for i, (pid, records) in enumerate(list(dataset.participant_records.items())[:3]):
-            info = dataset._get_participant_info(pid)
-            print(f"   Participant {pid} ({len(records)} records):")
-            print(f"     Info: {info}")
+        # Test participant/case info retrieval
+        print(f"\n4. Testing participant/case info retrieval for {dataset_type}...")
 
-            # Check validity
-            valid_fields = {k: v != -1 for k, v in info.items() if isinstance(v, (int, float))}
-            print(f"     Valid fields: {valid_fields}")
+        if dataset_type == 'vitaldb':
+            # VitalDB specific
+            if hasattr(dataset, 'cases') and len(dataset.cases) > 0:
+                for case_id in dataset.cases[:3]:
+                    info = dataset._get_participant_info(case_id)
+                    print(f"   Case {case_id}:")
+                    print(f"     Info: {info}")
+                    valid_fields = {k: v != -1 for k, v in info.items() if isinstance(v, (int, float))}
+                    print(f"     Valid fields: {valid_fields}")
+        else:
+            # BUT PPG specific
+            if hasattr(dataset, 'participant_records') and len(dataset.participant_records) > 0:
+                for i, (pid, records) in enumerate(list(dataset.participant_records.items())[:3]):
+                    info = dataset._get_participant_info(pid)
+                    print(f"   Participant {pid} ({len(records)} records):")
+                    print(f"     Info: {info}")
+                    valid_fields = {k: v != -1 for k, v in info.items() if isinstance(v, (int, float))}
+                    print(f"     Valid fields: {valid_fields}")
 
     print("\n" + "=" * 60)
-    print("Test complete! Check output for issues.")
+    print("All dataset tests complete!")
     print("=" * 60)
-
 
 if __name__ == "__main__":
     print("Running evaluation tests...")
