@@ -381,6 +381,275 @@ def run_full(args, device_manager):
     device_manager.empty_cache()
 
 
+# Updates for main.py to support new evaluation and fine-tuning flows
+
+def run_evaluate_extended(args, device_manager):
+    """
+    Extended evaluation supporting both BUT PPG and VitalDB.
+    Can evaluate on one or both datasets.
+    """
+    logger.info(f"Evaluating {args.modality.upper()} model on {args.dataset_type}")
+
+    # Find checkpoint
+    checkpoint_dir = Path(args.checkpoint_dir)
+    encoder_path = checkpoint_dir / "encoder.pt"
+    if not encoder_path.exists():
+        encoder_path = checkpoint_dir / "best_model.pt"
+
+    if not encoder_path.exists():
+        logger.error(f"No model found in {checkpoint_dir}")
+        sys.exit(1)
+
+    # Create evaluator
+    evaluator = DownstreamEvaluator(
+        encoder_path=str(encoder_path),
+        config_path=args.config,
+        device_manager=device_manager
+    )
+
+    all_results = []
+
+    # Evaluate on specified datasets
+    if args.dataset_type == 'both':
+        # Evaluate on both VitalDB and BUT PPG
+        datasets_to_eval = ['vitaldb', 'but_ppg']
+    else:
+        datasets_to_eval = [args.dataset_type]
+
+    for dataset_type in datasets_to_eval:
+        print(f"\n{'=' * 60}")
+        print(f"EVALUATING ON {dataset_type.upper()}")
+        print(f"{'=' * 60}")
+
+        # Run evaluation
+        results_path = checkpoint_dir / f"downstream_results_{args.modality}_{dataset_type}.csv"
+
+        results_df = evaluator.evaluate_all_tasks_extended(
+            dataset_type=dataset_type,
+            modality=args.modality,
+            split='test',
+            data_dir=args.data_dir if dataset_type == 'but_ppg' else None,
+            save_path=str(results_path),
+            downsample=args.downsample
+        )
+
+        # Print results
+        print(f"\n{dataset_type.upper()} RESULTS - {args.modality.upper()}")
+        print("=" * 60)
+        print(results_df.to_string())
+
+        all_results.append(results_df)
+
+        # Clean GPU memory between evaluations
+        device_manager.empty_cache()
+
+    # If evaluating both, save combined results
+    if len(all_results) > 1:
+        combined_df = pd.concat(all_results, ignore_index=True)
+        combined_path = checkpoint_dir / f"downstream_results_{args.modality}_combined.csv"
+        combined_df.to_csv(combined_path, index=False)
+
+        print("\n" + "=" * 60)
+        print("COMBINED RESULTS COMPARISON")
+        print("=" * 60)
+
+        # Print side-by-side comparison
+        for task in combined_df['task'].unique():
+            print(f"\n{task}:")
+            task_df = combined_df[combined_df['task'] == task]
+            for _, row in task_df.iterrows():
+                dataset = row['dataset']
+                if 'auc' in row:
+                    print(f"  {dataset:10s}: AUC={row.get('auc', 0):.3f}, Acc={row.get('accuracy', 0):.3f}")
+                elif 'mae' in row:
+                    print(f"  {dataset:10s}: MAE={row.get('mae', 0):.3f}, R2={row.get('r2', 0):.3f}")
+
+        logger.info(f"Combined results saved to: {combined_path}")
+        return combined_path
+    else:
+        return results_path
+
+
+def run_compare_extended(args, device_manager):
+    """
+    Extended comparison supporting VitalDB results.
+    Can compare VitalDB results with paper benchmarks.
+    """
+    logger.info(f"Comparing {args.dataset_type} results with paper benchmarks")
+
+    results_path = Path(args.results_path)
+
+    comparator = ResultsComparator(config_path=args.config)
+
+    # Determine dataset type from filename if not specified
+    if args.dataset_type == 'auto':
+        if 'vitaldb' in str(results_path).lower():
+            dataset_type = 'vitaldb'
+        elif 'combined' in str(results_path).lower():
+            dataset_type = 'combined'
+        else:
+            dataset_type = 'but_ppg'
+    else:
+        dataset_type = args.dataset_type
+
+    # Load results
+    comparator.load_results(str(results_path), modality=args.modality)
+
+    # Generate comparison report
+    comparison_dir = results_path.parent / f'comparisons_{dataset_type}'
+    report = comparator.generate_report(save_dir=str(comparison_dir))
+
+    # Print summary with dataset type
+    print(f"\n{'=' * 60}")
+    print(f"COMPARISON: {dataset_type.upper()} vs PAPER BENCHMARKS")
+    print(f"{'=' * 60}")
+    comparator.print_summary()
+
+    # Create comparison plot
+    plot_path = comparison_dir / f'comparison_{args.modality}_{dataset_type}.png'
+    comparator.plot_comparison(save_path=str(plot_path))
+
+    logger.info(f"Comparison saved to: {comparison_dir}")
+    device_manager.empty_cache()
+    return report
+
+
+def run_finetune_extended(args, device_manager):
+    """
+    Extended fine-tuning supporting both datasets.
+    Can fine-tune on VitalDB, BUT PPG, or both sequentially.
+    """
+    if not args.pretrained_path:
+        raise ValueError("--pretrained-path required for fine-tuning")
+
+    dataset_types = []
+    if args.finetune_dataset == 'both':
+        # Fine-tune on VitalDB first, then BUT PPG
+        dataset_types = ['vitaldb', 'but_ppg']
+    else:
+        dataset_types = [args.finetune_dataset]
+
+    current_model_path = args.pretrained_path
+
+    for dataset_type in dataset_types:
+        logger.info(f"Starting fine-tuning on {dataset_type.upper()} for {args.modality.upper()}")
+
+        config = get_config()
+
+        # Get dataset-specific config
+        if dataset_type == 'vitaldb':
+            finetune_config = config.config.get('finetune_vitaldb',
+                                                config.config.get('finetune', {}))
+        else:
+            finetune_config = config.config.get('finetune', {})
+
+        # Create experiment name
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        experiment_name = f"finetune_{dataset_type}_{args.modality}_{timestamp}"
+
+        # Initialize trainer
+        trainer = Trainer(
+            config_path=args.config,
+            experiment_name=experiment_name,
+            device_manager=device_manager,
+            ssl_method=args.ssl_method,
+            phase='finetune'
+        )
+
+        # Set dataset type for trainer
+        trainer.dataset_type = dataset_type
+        trainer.pretrained_path = current_model_path
+
+        print(f"\n🚀 Fine-tuning Configuration:")
+        print(f"  Dataset: {dataset_type.upper()}")
+        print(f"  Device: {device_manager.type}")
+        print(f"  Batch size: {args.batch_size or finetune_config.get('batch_size', 64)}")
+        print(f"  Learning rate: {args.lr or finetune_config.get('learning_rate', 0.00001)}")
+        print(f"  Epochs: {args.epochs or finetune_config.get('epochs', 20)}")
+        print(f"  Pretrained model: {current_model_path}")
+
+        # Train
+        checkpoint_dir = trainer.train(
+            modality=args.modality,
+            num_epochs=args.epochs or finetune_config.get('epochs', 20),
+            early_stopping_patience=args.patience or finetune_config.get('early_stopping_patience', 10)
+        )
+
+        # Update model path for next iteration (if fine-tuning on both)
+        if args.finetune_dataset == 'both':
+            current_model_path = str(checkpoint_dir / "encoder.pt")
+            logger.info(f"Using {dataset_type} fine-tuned model for next stage: {current_model_path}")
+
+    logger.info(f"Fine-tuning completed! Final model saved to: {checkpoint_dir}")
+    return checkpoint_dir
+
+
+def run_full_extended(args, device_manager):
+    """
+    Extended full pipeline with flexible dataset support.
+    Can run: pretrain(VitalDB) -> finetune(VitalDB/BUT/both) -> evaluate(VitalDB/BUT/both) -> compare
+    """
+    logger.info("Running extended full pipeline")
+
+    results_to_compare = []
+
+    # Step 1: Pre-train (or skip if pretrained path provided)
+    if args.pretrained_path:
+        logger.info("Using provided pretrained model, skipping pre-training")
+        pretrain_dir = Path(args.pretrained_path).parent
+    else:
+        logger.info("\n" + "=" * 60)
+        logger.info("PHASE 1: PRE-TRAINING ON VITALDB")
+        logger.info("=" * 60)
+        pretrain_dir = run_pretrain(args, device_manager)
+        args.pretrained_path = str(pretrain_dir / "encoder.pt")
+
+    # Step 2: Fine-tune on specified dataset(s)
+    logger.info("\n" + "=" * 60)
+    logger.info(f"PHASE 2: FINE-TUNING ON {args.finetune_dataset.upper()}")
+    logger.info("=" * 60)
+    finetune_dir = run_finetune_extended(args, device_manager)
+
+    # Step 3: Evaluate on specified dataset(s)
+    logger.info("\n" + "=" * 60)
+    logger.info(f"PHASE 3: EVALUATION ON {args.eval_dataset.upper()}")
+    logger.info("=" * 60)
+
+    args.checkpoint_dir = str(finetune_dir)
+    args.dataset_type = args.eval_dataset
+    results_path = run_evaluate_extended(args, device_manager)
+
+    # Step 4: Compare with paper benchmarks
+    logger.info("\n" + "=" * 60)
+    logger.info("PHASE 4: COMPARISON WITH BENCHMARKS")
+    logger.info("=" * 60)
+
+    # Compare each dataset's results
+    if args.eval_dataset == 'both':
+        # Compare both VitalDB and BUT PPG results
+        for dataset_type in ['vitaldb', 'but_ppg']:
+            specific_results = finetune_dir / f"downstream_results_{args.modality}_{dataset_type}.csv"
+            if specific_results.exists():
+                args.results_path = str(specific_results)
+                args.dataset_type = dataset_type
+                run_compare_extended(args, device_manager)
+
+        # Also compare combined results
+        args.results_path = str(results_path)  # This should be the combined results
+        args.dataset_type = 'combined'
+        run_compare_extended(args, device_manager)
+    else:
+        args.results_path = str(results_path)
+        args.dataset_type = args.eval_dataset
+        run_compare_extended(args, device_manager)
+
+    logger.info("\n" + "=" * 60)
+    logger.info("EXTENDED PIPELINE COMPLETED SUCCESSFULLY!")
+    logger.info("=" * 60)
+
+    device_manager.empty_cache()
+
+
 def run_test(args):
     """Run tests for specified modules."""
     if args.module in ['all', 'data']:
@@ -487,6 +756,21 @@ def main():
     parser.add_argument('--skip-training', action='store_true',
                         help='Skip training phase in full pipeline')
 
+    parser.add_argument('--dataset-type', type=str,
+                        choices=['but_ppg', 'vitaldb', 'both', 'auto'],
+                        default='but_ppg',
+                        help='Dataset to use for evaluation')
+
+    parser.add_argument('--finetune-dataset', type=str,
+                        choices=['but_ppg', 'vitaldb', 'both'],
+                        default='but_ppg',
+                        help='Dataset to use for fine-tuning')
+
+    parser.add_argument('--eval-dataset', type=str,
+                        choices=['but_ppg', 'vitaldb', 'both'],
+                        default='but_ppg',
+                        help='Dataset to use for evaluation')
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -511,11 +795,11 @@ def main():
     # Route to appropriate function based on command
     command_map = {
         'pretrain': run_pretrain,
-        'finetune': run_finetune,
-        'evaluate': run_evaluate,
-        'compare': run_compare,
+        'finetune': run_finetune_extended,  # Use extended version
+        'evaluate': run_evaluate_extended,  # Use extended version
+        'compare': run_compare_extended,  # Use extended version
         'train': run_train,
-        'full': run_full,
+        'full': run_full_extended,  # Use extended version
         'test': lambda args, dm: run_test(args)
     }
 

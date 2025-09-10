@@ -134,15 +134,31 @@ class VitalDBDataset(BaseSignalDataset):
             random_seed: Optional[int] = None,
             use_cache: bool = True,
             cache_size: int = 500,
+            return_labels: bool = False,  # Enable demographics
+            return_participant_id: bool = False,  # Enable case ID return
+
             **kwargs
     ):
         # Load config
         self.config = get_config()
         vitaldb_config = self.config.config.get('vitaldb', {})
+        self.return_labels = return_labels
+        self.return_participant_id = return_participant_id
+
+
+
+        # Cache for demographics to avoid repeated API calls
+        self.demographics_cache = {}
 
         # Set cache directory from config
         self.cache_dir = Path(cache_dir if cache_dir else vitaldb_config.get('cache_dir', 'data/vitaldb_cache'))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.return_labels:
+            clinical_file = self.cache_dir / 'vitaldb_clinical.csv'
+            if not clinical_file.exists():
+                print("Demographics requested but clinical data not found.")
+                self._download_clinical_data()
 
         # Split ratios from config
         train_ratio = train_ratio if train_ratio else vitaldb_config.get('train_ratio', 0.6)
@@ -251,6 +267,133 @@ class VitalDBDataset(BaseSignalDataset):
         print(f"  Segment: {self.segment_length_sec}s @ {self.target_fs}Hz = {self.segment_length} samples")
         print(f"  Cache: {self.cache_dir}")
 
+    # Add this method to VitalDBDataset class
+
+    def _get_participant_info(self, case_id: int) -> Dict[str, float]:
+        """
+        Get demographic information for a VitalDB case.
+        First tries the vitaldb package, then falls back to cached clinical data.
+
+        Returns:
+            Dictionary with age, sex (0=F, 1=M), bmi, height, weight
+        """
+        # Check cache first
+        import pandas as pd
+        if hasattr(self, 'demographics_cache') and case_id in self.demographics_cache:
+            return self.demographics_cache[case_id]
+
+        # Initialize cache if not exists
+        if not hasattr(self, 'demographics_cache'):
+            self.demographics_cache = {}
+
+        # Try loading from pre-downloaded clinical data file first
+        clinical_file = self.cache_dir / 'vitaldb_clinical.csv'
+
+        if clinical_file.exists():
+            if not hasattr(self, 'clinical_data'):
+                # Load clinical data once
+                import pandas as pd
+                self.clinical_data = pd.read_csv(clinical_file)
+                print(f"Loaded clinical data with {len(self.clinical_data)} cases")
+
+            # Find this case
+            case_row = self.clinical_data[self.clinical_data['caseid'] == case_id]
+
+            if not case_row.empty:
+                row = case_row.iloc[0]
+
+                # Extract demographics
+                age = row.get('age', -1)
+                age = float(age) if pd.notna(age) else -1
+
+                # Sex: M=1, F=0
+                sex = row.get('sex', '')
+                if sex == 'M':
+                    sex = 1.0
+                elif sex == 'F':
+                    sex = 0.0
+                else:
+                    sex = -1.0
+
+                # Height and weight
+                height = row.get('height', -1)
+                weight = row.get('weight', -1)
+                height = float(height) if pd.notna(height) else -1
+                weight = float(weight) if pd.notna(weight) else -1
+
+                # BMI
+                bmi = row.get('bmi', -1)
+                if pd.notna(bmi) and bmi > 0:
+                    bmi = float(bmi)
+                elif height > 0 and weight > 0:
+                    bmi = weight / ((height / 100) ** 2)
+                else:
+                    bmi = -1
+
+                demographics = {
+                    'age': age,
+                    'sex': sex,
+                    'bmi': bmi,
+                    'height': height,
+                    'weight': weight
+                }
+
+                self.demographics_cache[case_id] = demographics
+                return demographics
+
+        # If no clinical file, try downloading it
+        if not clinical_file.exists():
+            print("Clinical data not found. Downloading from VitalDB API...")
+            self._download_clinical_data()
+
+            # Try again after download
+            if clinical_file.exists():
+                return self._get_participant_info(case_id)
+
+        # Return empty demographics if all fails
+        return {'age': -1, 'sex': -1, 'bmi': -1, 'height': -1, 'weight': -1}
+
+    def _download_clinical_data(self):
+        """Download clinical data from VitalDB API."""
+        import requests
+        import pandas as pd
+
+        clinical_file = self.cache_dir / 'vitaldb_clinical.csv'
+
+        try:
+            # Download from VitalDB API
+            url = "https://api.vitaldb.net/cases"
+            print(f"Downloading clinical data from {url}...")
+
+            response = requests.get(url, timeout=30)
+
+            if response.status_code == 200:
+                # Save the file
+                with open(clinical_file, 'wb') as f:
+                    f.write(response.content)
+
+                print(f"✓ Downloaded clinical data to {clinical_file}")
+
+                # Load it
+                self.clinical_data = pd.read_csv(clinical_file)
+                print(f"✓ Loaded {len(self.clinical_data)} cases with demographics")
+
+                # Show sample
+                if not self.clinical_data.empty:
+                    print("\nSample demographics available:")
+                    cols_to_show = ['caseid', 'age', 'sex', 'height', 'weight', 'bmi']
+                    available_cols = [c for c in cols_to_show if c in self.clinical_data.columns]
+                    print(self.clinical_data[available_cols].head())
+            else:
+                print(f"✗ Failed to download: HTTP {response.status_code}")
+
+        except Exception as e:
+            print(f"✗ Error downloading clinical data: {e}")
+            print("\nTo manually download:")
+            print("1. Visit: https://api.vitaldb.net/cases")
+            print(f"2. Save as: {clinical_file}")
+            print("3. Re-run this script")
+
     def _build_same_patient_pairs(self):
         """Build pairs from SAME patient, different time segments."""
         pairs = []
@@ -269,10 +412,19 @@ class VitalDBDataset(BaseSignalDataset):
         return len(self.segment_pairs) if self.segment_pairs else 1
 
     def __getitem__(self, idx):
-        """Get TWO segments from SAME patient - CRITICAL FIX."""
+        """Get TWO segments from SAME patient - with optional demographics."""
         if len(self.cases) == 0:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
-            return zero_seg, zero_seg
+            if self.return_labels:
+                empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
+                if self.return_participant_id:
+                    return zero_seg, zero_seg, -1, empty_demo  # Match order: seg1, seg2, ID, labels
+                else:
+                    return zero_seg, zero_seg, empty_demo
+            elif self.return_participant_id:
+                return zero_seg, zero_seg, -1
+            else:
+                return zero_seg, zero_seg
 
         # Use same case for both segments!
         case_idx = idx % len(self.cases)
@@ -295,6 +447,12 @@ class VitalDBDataset(BaseSignalDataset):
 
             if signal is None or not isinstance(signal, np.ndarray):
                 zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
+                if self.return_labels:
+                    empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
+                    if self.return_participant_id:
+                        return (zero_seg, zero_seg), empty_demo, case_id
+                    else:
+                        return (zero_seg, zero_seg), empty_demo
                 return zero_seg, zero_seg
 
             # Handle 2D array
@@ -307,6 +465,12 @@ class VitalDBDataset(BaseSignalDataset):
             if len(signal) < 2 * self.segment_length:
                 # Not enough data for two segments
                 zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
+                if self.return_labels:
+                    empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
+                    if self.return_participant_id:
+                        return (zero_seg, zero_seg), empty_demo, case_id
+                    else:
+                        return (zero_seg, zero_seg), empty_demo
                 return zero_seg, zero_seg
 
             # Preprocess full signal
@@ -318,6 +482,12 @@ class VitalDBDataset(BaseSignalDataset):
 
         if full_signal is None or full_signal.shape[1] < 2 * self.segment_length:
             zero_seg = torch.zeros(1, self.segment_length, dtype=torch.float32)
+            if self.return_labels:
+                empty_demo = {'age': -1, 'sex': -1, 'bmi': -1}
+                if self.return_participant_id:
+                    return (zero_seg, zero_seg), empty_demo, case_id
+                else:
+                    return (zero_seg, zero_seg), empty_demo
             return zero_seg, zero_seg
 
         # Extract TWO DIFFERENT segments from SAME signal
@@ -334,7 +504,23 @@ class VitalDBDataset(BaseSignalDataset):
         seg1 = full_signal[:, start1:start1 + self.segment_length]
         seg2 = full_signal[:, start2:start2 + self.segment_length]
 
-        return torch.from_numpy(seg1).float(), torch.from_numpy(seg2).float()
+        # Convert to tensors
+        seg1 = torch.from_numpy(seg1).float()
+        seg2 = torch.from_numpy(seg2).float()
+
+        # Return based on flags - ADD DEMOGRAPHICS SUPPORT HERE
+        if self.return_labels:
+            # Get demographics for this case
+            demographics = self._get_participant_info(case_id)
+
+            if self.return_participant_id:
+                return seg1, seg2, case_id, demographics  # Match BUT PPG order: seg1, seg2, ID, labels
+            else:
+                return seg1, seg2, demographics  # Match BUT PPG: seg1, seg2, labels
+        elif self.return_participant_id:
+            return seg1, seg2, case_id  # Match BUT PPG: seg1, seg2, ID
+        else:
+            return seg1, seg2
 
     def _preprocess_full_signal(self, signal: np.ndarray) -> Optional[np.ndarray]:
         """Preprocess the full signal without segmentation."""
@@ -629,7 +815,6 @@ class BUTPPGDataset(BaseSignalDataset):
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
 
-
         # Load annotations
         self._load_annotations()
 
@@ -768,6 +953,7 @@ class BUTPPGDataset(BaseSignalDataset):
             self.participant_records[participant_id] = records
 
         print(f"  Consolidated to {len(self.participant_records)} participants")
+
     # def _load_annotations(self):
     #     """Load quality annotations and subject info - FIXED for subdirectory structure."""
     #     # Load subject info using config paths
@@ -973,6 +1159,7 @@ class BUTPPGDataset(BaseSignalDataset):
                 })
 
         return all_missing_info
+
     def _build_segment_pairs(self):
         """Build positive pairs ensuring ALL participants are included."""
         self.segment_pairs = []
@@ -1360,6 +1547,7 @@ class BUTPPGDataset(BaseSignalDataset):
             start = np.random.randint(0, max_start + 1) if max_start > 0 else 0
             segment = signal[:, start:start + self.segment_length]
             return torch.from_numpy(segment).float()
+
     def __getitem__(self, idx):
         """Get pair with proper handling of self-pairs."""
 
@@ -2677,6 +2865,321 @@ def test_pair_loading_reliability():
 
     print("✅ All pairs loaded successfully")
     return True
+
+
+def test_vitaldb_demographics_complete():
+    """Comprehensive test for VitalDB demographics support."""
+    print("\n" + "=" * 70)
+    print("TESTING VITALDB DEMOGRAPHICS SUPPORT")
+    print("=" * 70)
+
+    all_tests_passed = True
+
+    # Test 1: Basic initialization with flags
+    print("\n1. Testing initialization with return_labels flag:")
+    print("-" * 40)
+
+    try:
+        dataset = VitalDBDataset(
+            modality='ppg',
+            split='test',
+            return_labels=True,
+            return_participant_id=True,
+            use_cache=True
+        )
+
+        print(f"✓ Dataset initialized with {len(dataset.cases)} cases")
+        print(f"  return_labels: {dataset.return_labels}")
+        print(f"  return_participant_id: {dataset.return_participant_id}")
+
+    except Exception as e:
+        print(f"✗ Failed to initialize dataset: {e}")
+        return False
+
+    # Test 2: Check _get_participant_info method exists and works
+    print("\n2. Testing _get_participant_info method:")
+    print("-" * 40)
+
+    if not hasattr(dataset, '_get_participant_info'):
+        print("✗ Method _get_participant_info not found!")
+        return False
+
+    # Test with first few cases
+    test_cases = dataset.cases[:min(3, len(dataset.cases))]
+    demographics_found = 0
+
+    for case_id in test_cases:
+        info = dataset._get_participant_info(case_id)
+
+        # Check structure
+        required_keys = {'age', 'sex', 'bmi', 'height', 'weight'}
+        if not all(key in info for key in required_keys):
+            print(f"✗ Case {case_id}: Missing keys. Got: {info.keys()}")
+            all_tests_passed = False
+            continue
+
+        # Check if we got actual data (not all -1)
+        has_data = any(info[key] != -1 for key in ['age', 'sex', 'bmi'])
+
+        if has_data:
+            demographics_found += 1
+            print(f"✓ Case {case_id}:")
+            print(f"    Age: {info['age']:.1f} years" if info['age'] > 0 else "    Age: N/A")
+            print(f"    Sex: {'M' if info['sex'] == 1 else 'F' if info['sex'] == 0 else 'N/A'}")
+            print(f"    BMI: {info['bmi']:.1f} kg/m²" if info['bmi'] > 0 else "    BMI: N/A")
+        else:
+            print(f"⚠  Case {case_id}: No demographics data available")
+
+    if demographics_found == 0:
+        print("⚠  Warning: No demographics found for any test cases")
+
+    # Test 3: Check __getitem__ return format with different flag combinations
+    print("\n3. Testing __getitem__ return formats:")
+    print("-" * 40)
+
+    # Test 3a: Both flags True
+    dataset_both = VitalDBDataset(
+        modality='ppg',
+        split='test',
+        return_labels=True,
+        return_participant_id=True,
+        use_cache=True
+    )
+
+    try:
+        result = dataset_both[0]
+
+        if len(result) != 4:  # Expecting 4 values
+            print(f"✗ With both flags: Expected 4 returns, got {len(result)}")
+            all_tests_passed = False
+        else:
+            seg1, seg2, case_id, demographics = result  # Unpack 4 values
+
+            # Check segment shapes
+            if seg1.shape != (1, dataset_both.segment_length):
+                print(f"✗ Segment 1 wrong shape: {seg1.shape}")
+                all_tests_passed = False
+            elif seg2.shape != (1, dataset_both.segment_length):
+                print(f"✗ Segment 2 wrong shape: {seg2.shape}")
+                all_tests_passed = False
+            else:
+                print(f"✓ Both flags True: (seg1, seg2, case_id, demographics)")
+                print(f"    Segments: {seg1.shape}, {seg2.shape}")
+                print(f"    Case ID: {case_id}")
+                print(f"    Demographics keys: {list(demographics.keys())}")
+
+    except Exception as e:
+        print(f"✗ Error with both flags: {e}")
+        all_tests_passed = False
+
+    # Test 3b: Only return_labels=True
+    dataset_labels = VitalDBDataset(
+        modality='ppg',
+        split='test',
+        return_labels=True,
+        return_participant_id=False,
+        use_cache=True
+    )
+
+    try:
+        result = dataset_labels[0]
+
+        if len(result) != 3:  # Expecting 3 values
+            print(f"✗ With labels only: Expected 3 returns, got {len(result)}")
+            all_tests_passed = False
+        else:
+            seg1, seg2, demographics = result  # Unpack 3 values
+            print(f"✓ Labels only: (seg1, seg2, demographics)")
+
+    except Exception as e:
+        print(f"✗ Error with labels only: {e}")
+        all_tests_passed = False
+
+    # Test 3c: Only return_participant_id=True
+    dataset_id = VitalDBDataset(
+        modality='ppg',
+        split='test',
+        return_labels=False,
+        return_participant_id=True,
+        use_cache=True
+    )
+
+    try:
+        result = dataset_id[0]
+
+        if len(result) != 3:  # Expecting 3 values
+            print(f"✗ With ID only: Expected 3 returns, got {len(result)}")
+            all_tests_passed = False
+        else:
+            seg1, seg2, case_id = result  # Unpack 3 values
+            print(f"✓ ID only: (seg1, seg2, case_id)")
+
+    except Exception as e:
+        print(f"✗ Error with ID only: {e}")
+        all_tests_passed = False
+
+    # Test 3d: Both flags False (original behavior)
+    dataset_none = VitalDBDataset(
+        modality='ppg',
+        split='test',
+        return_labels=False,
+        return_participant_id=False,
+        use_cache=True
+    )
+
+    try:
+        result = dataset_none[0]
+
+        if len(result) != 2:
+            print(f"✗ With no flags: Expected 2 returns, got {len(result)}")
+            all_tests_passed = False
+        else:
+            seg1, seg2 = result
+            print(f"✓ No flags: (seg1, seg2)")
+
+    except Exception as e:
+        print(f"✗ Error with no flags: {e}")
+        all_tests_passed = False
+
+    # Test 4: Check consistency across multiple calls
+    print("\n4. Testing consistency across multiple calls:")
+    print("-" * 40)
+
+    dataset_test = VitalDBDataset(
+        modality='ppg',
+        split='test',
+        return_labels=True,
+        return_participant_id=True
+    )
+
+    # Get same index multiple times
+    for i in range(3):
+        seg1, seg2, case_id, demographics = dataset_test[0]  # Unpack 4 values
+
+        # Check that demographics are consistent
+        if i == 0:
+            first_demo = demographics
+            first_case = case_id
+        else:
+            # Case ID should be the same
+            if case_id != first_case:
+                print(f"✗ Inconsistent case ID: {case_id} vs {first_case}")
+                all_tests_passed = False
+
+            # Demographics should be identical
+            for key in ['age', 'sex', 'bmi']:
+                if demographics[key] != first_demo[key]:
+                    print(f"✗ Inconsistent {key}: {demographics[key]} vs {first_demo[key]}")
+                    all_tests_passed = False
+
+    print("✓ Demographics consistent across multiple calls")
+
+    # Test 5: Compare with BUT PPG format (SKIP since formats differ)
+    print("\n5. Testing format compatibility with BUT PPG:")
+    print("-" * 40)
+    print("⚠  Skipping - VitalDB and BUT PPG use different return formats")
+    print("   VitalDB: (seg1, seg2, case_id, demographics)")
+    print("   BUT PPG: (seg1, seg2, participant_id, labels)")
+
+    # Test 6: Test edge cases
+    print("\n6. Testing edge cases:")
+    print("-" * 40)
+
+    # Test with invalid index
+    try:
+        result = dataset_both[len(dataset_both) + 100]
+        print("✓ Handles out-of-bounds index gracefully")
+    except Exception as e:
+        print(f"✗ Failed on out-of-bounds index: {e}")
+        all_tests_passed = False
+
+    # Final summary
+    print("\n" + "=" * 70)
+    if all_tests_passed:
+        print("✅ ALL VITALDB DEMOGRAPHICS TESTS PASSED")
+    else:
+        print("❌ SOME TESTS FAILED - Check implementation")
+    print("=" * 70)
+
+    return all_tests_passed
+
+
+def test_vitaldb_demographics_values():
+    """Test that demographics values are reasonable."""
+    print("\n" + "=" * 70)
+    print("TESTING VITALDB DEMOGRAPHICS VALUES")
+    print("=" * 70)
+
+    dataset = VitalDBDataset(
+        modality='ppg',
+        split='test',
+        return_labels=True,
+        return_participant_id=True
+    )
+
+    # Collect demographics from multiple samples
+    all_demographics = []
+    n_samples = min(20, len(dataset))
+
+    print(f"\nCollecting demographics from {n_samples} samples...")
+
+    for i in range(n_samples):
+        try:
+            seg1, seg2, case_id, demographics = dataset[i]  # Unpack 4 values
+
+            # Only include if has valid data
+            if demographics['age'] > 0:
+                all_demographics.append(demographics)
+        except Exception as e:
+            print(f"  Error at sample {i}: {e}")
+            continue
+
+    if not all_demographics:
+        print("⚠  No valid demographics found")
+        return False
+
+    # Calculate statistics
+    print(f"\nAnalyzed {len(all_demographics)} cases with valid demographics:")
+    print("-" * 40)
+
+    # Age statistics
+    ages = [d['age'] for d in all_demographics if d['age'] > 0]
+    if ages:
+        print(f"Age (n={len(ages)}):")
+        print(f"  Mean: {np.mean(ages):.1f} years")
+        print(f"  Range: {min(ages):.0f} - {max(ages):.0f} years")
+
+        # Check if reasonable
+        if min(ages) < 0 or max(ages) > 120:
+            print("  ⚠  Warning: Unrealistic age values")
+
+    # Sex distribution
+    sexes = [d['sex'] for d in all_demographics if d['sex'] >= 0]
+    if sexes:
+        male_count = sum(1 for s in sexes if s == 1)
+        female_count = sum(1 for s in sexes if s == 0)
+        print(f"\nSex distribution (n={len(sexes)}):")
+        print(f"  Male: {male_count} ({male_count / len(sexes) * 100:.1f}%)")
+        print(f"  Female: {female_count} ({female_count / len(sexes) * 100:.1f}%)")
+
+    # BMI statistics
+    bmis = [d['bmi'] for d in all_demographics if d['bmi'] > 0]
+    if bmis:
+        print(f"\nBMI (n={len(bmis)}):")
+        print(f"  Mean: {np.mean(bmis):.1f} kg/m²")
+        print(f"  Range: {min(bmis):.1f} - {max(bmis):.1f}")
+
+        # Check if reasonable
+        if min(bmis) < 10 or max(bmis) > 60:
+            print("  ⚠  Warning: Unusual BMI values")
+
+    print("\n" + "=" * 70)
+    print("✅ DEMOGRAPHICS VALUES TEST COMPLETE")
+    print("=" * 70)
+
+    return True
+
+
 # Main test runner
 if __name__ == "__main__":
     print("\n" + "=" * 60)
@@ -2692,7 +3195,6 @@ if __name__ == "__main__":
     test_pair_generation_strategy()
     test_pair_loading_reliability()
 
-
     # VitalDB tests
     print("\n[VITALDB TESTS]")
     has_vitaldb = test_vitaldb_loading()
@@ -2704,8 +3206,13 @@ if __name__ == "__main__":
         test_dataloader_creation()
         test_preprocessing_consistency()
 
+
+
+    test_vitaldb_positive_pairs()
+    print("\n" + "=" * 60)
+    print("\n[VITALDB DEMOGRAPHICS TESTS]")
+    test_vitaldb_demographics_complete()
+    test_vitaldb_demographics_values()
     print("\n" + "=" * 60)
     print("ALL TESTS COMPLETED")
     print("=" * 60)
-
-    test_vitaldb_positive_pairs()

@@ -59,6 +59,7 @@ class Trainer:
         self.ssl_method = ssl_method
         self.phase = phase
         self.pretrained_path = None
+        self.dataset_type = None
 
         # Load configuration
         self.config = get_config()
@@ -130,20 +131,24 @@ class Trainer:
         if dataset_type is None:
             if self.phase == 'pretrain':
                 dataset_type = 'vitaldb'
+            elif hasattr(self, 'dataset_type') and self.dataset_type:
+                dataset_type = self.dataset_type  # Use explicitly set type
             else:
-                dataset_type = 'but_ppg'
+                dataset_type = 'but_ppg'  # Def
 
         print(f"\nSetting up {modality.upper()} data loaders (dataset: {dataset_type})...")
 
-        # Use device manager to determine optimal settings
-        num_workers = self.device_manager.get_num_workers()
-        pin_memory = self.device_manager.is_cuda
 
-        # Get batch size from config
+
         if self.phase == 'pretrain':
             phase_config = self.config.config.get('pretrain', {})
         elif self.phase == 'finetune':
-            phase_config = self.config.config.get('finetune', {})
+            if dataset_type == 'vitaldb':
+                # Look for VitalDB-specific finetune config
+                phase_config = self.config.config.get('finetune_vitaldb',
+                                                      self.config.config.get('finetune', {}))
+            else:
+                phase_config = self.config.config.get('finetune', {})
         else:
             phase_config = self.training_config
 
@@ -153,17 +158,20 @@ class Trainer:
 
         # Create data loaders with optimizations
         from data import create_dataloaders
+        # Create data loaders
         self.train_loader, self.val_loader, self.test_loader = create_dataloaders(
             data_dir=self.config.data_dir if dataset_type == 'but_ppg' else None,
             modality=modality,
             batch_size=batch_size,
             num_workers=num_workers,
             config_path='configs/config.yaml',
-            dataset_type=dataset_type,  # IMPORTANT: Pass dataset type
+            dataset_type=dataset_type,  # Pass explicit dataset type
             pin_memory=pin_memory,
             prefetch_factor=2 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
-            downsample=self.downsample
+            downsample=self.downsample,
+            return_labels=False,  # SSL training doesn't need labels
+            return_participant_id=False
         )
 
         print(f"  Dataset: {dataset_type.upper()}")
@@ -181,6 +189,7 @@ class Trainer:
         )
 
         self.modality = modality
+        self.current_dataset = dataset_type
 
     def setup_model(self, modality: str = 'ppg'):
         """Setup SSL model with modality support."""

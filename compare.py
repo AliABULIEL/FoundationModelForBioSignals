@@ -38,6 +38,7 @@ class ResultsComparator:
             config_path: Path to configuration file
         """
         # Load configuration
+        self.dataset_type = None
         self.config = get_config()
 
         # Load paper benchmarks from config
@@ -115,54 +116,185 @@ class ResultsComparator:
 
         return restructured if restructured else benchmarks
 
-    def load_results(
-            self,
-            results_path: str,
-            modality: str = 'ppg'
-    ):
+    def load_results(self, results_path: str, modality: str = 'ppg', dataset_type: str = 'auto'):
         """
-        Load experimental results with optimized file reading.
+        Load experimental results with dataset type awareness.
 
         Args:
-            results_path: Path to results file (CSV or JSON)
-            modality: Signal modality ('ppg' or 'ecg')
+            results_path: Path to results file
+            modality: Signal modality
+            dataset_type: 'but_ppg', 'vitaldb', 'combined', or 'auto'
         """
         path = Path(results_path)
 
         if not path.exists():
             raise FileNotFoundError(f"Results file not found: {path}")
 
+        # Auto-detect dataset type from filename
+        if dataset_type == 'auto':
+            filename_lower = str(path).lower()
+            if 'vitaldb' in filename_lower:
+                dataset_type = 'vitaldb'
+            elif 'combined' in filename_lower:
+                dataset_type = 'combined'
+            else:
+                dataset_type = 'but_ppg'
+
+        self.dataset_type = dataset_type
+
         # Clear cache when loading new results
         self._comparison_cache.clear()
 
         try:
             if path.suffix == '.csv':
-                # Optimized CSV loading with type inference
-                df = pd.read_csv(
-                    path,
-                    engine='c',  # Use C engine for faster parsing
-                    na_values=['NA', 'NaN', 'null', 'None'],
-                    dtype_backend='numpy_nullable'  # More efficient nullable types
-                )
+                df = pd.read_csv(path, engine='c', na_values=['NA', 'NaN', 'null', 'None'])
 
-                # Vectorized conversion to dictionary format
-                self.our_results[modality] = self._df_to_results_dict(df)
+                # Check if dataset column exists
+                if 'dataset' in df.columns or 'dataset_type' in df.columns:
+                    # Handle multi-dataset results
+                    self.our_results[modality] = self._process_multi_dataset_results(df)
+                else:
+                    # Single dataset results
+                    self.our_results[modality] = self._df_to_results_dict(df)
 
             elif path.suffix == '.json':
-                # Optimized JSON loading
-                with open(path, 'r', buffering=8192) as f:  # Larger buffer for faster I/O
+                with open(path, 'r', buffering=8192) as f:
                     results = json.load(f)
                 self.our_results[modality] = results
-
             else:
                 raise ValueError(f"Unsupported file format: {path.suffix}")
 
             print(f"Loaded {modality.upper()} results from {path}")
+            print(f"  Dataset type: {dataset_type}")
 
         except Exception as e:
             logger.error(f"Error loading results: {e}")
             raise
 
+    def _process_multi_dataset_results(self, df: pd.DataFrame) -> Dict:
+        """
+        Process results that contain multiple datasets.
+
+        Args:
+            df: DataFrame with dataset column
+
+        Returns:
+            Dictionary organized by dataset and task
+        """
+        results = {}
+
+        # Group by dataset if present
+        if 'dataset' in df.columns:
+            dataset_col = 'dataset'
+        elif 'dataset_type' in df.columns:
+            dataset_col = 'dataset_type'
+        else:
+            # No dataset column, treat as single dataset
+            return self._df_to_results_dict(df)
+
+        for dataset in df[dataset_col].unique():
+            dataset_df = df[df[dataset_col] == dataset]
+            dataset_key = dataset.lower().replace(' ', '_')
+            results[dataset_key] = self._df_to_results_dict(dataset_df)
+
+        return results
+
+    def compare_modality(self, modality: str = 'ppg', dataset_filter: Optional[str] = None) -> pd.DataFrame:
+        """
+        Compare results with dataset filtering support.
+
+        Args:
+            modality: Signal modality
+            dataset_filter: Filter for specific dataset ('vitaldb', 'but_ppg', None for all)
+
+        Returns:
+            DataFrame with comparison
+        """
+        # Check cache first
+        cache_key = f"{modality}_{dataset_filter or 'all'}_comparison"
+        if cache_key in self._comparison_cache:
+            return self._comparison_cache[cache_key].copy()
+
+        if modality not in self.our_results:
+            raise ValueError(f"No results loaded for {modality}")
+
+        comparisons = []
+
+        # Handle multi-dataset results
+        our_results = self.our_results[modality]
+
+        if isinstance(our_results, dict) and any(k in our_results for k in ['vitaldb', 'but_ppg']):
+            # Multi-dataset results
+            for dataset_key, dataset_results in our_results.items():
+                if dataset_filter and dataset_key != dataset_filter:
+                    continue
+
+                for task, paper_metrics in self.paper_benchmarks.get(modality, {}).items():
+                    comparison = self._compare_single_task(
+                        task,
+                        dataset_results.get(task, {}),
+                        paper_metrics,
+                        modality,
+                        dataset_key
+                    )
+                    comparisons.append(comparison)
+        else:
+            # Single dataset results
+            for task, paper_metrics in self.paper_benchmarks.get(modality, {}).items():
+                comparison = self._compare_single_task(
+                    task,
+                    our_results.get(task, {}),
+                    paper_metrics,
+                    modality,
+                    self.dataset_type or 'unknown'
+                )
+                comparisons.append(comparison)
+
+        df = pd.DataFrame(comparisons)
+
+        # Cache the result
+        self._comparison_cache[cache_key] = df.copy()
+
+        return df
+
+    def _compare_single_task(self, task: str, our_metrics: Dict, paper_metrics: Dict,
+                             modality: str, dataset: str) -> Dict:
+        """
+        Compare metrics for a single task.
+
+        Args:
+            task: Task name
+            our_metrics: Our results
+            paper_metrics: Paper benchmarks
+            modality: Signal modality
+            dataset: Dataset name
+
+        Returns:
+            Dictionary with comparison
+        """
+        comparison = {
+            'modality': modality.upper(),
+            'task': task,
+            'dataset': dataset
+        }
+
+        # Compare each metric
+        for metric, paper_value in paper_metrics.items():
+            our_value = our_metrics.get(metric)
+
+            if our_value is not None:
+                comparison[f'paper_{metric}'] = paper_value
+                comparison[f'our_{metric}'] = our_value
+
+                # Calculate differences
+                diff, pct_diff = self._calculate_metric_difference(
+                    metric, our_value, paper_value
+                )
+
+                comparison[f'diff_{metric}'] = diff
+                comparison[f'pct_diff_{metric}'] = pct_diff
+
+        return comparison
     def _df_to_results_dict(self, df: pd.DataFrame) -> Dict:
         """
         Optimized DataFrame to dictionary conversion.
@@ -275,20 +407,18 @@ class ResultsComparator:
 
         return df
 
-    def generate_report(
-            self,
-            save_dir: Optional[str] = None
-    ) -> Dict:
+    def generate_report(self, save_dir: Optional[str] = None,
+                        separate_by_dataset: bool = True) -> Dict:
         """
-        Generate comprehensive comparison report with optimized I/O.
+        Generate report with dataset-aware organization.
 
         Args:
             save_dir: Directory to save report
+            separate_by_dataset: Whether to create separate reports per dataset
 
         Returns:
             Dictionary with comparison statistics
         """
-        # Get save directory from config if not provided
         if save_dir is None:
             save_dir = self.config.get('comparison.output_dir', 'data/outputs/comparisons')
 
@@ -298,6 +428,7 @@ class ResultsComparator:
         report = {
             'timestamp': datetime.now().isoformat(),
             'modalities': list(self.our_results.keys()),
+            'dataset_type': self.dataset_type,
             'comparisons': {},
             'config': {
                 'dataset': self.config.dataset_name,
@@ -305,39 +436,79 @@ class ResultsComparator:
             }
         }
 
-        # Pre-allocate list for DataFrames
         all_comparisons = []
 
-        # Process modalities in batch
+        # Process each modality
         for modality in self.our_results.keys():
-            df = self.compare_modality(modality)
-            all_comparisons.append(df)
+            # Check if we have multi-dataset results
+            our_results = self.our_results[modality]
 
-            # Optimized summary calculation using numpy operations
-            summary = self._calculate_summary_stats(df)
+            if isinstance(our_results, dict) and any(k in our_results for k in ['vitaldb', 'but_ppg']):
+                # Multi-dataset - create separate comparisons
+                for dataset in ['vitaldb', 'but_ppg']:
+                    if dataset in our_results:
+                        df = self.compare_modality(modality, dataset_filter=dataset)
+                        all_comparisons.append(df)
 
-            report['comparisons'][modality] = {
-                'summary': summary,
-                'details': df.to_dict('records')
-            }
+                        summary = self._calculate_summary_stats(df)
 
-        # Combine all comparisons efficiently
+                        if dataset not in report['comparisons']:
+                            report['comparisons'][dataset] = {}
+
+                        report['comparisons'][dataset][modality] = {
+                            'summary': summary,
+                            'details': df.to_dict('records')
+                        }
+
+                        if separate_by_dataset:
+                            # Save dataset-specific comparison
+                            dataset_dir = save_dir / dataset
+                            dataset_dir.mkdir(exist_ok=True)
+
+                            csv_path = dataset_dir / f'comparison_table_{modality}.csv'
+                            df.to_csv(csv_path, index=False)
+                            print(f"  {dataset.upper()} comparison saved to {csv_path}")
+            else:
+                # Single dataset - FIXED: Use modality as key directly for backward compatibility
+                df = self.compare_modality(modality)
+                all_comparisons.append(df)
+
+                summary = self._calculate_summary_stats(df)
+
+                # For backward compatibility, when dataset_type is not specified or is a single dataset,
+                # put results directly under modality key
+                if self.dataset_type and self.dataset_type not in ['unknown', 'auto']:
+                    # New structure with dataset awareness
+                    dataset_key = self.dataset_type
+                    if dataset_key not in report['comparisons']:
+                        report['comparisons'][dataset_key] = {}
+                    report['comparisons'][dataset_key][modality] = {
+                        'summary': summary,
+                        'details': df.to_dict('records')
+                    }
+                else:
+                    # Original structure for backward compatibility
+                    report['comparisons'][modality] = {
+                        'summary': summary,
+                        'details': df.to_dict('records')
+                    }
+
+        # Combine all comparisons
         if all_comparisons:
             self.comparison_df = pd.concat(all_comparisons, ignore_index=True)
 
-            # Save with optimized I/O
-            csv_path = save_dir / 'comparison_table.csv'
+            # Save combined table
+            csv_path = save_dir / 'comparison_table_all.csv'
             self.comparison_df.to_csv(csv_path, index=False)
-            print(f"Comparison table saved to {csv_path}")
+            print(f"Combined comparison table saved to {csv_path}")
 
-        # Save JSON with optimized writing
+        # Save JSON report
         json_path = save_dir / 'comparison_report.json'
         with open(json_path, 'w', buffering=8192) as f:
             json.dump(report, f, indent=2, default=str)
         print(f"Comparison report saved to {json_path}")
 
         return report
-
     def _calculate_summary_stats(self, df: pd.DataFrame) -> Dict:
         """
         Optimized summary statistics calculation using numpy.
@@ -574,48 +745,75 @@ class ResultsComparator:
                 fontsize=10, verticalalignment='center',
                 fontfamily='monospace')
 
-    def print_summary(self):
-        """Print summary comparison to console - optimized version."""
+    def print_summary(self, dataset_filter: Optional[str] = None):
+        """
+        Print summary with dataset filtering.
+
+        Args:
+            dataset_filter: Show only specific dataset results
+        """
         if not self.our_results:
             print("No results loaded")
             return
 
-        # Pre-format header
         header = "\n" + "=" * 60 + "\n"
-        print(header + "COMPARISON WITH APPLE PAPER RESULTS" + header)
+
+        if dataset_filter:
+            print(header + f"COMPARISON WITH PAPER - {dataset_filter.upper()}" + header)
+        else:
+            print(header + "COMPARISON WITH APPLE PAPER RESULTS" + header)
 
         for modality in self.our_results.keys():
             print(f"\n{modality.upper()} Results:")
             print("-" * 40)
 
-            df = self.compare_modality(modality)
+            our_results = self.our_results[modality]
 
-            # Vectorized processing for printing
-            for _, row in df.iterrows():
-                task_name = row['task'].replace('_', ' ').title()
-                print(f"\n{task_name}:")
+            # Handle multi-dataset results
+            if isinstance(our_results, dict) and any(k in our_results for k in ['vitaldb', 'but_ppg']):
+                for dataset in ['vitaldb', 'but_ppg']:
+                    if dataset_filter and dataset != dataset_filter:
+                        continue
 
-                # Print all available metrics efficiently
-                metrics_printed = False
-                for metric in ['auc', 'mae', 'pauc']:
-                    our_col = f'our_{metric}'
-                    paper_col = f'paper_{metric}'
-
-                    if our_col in row and pd.notna(row[our_col]):
-                        paper_val = row.get(paper_col, 0)
-                        our_val = row[our_col]
-                        diff = our_val - paper_val if metric in self._HIGHER_BETTER_METRICS else paper_val - our_val
-
-                        format_str = ".3f" if metric in {'auc', 'pauc'} else ".2f"
-                        print(f"  {metric.upper()}: {our_val:{format_str}} "
-                              f"(Paper: {paper_val:{format_str}}, "
-                              f"Diff: {diff:+{format_str}})")
-                        metrics_printed = True
-
-                if not metrics_printed:
-                    print("  No metrics available")
+                    if dataset in our_results:
+                        print(f"\n  Dataset: {dataset.upper()}")
+                        self._print_dataset_comparison(modality, dataset, our_results[dataset])
+            else:
+                # Single dataset
+                dataset_name = self.dataset_type or 'unknown'
+                if not dataset_filter or dataset_filter == dataset_name:
+                    self._print_dataset_comparison(modality, dataset_name, our_results)
 
         print("\n" + "=" * 60)
+
+    def _print_dataset_comparison(self, modality: str, dataset: str, results: Dict):
+        """Print comparison for a specific dataset."""
+        for task_name, metrics in results.items():
+            if not isinstance(metrics, dict):
+                continue
+
+            task_display = task_name.replace('_', ' ').title()
+            print(f"\n    {task_display}:")
+
+            # Get paper benchmarks
+            paper_metrics = self.paper_benchmarks.get(modality, {}).get(task_name, {})
+
+            # Print metrics
+            for metric in ['auc', 'mae', 'pauc', 'accuracy', 'f1', 'r2']:
+                if metric in metrics:
+                    our_val = metrics[metric]
+                    paper_val = paper_metrics.get(metric, None)
+
+                    if paper_val is not None:
+                        diff = our_val - paper_val if metric in self._HIGHER_BETTER_METRICS else paper_val - our_val
+                        format_str = ".3f" if metric in {'auc', 'pauc'} else ".2f"
+
+                        print(f"      {metric.upper()}: {our_val:{format_str}} "
+                              f"(Paper: {paper_val:{format_str}}, "
+                              f"Diff: {diff:+{format_str}})")
+                    else:
+                        format_str = ".3f" if metric in {'auc', 'pauc'} else ".2f"
+                        print(f"      {metric.upper()}: {our_val:{format_str}} (No benchmark)")
 
 
 # ============= TEST FUNCTIONS =============

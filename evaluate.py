@@ -159,6 +159,7 @@ class DownstreamEvaluator:
     ):
         """Initialize evaluator with device manager."""
         self.encoder_path = encoder_path
+        self.current_dataset_type = None
         
         # Load configuration
         self.config = get_config()
@@ -296,6 +297,61 @@ class DownstreamEvaluator:
         print(f"Encoder loaded from {self.encoder_path}")
         print(f"  Modality: {modality}")
 
+    def evaluate_all_tasks_extended(
+            self,
+            dataset_type: str = 'but_ppg',
+            modality: str = 'ppg',
+            split: str = 'test',
+            data_dir: Optional[str] = None,
+            save_path: Optional[str] = None,
+            downsample: bool = False
+    ) -> pd.DataFrame:
+        """
+        Extended evaluation that supports both BUT PPG and VitalDB.
+
+        Args:
+            dataset_type: 'but_ppg' or 'vitaldb'
+            modality: Signal modality
+            split: Data split
+            data_dir: Data directory (for BUT PPG)
+            save_path: Where to save results
+            downsample: Whether to downsample
+
+        Returns:
+            DataFrame with evaluation results
+        """
+        # Create appropriate dataset
+        dataset = create_evaluation_dataset(
+            dataset_type=dataset_type,
+            modality=modality,
+            split=split,
+            data_dir=data_dir,
+            downsample=downsample
+        )
+
+        self.current_dataset_type = dataset_type
+
+        # Determine number of participants/cases
+        if dataset_type == 'vitaldb':
+            n_participants = len(dataset.cases)
+            dataset_label = 'VitalDB'
+        else:
+            n_participants = len(dataset.participant_records)
+            dataset_label = 'BUT PPG'
+
+        print(f"\nEvaluating on {dataset_label} - {modality.upper()}")
+        print(f"  Dataset: {dataset_label}")
+        print(f"  Split: {split}")
+        print(f"  Participants/Cases: {n_participants}")
+
+        # Use existing evaluate_all_tasks with the dataset
+        results_df = self.evaluate_all_tasks(dataset, save_path)
+
+        # Add dataset type to results
+        results_df['dataset'] = dataset_label
+        results_df['dataset_type'] = dataset_type
+
+        return results_df
     @torch.no_grad()
     def extract_embeddings(
             self,
@@ -1333,7 +1389,46 @@ class DownstreamEvaluator:
 
 
 # ============= TEST FUNCTIONS =============
+def create_evaluation_dataset(
+        dataset_type: str = 'but_ppg',
+        modality: str = 'ppg',
+        split: str = 'test',
+        data_dir: Optional[str] = None,
+        downsample: bool = False
+):
+    """
+    Create dataset for evaluation - supports both BUT PPG and VitalDB.
 
+    Args:
+        dataset_type: 'but_ppg' or 'vitaldb'
+        modality: Signal modality
+        split: Data split to use
+        data_dir: Data directory (for BUT PPG)
+        downsample: Whether to downsample
+
+    Returns:
+        Dataset instance with labels and participant IDs
+    """
+    if dataset_type == 'vitaldb':
+        from data import VitalDBDataset
+        return VitalDBDataset(
+            modality=modality,
+            split=split,
+            return_labels=True,
+            return_participant_id=True,
+            use_cache=True
+        )
+    else:  # but_ppg
+        from data import BUTPPGDataset
+        return BUTPPGDataset(
+            data_dir=data_dir or 'data/but_ppg/dataset',
+            modality=modality,
+            split=split,
+            return_participant_id=True,
+            return_labels=True,
+            quality_filter=False,
+            downsample=downsample
+        )
 def test_evaluation():
     """Test evaluation functionality with device manager and small samples."""
     print("=" * 50)
