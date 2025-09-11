@@ -255,6 +255,7 @@ pretrain:
   num_workers: 8
   save_freq: 10
   early_stopping_patience: 20
+  semi_supervised_weight: 0.01
 
 # Fine-tuning settings
 finetune:
@@ -266,16 +267,36 @@ finetune:
   freeze_encoder: false
   save_freq: 5
   early_stopping_patience: 20
+  semi_supervised_weight: 0.05
 
 semi_supervised:
-  enabled: false   # Set to true to enable semi-supervised learning
-  mode: "multi_task"  # "multi_task" or "pseudo_label"
+  enabled: true
+  supervised_weight: 0.01  # Very small weight to start
+  method: 'mean_teacher'  # Choose your method
 
+  # Standard options (work with all methods)
+  use_pseudo: true
+  pseudo_threshold: 0.95
+  use_consistency: true
+  consistency_rampup: 20
+  confidence_weighting: true
 
+  # MixMatch specific
+  mixmatch:
+    K: 2  # Number of augmentations
+    temperature: 0.5  # Sharpening temperature
+    alpha: 0.75  # MixUp coefficient
 
-  # Loss weights
-  ssl_weight: 0.7  # Weight for SSL loss (contrastive)
-  supervised_weight: 0.01  # Weight for supervised loss
+  # Temporal Ensemble specific
+  temporal:
+    alpha: 0.6  # EMA decay for ensemble
+    rampup: 40  # Epochs to ramp up
+
+  # Mean Teacher specific
+  mean_teacher:
+    ema_decay: 0.999  # Teacher EMA decay
+    consistency_weight: 1.0
+    rampup: 40
 
   # Supervised tasks to include
   tasks:

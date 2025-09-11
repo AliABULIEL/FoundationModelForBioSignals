@@ -5,10 +5,13 @@ Implements SSL training following Apple paper
 Enhanced with ACC support and device manager integration
 Uses centralized configuration management
 """
+from copy import deepcopy
 
+
+import torch.nn as nn
+from copy import deepcopy
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 import numpy as np
 import pandas as pd
@@ -76,6 +79,15 @@ class Trainer:
             alpha = self.config.config.get('semi_supervised', {}).get('supervised_weight', 0.3)
             self.semi_supervised_loss = SemiSupervisedLoss(alpha=alpha)
             print(f"  Semi-supervised: ENABLED (alpha={alpha})")
+
+            semi_method = self.config.config.get('semi_supervised', {}).get('method', 'standard')
+
+            if semi_method == 'mean_teacher':
+                self.teacher_model = None  # Will be created after model setup
+            elif semi_method == 'temporal':
+                self.sample_tracker = {}  # Track sample indices
+
+            print(f"  Semi-supervised method: {semi_method}")
 
         # Set experiment name
         if experiment_name is None:
@@ -212,7 +224,7 @@ class Trainer:
         """Setup SSL model with modality support."""
         print(f"\nSetting up {modality.upper()} model...")
 
-        # Create foundation model (it will use global device manager internally)
+        # Create foundation model
         foundation_model = BiosignalFoundationModel(
             config_path='configs/config.yaml',
             modality=modality
@@ -225,7 +237,10 @@ class Trainer:
             ssl_method=self.ssl_method,
             use_supervised=self.use_supervised
         )
+
         self.model = self.model.to(self.device)
+
+        # IMPORTANT: Load pretrained weights FIRST, then create teacher
         if self.phase == 'finetune' and hasattr(self, 'pretrained_path') and self.pretrained_path:
             print(f"Loading pretrained encoder from: {self.pretrained_path}")
             try:
@@ -236,11 +251,11 @@ class Trainer:
                 else:
                     encoder_state = checkpoint
 
-                # Load weights
+                # Load weights into student model
                 self.model.encoder.load_state_dict(encoder_state, strict=False)
                 print(f"✓ Successfully loaded pretrained encoder")
 
-                # Verify weights were loaded (not random)
+                # Verify weights were loaded
                 with torch.no_grad():
                     dummy_input = torch.randn(1, 1, 640).to(self.device)
                     output = self.model.encoder(dummy_input)
@@ -249,14 +264,43 @@ class Trainer:
             except Exception as e:
                 print(f"ERROR loading pretrained model: {e}")
                 raise
-        # Move to device (model already on device from initialization)
+
+        # NOW setup semi-supervised components (AFTER loading pretrained weights)
+        if self.use_supervised:
+            semi_method = self.config.config.get('semi_supervised', {}).get('method', 'standard')
+
+            if semi_method == 'mean_teacher':
+                # Create teacher model from the already-loaded student
+                self.teacher_model = deepcopy(self.model)
+                for param in self.teacher_model.parameters():
+                    param.requires_grad = False
+                print("  Created Mean Teacher model (with pretrained weights)")
+
+                # Initialize supervised heads with better initialization
+                if hasattr(self.model, 'age_classifier'):
+                    nn.init.xavier_uniform_(self.model.age_classifier[0].weight)
+                if hasattr(self.model, 'bmi_regressor'):
+                    nn.init.xavier_uniform_(self.model.bmi_regressor[0].weight)
+                if hasattr(self.model, 'sex_classifier'):
+                    nn.init.xavier_uniform_(self.model.sex_classifier[0].weight)
+
+            elif semi_method == 'temporal' and self.semi_supervised_loss:
+                # Initialize temporal ensemble with dataset size
+                dataset_size = len(self.train_loader.dataset) if hasattr(self, 'train_loader') else 1000
+                self.semi_supervised_loss.init_temporal_ensemble(dataset_size)
+                print(f"  Initialized Temporal Ensemble for {dataset_size} samples")
+
+            print(f"  Semi-supervised heads: ENABLED")
+            print(f"    - Age classifier (binary)")
+            print(f"    - BMI regressor")
+            print(f"    - Sex classifier (binary)")
 
         # Use DataParallel if multiple GPUs
         if self.device_manager.is_cuda and torch.cuda.device_count() > 1:
             print(f"  Using {torch.cuda.device_count()} GPUs with DataParallel")
             self.model = torch.nn.DataParallel(self.model)
 
-        # Optional: Compile model for faster execution (PyTorch 2.0+)
+        # Optional: Compile model
         compile_model = self.config.get('training.compile_model', False)
         if self.device_manager.supports_compile and compile_model:
             try:
@@ -277,12 +321,6 @@ class Trainer:
             mem_stats = self.device_manager.memory_stats()
             print(f"  GPU memory after model load: {mem_stats.get('allocated', 0):.2f} GB")
 
-        if self.use_supervised:
-            print(f"  Semi-supervised heads: ENABLED")
-            print(f"    - Age classifier (binary)")
-            print(f"    - BMI regressor")
-            print(f"    - Sex classifier (binary)")
-
     def setup_optimizer(self):
         """Setup optimizer and scheduler with optimizations."""
         print("\nSetting up optimizer...")
@@ -299,28 +337,41 @@ class Trainer:
         else:
             learning_rate = self.training_config.get('learning_rate', 1e-4)
         # Create optimizer based on config
-        if optimizer_type == 'adam':
-            self.optimizer = optim.Adam(
-                self.model.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay
-            )
-        elif optimizer_type == 'adamw':
-            self.optimizer = optim.AdamW(
-                self.model.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay
-            )
-        elif optimizer_type == 'sgd':
-            momentum = self.config.get('training.sgd_momentum', 0.9)
-            self.optimizer = optim.SGD(
-                self.model.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay,
-                momentum=momentum
-            )
+        if self.phase == 'finetune' and self.use_supervised:
+            # Use different learning rates for pretrained encoder vs new heads
+            param_groups = [
+                {'params': self.model.encoder.parameters(), 'lr': learning_rate * 0.1},  # Lower LR for encoder
+                {'params': self.model.age_classifier.parameters(), 'lr': learning_rate},
+                {'params': self.model.bmi_regressor.parameters(), 'lr': learning_rate},
+                {'params': self.model.sex_classifier.parameters(), 'lr': learning_rate},
+            ]
+
+            self.optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+            print(f"  Using differential learning rates for fine-tuning")
         else:
-            raise ValueError(f"Unknown optimizer: {optimizer_type}")
+
+            if optimizer_type == 'adam':
+                self.optimizer = optim.Adam(
+                    self.model.parameters(),
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+            elif optimizer_type == 'adamw':
+                self.optimizer = optim.AdamW(
+                    self.model.parameters(),
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+            elif optimizer_type == 'sgd':
+                momentum = self.config.get('training.sgd_momentum', 0.9)
+                self.optimizer = optim.SGD(
+                    self.model.parameters(),
+                    lr=learning_rate,
+                    weight_decay=weight_decay,
+                    momentum=momentum
+                )
+        # else:
+        #     raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
         # Learning rate scheduler from config
         scheduler_type = self.training_config.get('scheduler', 'step').lower()
@@ -368,7 +419,7 @@ class Trainer:
         print(f"  Scheduler: {scheduler_type if self.scheduler else 'None'}")
 
     def train_epoch(self, epoch: int) -> Dict:
-        """Train for one epoch with device optimizations."""
+        """Train for one epoch with device optimizations and semi-supervised learning."""
         self.model.train()
 
         epoch_losses = []
@@ -376,8 +427,14 @@ class Trainer:
             'loss_contrastive': [],
             'loss_koleo': [],
             'loss_variance': [],
-            'supervised_loss': []  # ADD THIS
+            'supervised_loss': [],
+            'method_loss': [],
+            'pseudo_loss': []
         }
+
+        # Update consistency weight if using semi-supervised
+        if self.semi_supervised_loss and hasattr(self.semi_supervised_loss, 'update_consistency_weight'):
+            self.semi_supervised_loss.update_consistency_weight(epoch, self.training_config.get('num_epochs', 100))
 
         # Timing
         batch_times = []
@@ -395,8 +452,18 @@ class Trainer:
             # Measure data loading time
             data_time = time.time() - end
             data_times.append(data_time)
+
+            # Initialize variables
             has_labels = False
             labels = None
+            sample_indices = None
+
+            # Track sample indices for temporal ensemble
+            if hasattr(self, 'sample_tracker'):
+                sample_indices = torch.arange(
+                    batch_idx * self.train_loader.batch_size,
+                    min((batch_idx + 1) * self.train_loader.batch_size, len(self.train_loader.dataset))
+                )
 
             # Get positive pairs
             if len(batch) == 3:  # With labels
@@ -411,14 +478,12 @@ class Trainer:
             if self.device_manager.is_cuda:
                 seg1 = seg1.to(self.device, non_blocking=True)
                 seg2 = seg2.to(self.device, non_blocking=True)
-                # ADD: Move labels to device
                 if has_labels and labels is not None:
                     for key in labels:
                         labels[key] = labels[key].to(self.device, non_blocking=True)
             else:
                 seg1 = seg1.to(self.device)
                 seg2 = seg2.to(self.device)
-                # ADD: Move labels to device
                 if has_labels and labels is not None:
                     for key in labels:
                         labels[key] = labels[key].to(self.device)
@@ -426,34 +491,100 @@ class Trainer:
             # Apply augmentations
             seg1_aug, seg2_aug = self.augmentation(seg1, seg2)
 
-            # Mixed precision forward pass (only if device supports it)
+            # Initialize variables for semi-supervised methods
+            seg1_aug2, seg2_aug2 = None, None
+            teacher_predictions = None
+
+            # Get semi-supervised method
+            semi_method = self.config.config.get('semi_supervised', {}).get('method', 'standard')
+
+            # Prepare for semi-supervised learning if enabled
+            if self.use_supervised:
+                if semi_method == 'mean_teacher' and hasattr(self, 'teacher_model'):
+                    # Get teacher predictions
+                    with torch.no_grad():
+                        teacher_h1 = self.teacher_model.encoder(seg1_aug)
+                        teacher_predictions = {}
+                        if hasattr(self.teacher_model, 'age_classifier'):
+                            teacher_predictions['age_class'] = self.teacher_model.age_classifier(teacher_h1)
+                        if hasattr(self.teacher_model, 'bmi_regressor'):
+                            teacher_predictions['bmi'] = self.teacher_model.bmi_regressor(teacher_h1)
+                        if hasattr(self.teacher_model, 'sex_classifier'):
+                            teacher_predictions['sex'] = self.teacher_model.sex_classifier(teacher_h1)
+
+                elif semi_method in ['standard', 'temporal'] and self.config.config.get('semi_supervised', {}).get(
+                        'use_consistency', False):
+                    # Create second augmentation for consistency
+                    seg1_aug2, seg2_aug2 = self.augmentation(seg1, seg2)
+
+            # Forward pass
             if self.use_supervised and has_labels and labels is not None:
                 # Semi-supervised forward pass
                 if self.use_amp and self.device_manager.supports_amp:
                     with autocast():
-                        ssl_loss, metrics, predictions = self.model(
-                            seg1_aug, seg2_aug,
-                            return_predictions=True
-                        )
-                        total_loss, sup_loss_value = self.semi_supervised_loss(
-                            ssl_loss, predictions, labels
+                        # Get SSL loss and predictions
+                        if seg1_aug2 is not None:
+                            ssl_loss, metrics, predictions, predictions_aug = self.model(
+                                seg1_aug, seg2_aug,
+                                return_predictions=True,
+                                x1_aug2=seg1_aug2,
+                                x2_aug2=seg2_aug2
+                            )
+                        else:
+                            # No second augmentation needed
+                            result = self.model(seg1_aug, seg2_aug, return_predictions=True)
+                            if len(result) == 4:
+                                ssl_loss, metrics, predictions, predictions_aug = result
+                            else:
+                                ssl_loss, metrics, predictions = result
+                                predictions_aug = None
+
+                        # Calculate total loss with semi-supervised components
+                        total_loss, loss_dict = self.semi_supervised_loss(
+                            ssl_loss, predictions, labels,
+                            predictions_aug=predictions_aug,
+                            teacher_predictions=teacher_predictions,
+                            sample_indices=sample_indices,
+                            epoch=epoch
                         )
                         loss = total_loss / self.gradient_accumulation_steps
                 else:
-                    ssl_loss, metrics, predictions = self.model(
-                        seg1_aug, seg2_aug,
-                        return_predictions=True
-                    )
-                    total_loss, sup_loss_value = self.semi_supervised_loss(
-                        ssl_loss, predictions, labels
+                    # Same without AMP
+                    if seg1_aug2 is not None:
+                        ssl_loss, metrics, predictions, predictions_aug = self.model(
+                            seg1_aug, seg2_aug,
+                            return_predictions=True,
+                            x1_aug2=seg1_aug2,
+                            x2_aug2=seg2_aug2
+                        )
+                    else:
+                        result = self.model(seg1_aug, seg2_aug, return_predictions=True)
+                        if len(result) == 4:
+                            ssl_loss, metrics, predictions, predictions_aug = result
+                        else:
+                            ssl_loss, metrics, predictions = result
+                            predictions_aug = None
+
+                    total_loss, loss_dict = self.semi_supervised_loss(
+                        ssl_loss, predictions, labels,
+                        predictions_aug=predictions_aug,
+                        teacher_predictions=teacher_predictions,
+                        sample_indices=sample_indices,
+                        epoch=epoch
                     )
                     loss = total_loss / self.gradient_accumulation_steps
 
-                # Update metrics
-                metrics['supervised_loss'] = sup_loss_value
-                epoch_metrics['supervised_loss'].append(sup_loss_value)
+                # Update metrics with semi-supervised losses
+                metrics['supervised_loss'] = loss_dict.get('supervised', 0)
+                metrics['method_loss'] = loss_dict.get('method', 0)
+                metrics['pseudo_loss'] = loss_dict.get('pseudo', 0)
+
+                epoch_metrics['supervised_loss'].append(loss_dict.get('supervised', 0))
+                epoch_metrics['method_loss'].append(loss_dict.get('method', 0))
+                epoch_metrics['pseudo_loss'].append(loss_dict.get('pseudo', 0))
+
             else:
-                # Standard SSL forward pass (existing code)
+                # Standard SSL forward pass (no labels)
                 if self.use_amp and self.device_manager.supports_amp:
                     with autocast():
                         loss, metrics = self.model(seg1_aug, seg2_aug)
@@ -463,6 +594,8 @@ class Trainer:
                     loss = loss / self.gradient_accumulation_steps
 
                 epoch_metrics['supervised_loss'].append(0.0)
+                epoch_metrics['method_loss'].append(0.0)
+                epoch_metrics['pseudo_loss'].append(0.0)
 
             # Backward pass
             if self.use_amp and self.scaler is not None:
@@ -484,11 +617,21 @@ class Trainer:
 
                 self.optimizer.zero_grad()
 
-                # Update momentum networks
+                # Update momentum networks (for InfoNCE)
                 if hasattr(self.model, 'module'):
                     self.model.module.update_momentum_networks()
                 else:
                     self.model.update_momentum_networks()
+
+            # Update Mean Teacher if using that method
+            if semi_method == 'mean_teacher' and hasattr(self, 'teacher_model'):
+                with torch.no_grad():
+                    alpha = self.config.config.get('semi_supervised.mean_teacher.ema_decay', 0.999)
+                    for teacher_param, student_param in zip(
+                            self.teacher_model.parameters(),
+                            self.model.parameters()
+                    ):
+                        teacher_param.data = alpha * teacher_param.data + (1 - alpha) * student_param.data
 
             # Track losses
             epoch_losses.append(loss.item() * self.gradient_accumulation_steps)
@@ -506,7 +649,9 @@ class Trainer:
                 'loss': f"{loss.item() * self.gradient_accumulation_steps:.4f}",
                 'cont': f"{metrics['loss_contrastive']:.4f}",
                 'koleo': f"{metrics.get('loss_koleo', 0):.4f}",
-                'sup': f"{metrics.get('supervised_loss', 0):.4f}",  # ADD THIS
+                'sup': f"{metrics.get('supervised_loss', 0):.4f}",
+                'method': f"{metrics.get('method_loss', 0):.4f}",
+                'pseudo': f"{metrics.get('pseudo_loss', 0):.4f}",
                 'data_t': f"{np.mean(data_times[-10:]) if data_times else 0:.3f}",
                 'batch_t': f"{np.mean(batch_times[-10:]) if batch_times else 0:.3f}"
             })
@@ -526,7 +671,9 @@ class Trainer:
             'loss_contrastive': np.mean(epoch_metrics['loss_contrastive']),
             'loss_koleo': np.mean(epoch_metrics['loss_koleo']),
             'loss_variance': np.mean(epoch_metrics['loss_variance']),
-            'supervised_loss': np.mean(epoch_metrics['supervised_loss']),  # ADD THIS
+            'supervised_loss': np.mean(epoch_metrics['supervised_loss']),
+            'method_loss': np.mean(epoch_metrics.get('method_loss', [0])),
+            'pseudo_loss': np.mean(epoch_metrics.get('pseudo_loss', [0])),
             'lr': self.optimizer.param_groups[0]['lr'],
             'avg_data_time': np.mean(data_times) if data_times else 0,
             'avg_batch_time': np.mean(batch_times) if batch_times else 0
@@ -535,15 +682,20 @@ class Trainer:
         # Add memory stats if CUDA
         if self.device_manager.is_cuda:
             mem_stats = self.device_manager.memory_stats()
+            stats['gpu_memory_gb'] = mem_stats.get('allocated', 0)
+
+        # Print detailed metrics every 5 epochs
         if epoch % 5 == 0:
             print(f"\nDetailed metrics at epoch {epoch}:")
             print(f"  Loss components:")
-            print(f"    {stats}")
+            for key, value in stats.items():
+                if 'loss' in key or key in ['lr', 'gpu_memory_gb']:
+                    print(f"    {key}: {value:.4f}")
 
         return stats
 
     def validate(self, epoch: int) -> Dict:
-        """Validate model with device optimizations."""
+        """Validate model with device optimizations and semi-supervised metrics."""
         self.model.eval()
 
         val_losses = []
@@ -551,8 +703,20 @@ class Trainer:
             'loss_contrastive': [],
             'loss_koleo': [],
             'loss_variance': [],
-            'supervised_loss': []
+            'supervised_loss': [],
+            'method_loss': [],  # Add for consistency with train
+            'pseudo_loss': []  # Add for consistency with train
         }
+
+        # Initialize supervised metrics tracking if using semi-supervised
+        if self.use_supervised:
+            supervised_performance = {
+                'age_correct': 0,
+                'age_total': 0,
+                'bmi_errors': [],
+                'sex_correct': 0,
+                'sex_total': 0
+            }
 
         with torch.no_grad():
             pbar = tqdm(self.val_loader, desc=f"Epoch {epoch + 1} [Val]")
@@ -561,7 +725,7 @@ class Trainer:
                 has_labels = False
                 labels = None
 
-                # Handle both 2 and 3 element batches
+                # Handle both 2 and 3 element batches (backward compatible)
                 if len(batch) == 3:
                     seg1, seg2, labels = batch
                     has_labels = True
@@ -585,21 +749,102 @@ class Trainer:
                     seg1 = seg1.to(self.device)
                     seg2 = seg2.to(self.device)
 
-                # Compute loss (with optional supervised component)
+                # Compute loss (backward compatible)
                 if self.use_supervised and has_labels and labels is not None:
-                    # Get predictions for supervised loss calculation
+                    # Semi-supervised validation
                     if self.use_amp and self.device_manager.supports_amp:
                         with autocast():
-                            ssl_loss, metrics, predictions = self.model(seg1, seg2, return_predictions=True)
-                            _, sup_loss_value = self.semi_supervised_loss(ssl_loss, predictions, labels)
+                            # Get predictions from model
+                            result = self.model(seg1, seg2, return_predictions=True)
+
+                            # Handle different return formats (backward compatible)
+                            if len(result) == 4:
+                                ssl_loss, metrics, predictions, predictions_aug = result
+                            else:
+                                ssl_loss, metrics, predictions = result
+                                predictions_aug = None
+
+                            # Calculate semi-supervised loss
+                            if hasattr(self, 'semi_supervised_loss'):
+                                # Use the new enhanced loss function if available
+                                if hasattr(self.semi_supervised_loss, 'forward'):
+                                    total_loss, loss_dict = self.semi_supervised_loss(
+                                        ssl_loss, predictions, labels,
+                                        predictions_aug=predictions_aug,
+                                        epoch=epoch
+                                    )
+                                    sup_loss_value = loss_dict.get('supervised', 0)
+                                else:
+                                    # Fallback to old format
+                                    total_loss, sup_loss_value = self.semi_supervised_loss(
+                                        ssl_loss, predictions, labels
+                                    )
+                            else:
+                                sup_loss_value = 0
                     else:
-                        ssl_loss, metrics, predictions = self.model(seg1, seg2, return_predictions=True)
-                        _, sup_loss_value = self.semi_supervised_loss(ssl_loss, predictions, labels)
+                        # Same without AMP
+                        result = self.model(seg1, seg2, return_predictions=True)
+
+                        if len(result) == 4:
+                            ssl_loss, metrics, predictions, predictions_aug = result
+                        else:
+                            ssl_loss, metrics, predictions = result
+                            predictions_aug = None
+
+                        if hasattr(self, 'semi_supervised_loss'):
+                            if hasattr(self.semi_supervised_loss, 'forward'):
+                                total_loss, loss_dict = self.semi_supervised_loss(
+                                    ssl_loss, predictions, labels,
+                                    predictions_aug=predictions_aug,
+                                    epoch=epoch
+                                )
+                                sup_loss_value = loss_dict.get('supervised', 0)
+                            else:
+                                total_loss, sup_loss_value = self.semi_supervised_loss(
+                                    ssl_loss, predictions, labels
+                                )
+                        else:
+                            sup_loss_value = 0
 
                     val_metrics['supervised_loss'].append(sup_loss_value)
+                    val_metrics['method_loss'].append(loss_dict.get('method', 0) if 'loss_dict' in locals() else 0)
+                    val_metrics['pseudo_loss'].append(loss_dict.get('pseudo', 0) if 'loss_dict' in locals() else 0)
+
+                    # Track supervised head performance (NEW)
+                    if self.use_supervised and 'predictions' in locals():
+                        # Age accuracy
+                        if 'age_class' in predictions and 'age' in labels:
+                            age_pred = torch.argmax(predictions['age_class'], dim=1)
+                            age_true = (labels['age'] > 50).long()
+                            valid_mask = labels['age'] >= 0
+                            if valid_mask.any():
+                                supervised_performance['age_correct'] += (
+                                            age_pred[valid_mask] == age_true[valid_mask]).sum().item()
+                                supervised_performance['age_total'] += valid_mask.sum().item()
+
+                        # BMI error
+                        if 'bmi' in predictions and 'bmi' in labels:
+                            valid_mask = labels['bmi'] > 0
+                            if valid_mask.any():
+                                bmi_pred = predictions['bmi'][valid_mask].squeeze()
+                                # Denormalize predictions
+                                bmi_pred_actual = bmi_pred * 15.0 + 20.0
+                                bmi_error = torch.abs(bmi_pred_actual - labels['bmi'][valid_mask]).mean().item()
+                                supervised_performance['bmi_errors'].append(bmi_error)
+
+                        # Sex accuracy
+                        if 'sex' in predictions and 'sex' in labels:
+                            sex_pred = torch.argmax(predictions['sex'], dim=1)
+                            valid_mask = labels['sex'] >= 0
+                            if valid_mask.any():
+                                supervised_performance['sex_correct'] += (
+                                            sex_pred[valid_mask] == labels['sex'][valid_mask]).sum().item()
+                                supervised_performance['sex_total'] += valid_mask.sum().item()
+
                     loss = ssl_loss  # Use only SSL loss for validation tracking
+
                 else:
-                    # Standard validation without supervised loss
+                    # Standard validation without supervised loss (backward compatible)
                     if self.use_amp and self.device_manager.supports_amp:
                         with autocast():
                             loss, metrics = self.model(seg1, seg2)
@@ -607,6 +852,8 @@ class Trainer:
                         loss, metrics = self.model(seg1, seg2)
 
                     val_metrics['supervised_loss'].append(0.0)
+                    val_metrics['method_loss'].append(0.0)
+                    val_metrics['pseudo_loss'].append(0.0)
 
                 val_losses.append(loss.item())
                 val_metrics['loss_contrastive'].append(metrics['loss_contrastive'])
@@ -621,8 +868,27 @@ class Trainer:
             'loss_contrastive': np.mean(val_metrics['loss_contrastive']),
             'loss_koleo': np.mean(val_metrics['loss_koleo']),
             'loss_variance': np.mean(val_metrics['loss_variance']),
-            'supervised_loss': np.mean(val_metrics['supervised_loss'])
+            'supervised_loss': np.mean(val_metrics['supervised_loss']),
+            'method_loss': np.mean(val_metrics.get('method_loss', [0])),
+            'pseudo_loss': np.mean(val_metrics.get('pseudo_loss', [0]))
         }
+
+        # Add supervised head performance metrics (NEW)
+        if self.use_supervised and supervised_performance['age_total'] > 0:
+            stats['age_acc'] = supervised_performance['age_correct'] / supervised_performance['age_total']
+
+        if self.use_supervised and supervised_performance['bmi_errors']:
+            stats['bmi_mae'] = np.mean(supervised_performance['bmi_errors'])
+
+        if self.use_supervised and supervised_performance['sex_total'] > 0:
+            stats['sex_acc'] = supervised_performance['sex_correct'] / supervised_performance['sex_total']
+
+        # Print supervised metrics if available
+        if self.use_supervised and 'age_acc' in stats:
+            print(f"\n  Validation supervised performance:")
+            print(f"    Age Acc: {stats.get('age_acc', 0):.3f}")
+            print(f"    BMI MAE: {stats.get('bmi_mae', 0):.2f}")
+            print(f"    Sex Acc: {stats.get('sex_acc', 0):.3f}")
 
         return stats
     def apply_warmup(self, epoch: int):
