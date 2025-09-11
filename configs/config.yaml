@@ -272,7 +272,7 @@ finetune:
 semi_supervised:
   enabled: true
   supervised_weight: 0.01  # Very small weight to start
-  method: 'mean_teacher'  # Choose your method
+  method: 'mixmatch'  # Choose your method
 
   # Standard options (work with all methods)
   use_pseudo: true
