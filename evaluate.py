@@ -440,7 +440,7 @@ class DownstreamEvaluator:
             modality=modality
         )
 
-        checkpoint = torch.load(self.encoder_path, map_location=self.device)
+        checkpoint = torch.load(self.encoder_path, map_location=self.device, weights_only=False)
         if isinstance(checkpoint, dict):
             if 'encoder_state_dict' in checkpoint:
                 self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
