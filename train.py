@@ -141,7 +141,7 @@ class Trainer:
         """Setup data loaders with dataset type support."""
         semi_supervised_enabled = self.config.config.get('semi_supervised', {}).get('enabled', False)
         # Only return labels during training phase
-        return_labels = semi_supervised_enabled and self.phase in ['pretrain', 'finetune', '']
+        return_labels = semi_supervised_enabled and self.phase in ['pretrain', 'finetune']
         if dataset_type is None:
             if self.phase == 'pretrain':
                 dataset_type = 'vitaldb'
@@ -669,6 +669,14 @@ class Trainer:
 
         # Resume if specified
         start_epoch = 0
+        supervised_evaluator = None
+        if self.use_supervised:
+            from evaluate import DownstreamEvaluator
+            # Create a dummy evaluator (we just need the method)
+            supervised_evaluator = DownstreamEvaluator(
+                encoder_path='dummy',  # We'll pass the model directly
+                device_manager=self.device_manager
+            )
         if resume_from:
             print(f"\nResuming from checkpoint: {resume_from}")
             if hasattr(self.model, 'module'):
@@ -839,7 +847,20 @@ class Trainer:
 
         # Print training summary
         self.print_training_summary()
+        if self.use_supervised and supervised_evaluator and epoch % 5 == 0:
+            print("\nEvaluating supervised heads...")
+            head_metrics = supervised_evaluator.evaluate_supervised_heads(
+                self.model,  # Pass the model
+                self.val_loader.dataset  # Pass the validation dataset
+            )
 
+            print("Supervised Head Performance:")
+            for metric, value in head_metrics.items():
+                print(f"  {metric}: {value:.4f}")
+
+            # Log to history
+            if 'supervised_metrics' not in self.val_history[-1]:
+                self.val_history[-1]['supervised_metrics'] = head_metrics
         return self.checkpoint_dir
 
     def print_training_summary(self):

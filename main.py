@@ -700,6 +700,128 @@ def run_full_extended(args, device_manager):
     return all_results
 
 
+def run_eval_supervised(args, device_manager):
+    """Evaluate supervised heads of a semi-supervised model."""
+    logger.info("Evaluating supervised heads")
+
+    # Load checkpoint
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_path = checkpoint_dir / "best_model.pt"
+
+    if not checkpoint_path.exists():
+        checkpoint_path = checkpoint_dir / "final_model.pt"
+
+    if not checkpoint_path.exists():
+        logger.error(f"No model found in {checkpoint_dir}")
+        return None
+
+    # Load model
+    from ssl_model import create_ssl_model
+    from model import EfficientNet1D, ProjectionHead
+    from config_loader import get_config
+
+    config = get_config()
+
+    # Get model dimensions from config
+    embedding_dim = config.get('model.embedding_dim', 256)
+    projection_dim = config.get('model.projection_dim', 128)
+
+    # Create model architecture
+    encoder = EfficientNet1D(
+        in_channels=1,
+        embedding_dim=embedding_dim,
+        modality=args.modality
+    )
+    projection_head = ProjectionHead(
+        input_dim=embedding_dim,
+        output_dim=projection_dim
+    )
+
+    # Create SSL model with supervised heads
+    model = create_ssl_model(
+        encoder=encoder,
+        projection_head=projection_head,
+        ssl_method=args.ssl_method,
+        use_supervised=True  # Must be True to have heads
+    )
+
+    # Load checkpoint - handle different checkpoint formats
+    checkpoint = torch.load(checkpoint_path, map_location=device_manager.device, weights_only=False)
+
+    # The checkpoint structure depends on how it was saved
+    if 'encoder_state_dict' in checkpoint:
+        # Load encoder weights
+        model.encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
+
+        # Load projection head if available
+        if 'projection_state_dict' in checkpoint:
+            model.projection_head.load_state_dict(checkpoint['projection_state_dict'], strict=False)
+
+        # Load supervised heads if available
+        if 'age_classifier_state_dict' in checkpoint:
+            model.age_classifier.load_state_dict(checkpoint['age_classifier_state_dict'], strict=False)
+        if 'bmi_regressor_state_dict' in checkpoint:
+            model.bmi_regressor.load_state_dict(checkpoint['bmi_regressor_state_dict'], strict=False)
+        if 'sex_classifier_state_dict' in checkpoint:
+            model.sex_classifier.load_state_dict(checkpoint['sex_classifier_state_dict'], strict=False)
+    else:
+        # Try loading the full model state
+        try:
+            model.load_state_dict(checkpoint, strict=False)
+        except:
+            logger.error("Could not load model weights - checkpoint format not recognized")
+            return None
+
+    model = model.to(device_manager.device)
+    model.eval()
+
+    # Create dataset using the same method as evaluate_extended
+    from data import create_dataloaders
+
+    # Determine dataset type
+    dataset_type = args.dataset_type if hasattr(args, 'dataset_type') else 'but_ppg'
+
+    # Create data loaders with labels
+    _, _, test_loader = create_dataloaders(
+        data_dir=args.data_dir if dataset_type == 'but_ppg' else None,
+        modality=args.modality,
+        batch_size=32,
+        num_workers=0,
+        dataset_type=dataset_type,
+        return_labels=True,  # Important: need labels for evaluation
+        downsample=args.downsample if hasattr(args, 'downsample') else False
+    )
+
+    # Create evaluator
+    from evaluate import DownstreamEvaluator
+    evaluator = DownstreamEvaluator(
+        encoder_path='dummy',  # Not used, we pass model directly
+        device_manager=device_manager
+    )
+
+    # Evaluate supervised heads using the test dataset
+    metrics = evaluator.evaluate_supervised_heads(model, test_loader.dataset)
+
+    print("\n" + "=" * 60)
+    print("SUPERVISED HEAD EVALUATION RESULTS")
+    print("=" * 60)
+
+    if metrics:
+        for metric, value in metrics.items():
+            print(f"{metric:15s}: {value:.4f}")
+
+        # Save results
+        results_path = checkpoint_dir / f"supervised_head_results_{dataset_type}.json"
+        import json
+        with open(results_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+        logger.info(f"Results saved to {results_path}")
+    else:
+        print("No metrics returned - check if model has supervised heads")
+        logger.warning("No supervised metrics computed")
+
+    return metrics
 def run_test(args):
     """Run tests for specified modules."""
     if args.module in ['all', 'data']:
@@ -727,7 +849,7 @@ def main():
     # === GLOBAL ARGUMENTS (available for all commands) ===
     parser.add_argument('command',
                         choices=['pretrain', 'finetune', 'evaluate', 'compare',
-                                 'train', 'full', 'test'],
+                                 'train', 'full', 'test', 'eval-supervised'],  # Added
                         help='Command to run')
 
     parser.add_argument('--modality', type=str,
@@ -850,7 +972,8 @@ def main():
         'compare': run_compare_extended,  # Use extended version
         'train': run_train,
         'full': run_full_extended,  # Use extended version
-        'test': lambda args, dm: run_test(args)
+        'test': lambda args, dm: run_test(args),
+        'eval-supervised': run_eval_supervised,
     }
 
     # Execute the command

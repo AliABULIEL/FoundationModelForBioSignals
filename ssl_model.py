@@ -16,10 +16,11 @@ from config_loader import get_config  # Added ConfigLoader
 
 
 class SemiSupervisedLoss(nn.Module):
-    def __init__(self, alpha=0.3, age_threshold=50):
+    def __init__(self, alpha=0.01, age_threshold=50):  # Use smaller alpha
         super().__init__()
         self.config = get_config()
         self.alpha = self.config.config.get('semi_supervised', {}).get('supervised_weight', 0.3)
+
         self.age_threshold = age_threshold
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
         self.mse_loss = nn.MSELoss()
@@ -27,13 +28,11 @@ class SemiSupervisedLoss(nn.Module):
     def forward(self, ssl_loss, predictions, labels):
         supervised_losses = []
 
-        # Convert age to binary classification
+        # Age classification (binary)
         if 'age' in labels and 'age_class' in predictions:
             age_values = labels['age']
-            valid_mask = age_values >= 0  # Valid ages
-
+            valid_mask = age_values >= 0
             if valid_mask.any():
-                # Convert to binary: 1 if >50, 0 if <=50
                 age_binary = (age_values > self.age_threshold).long()
                 age_loss = self.ce_loss(
                     predictions['age_class'][valid_mask],
@@ -41,17 +40,19 @@ class SemiSupervisedLoss(nn.Module):
                 )
                 supervised_losses.append(age_loss)
 
-        # BMI regression
+        # BMI regression - NORMALIZE!
         if 'bmi' in labels and 'bmi' in predictions:
             valid_mask = labels['bmi'] > 0
             if valid_mask.any():
-                bmi_loss = self.mse_loss(
-                    predictions['bmi'][valid_mask].squeeze(),
-                    labels['bmi'][valid_mask]
-                )
+                # Normalize BMI to ~[0,1] range
+                bmi_normalized = (labels['bmi'][valid_mask] - 20.0) / 15.0  # BMI 20-35 range
+                bmi_normalized = torch.clamp(bmi_normalized, 0, 2)  # Clip outliers
+
+                bmi_pred = predictions['bmi'][valid_mask].squeeze()
+                bmi_loss = self.mse_loss(bmi_pred, bmi_normalized)
                 supervised_losses.append(bmi_loss)
 
-        # Sex classification (already 0/1)
+        # Sex classification
         if 'sex' in labels and 'sex' in predictions:
             valid_mask = labels['sex'] >= 0
             if valid_mask.any():
@@ -63,6 +64,9 @@ class SemiSupervisedLoss(nn.Module):
 
         if supervised_losses:
             supervised_loss = torch.mean(torch.stack(supervised_losses))
+            # Clip to prevent spikes
+            supervised_loss = torch.clamp(supervised_loss, max=10.0)
+
             total_loss = (1 - self.alpha) * ssl_loss + self.alpha * supervised_loss
             return total_loss, supervised_loss.item()
         else:
@@ -239,26 +243,41 @@ class SSLModel(nn.Module):
             embedding_dim = encoder(dummy).shape[1]
         ssl_config = self.config.get_ssl_config('infonce')
         if self.use_supervised:
-            # Add task-specific heads
+            # Initialize heads with better architecture
+            hidden_dim = 128  # Larger hidden layer
+
             self.age_classifier = nn.Sequential(
-                nn.Linear(embedding_dim, 64),
+                nn.Linear(embedding_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(hidden_dim, 64),
                 nn.ReLU(),
                 nn.Dropout(0.2),
-                nn.Linear(64, 2)  # Binary: >50 or ≤50
+                nn.Linear(64, 2)
             )
 
             self.bmi_regressor = nn.Sequential(
-                nn.Linear(embedding_dim, 64),
+                nn.Linear(embedding_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(hidden_dim, 64),
                 nn.ReLU(),
                 nn.Dropout(0.2),
-                nn.Linear(64, 1)  # Regression
+                nn.Linear(64, 1),
+                nn.Sigmoid()  # Output in [0,1] for normalized BMI
             )
 
             self.sex_classifier = nn.Sequential(
-                nn.Linear(embedding_dim, 64),
+                nn.Linear(embedding_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(hidden_dim, 64),
                 nn.ReLU(),
                 nn.Dropout(0.2),
-                nn.Linear(64, 2)  # Binary: M/F
+                nn.Linear(64, 2)
             )
         if ssl_method == 'simsiam':
             simsiam_config = self.config.get_ssl_config('simsiam')

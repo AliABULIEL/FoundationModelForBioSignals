@@ -199,6 +199,147 @@ class DownstreamEvaluator:
             mem_stats = self.device_manager.memory_stats()
             print(f"  GPU memory available: {mem_stats.get('free', 0):.2f} GB")
 
+    def evaluate_supervised_heads(self, model, dataset):
+        """
+        Evaluate the supervised heads directly during training.
+        This is useful for monitoring semi-supervised training progress.
+        """
+        from torch.utils.data import DataLoader
+        from sklearn.metrics import accuracy_score, mean_absolute_error
+
+        # Ensure model is in eval mode
+        model.eval()
+
+        all_preds = {'age': [], 'bmi': [], 'sex': []}
+        all_labels = {'age': [], 'bmi': [], 'sex': []}
+
+        # Create dataloader
+        loader = DataLoader(
+            dataset,
+            batch_size=32,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=self.device_manager.is_cuda
+        )
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                # Handle different batch formats
+                seg1 = None
+                labels = None
+
+                if len(batch) == 3:  # (seg1, seg2, labels)
+                    seg1, seg2, labels = batch
+                elif len(batch) == 2:  # (seg1, seg2)
+                    seg1, seg2 = batch
+                    continue  # Skip if no labels
+                else:
+                    continue
+
+                if labels is None or not isinstance(labels, dict):
+                    continue
+
+                # Move to device
+                seg1 = seg1.to(self.device)
+
+                # Get embeddings from encoder (not the full model)
+                if hasattr(model, 'encoder'):
+                    embeddings = model.encoder(seg1)
+                elif hasattr(model, 'module') and hasattr(model.module, 'encoder'):
+                    embeddings = model.module.encoder(seg1)
+                else:
+                    print("ERROR: Cannot find encoder in model")
+                    continue
+
+                # Get predictions from supervised heads
+                # Age classification (binary: >50)
+                if (hasattr(model, 'age_classifier') or
+                        (hasattr(model, 'module') and hasattr(model.module, 'age_classifier'))):
+
+                    if hasattr(model, 'module'):
+                        age_logits = model.module.age_classifier(embeddings)
+                    else:
+                        age_logits = model.age_classifier(embeddings)
+
+                    age_pred = torch.argmax(age_logits, dim=1)
+
+                    if 'age' in labels:
+                        age_values = labels['age']
+                        # Convert to binary (>50)
+                        age_binary = (age_values > 50).long()
+
+                        # Filter valid ages
+                        valid_mask = age_values >= 0
+                        if valid_mask.any():
+                            all_preds['age'].extend(age_pred[valid_mask].cpu().numpy())
+                            all_labels['age'].extend(age_binary[valid_mask].cpu().numpy())
+
+                # BMI regression
+                if (hasattr(model, 'bmi_regressor') or
+                        (hasattr(model, 'module') and hasattr(model.module, 'bmi_regressor'))):
+
+                    if hasattr(model, 'module'):
+                        bmi_pred = model.module.bmi_regressor(embeddings)
+                    else:
+                        bmi_pred = model.bmi_regressor(embeddings)
+
+                    # If using sigmoid output, denormalize
+                    if bmi_pred.min() >= 0 and bmi_pred.max() <= 1:
+                        bmi_pred = bmi_pred * 15.0 + 20.0  # Map [0,1] to [20,35]
+
+                    if 'bmi' in labels:
+                        bmi_values = labels['bmi']
+                        valid_mask = bmi_values > 0
+                        if valid_mask.any():
+                            all_preds['bmi'].extend(bmi_pred[valid_mask].squeeze().cpu().numpy())
+                            all_labels['bmi'].extend(bmi_values[valid_mask].cpu().numpy())
+
+                # Sex classification (binary)
+                if (hasattr(model, 'sex_classifier') or
+                        (hasattr(model, 'module') and hasattr(model.module, 'sex_classifier'))):
+
+                    if hasattr(model, 'module'):
+                        sex_logits = model.module.sex_classifier(embeddings)
+                    else:
+                        sex_logits = model.sex_classifier(embeddings)
+
+                    sex_pred = torch.argmax(sex_logits, dim=1)
+
+                    if 'sex' in labels:
+                        sex_values = labels['sex'].long()
+                        valid_mask = sex_values >= 0
+                        if valid_mask.any():
+                            all_preds['sex'].extend(sex_pred[valid_mask].cpu().numpy())
+                            all_labels['sex'].extend(sex_values[valid_mask].cpu().numpy())
+
+        # Calculate metrics
+        metrics = {}
+
+        if len(all_preds['age']) > 0 and len(all_labels['age']) > 0:
+            try:
+                metrics['age_acc'] = accuracy_score(all_labels['age'], all_preds['age'])
+            except Exception as e:
+                print(f"Error calculating age accuracy: {e}")
+                metrics['age_acc'] = 0.0
+
+        if len(all_preds['bmi']) > 0 and len(all_labels['bmi']) > 0:
+            try:
+                metrics['bmi_mae'] = mean_absolute_error(all_labels['bmi'], all_preds['bmi'])
+            except Exception as e:
+                print(f"Error calculating BMI MAE: {e}")
+                metrics['bmi_mae'] = 0.0
+
+        if len(all_preds['sex']) > 0 and len(all_labels['sex']) > 0:
+            try:
+                metrics['sex_acc'] = accuracy_score(all_labels['sex'], all_preds['sex'])
+            except Exception as e:
+                print(f"Error calculating sex accuracy: {e}")
+                metrics['sex_acc'] = 0.0
+
+        # Set model back to train mode
+        model.train()
+
+        return metrics
     def _load_tasks_from_config(self) -> Dict:
         """Load task definitions from configuration."""
         eval_config = self.config.get_evaluation_config()
