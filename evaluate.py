@@ -186,7 +186,9 @@ class DownstreamEvaluator:
         self._cached_pids = None
 
         # Load encoder
-        self._load_encoder()
+        if encoder_path != 'dummy':
+            # Load encoder
+            self._load_encoder()
 
         # Define tasks from config
         self.tasks = self._load_tasks_from_config()
