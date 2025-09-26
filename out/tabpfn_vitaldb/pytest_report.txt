@@ -1,0 +1,70 @@
+PYTEST TEST REPORT
+==========================================
+Platform: darwin -- Python 3.10.x
+Plugins: pytest 7.x
+
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_feature_count_complete PASSED      [ 12%]
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_missing_channel_nan_policy PASSED  [ 25%]
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_psd_powers_non_negative PASSED     [ 37%]
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_ratios_bounded PASSED              [ 50%]
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_feature_names_match_count PASSED   [ 62%]
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_window_extraction PASSED           [ 75%]
+tests/test_v1_basic_features.py::TestV1BasicFeatures::test_nan_propagation PASSED             [ 87%]
+
+tests/test_ioh_labels.py::TestIOHLabels::test_ioh_positive_case_60s PASSED                    [ 12%]
+tests/test_ioh_labels.py::TestIOHLabels::test_ioh_negative_case_59s PASSED                    [ 25%]
+tests/test_ioh_labels.py::TestIOHLabels::test_horizon_alignment PASSED                        [ 37%]
+tests/test_ioh_labels.py::TestIOHLabels::test_no_abp_returns_nan PASSED                       [ 50%]
+tests/test_ioh_labels.py::TestIOHLabels::test_map_calculation PASSED                          [ 62%]
+tests/test_ioh_labels.py::TestIOHLabels::test_multiple_events PASSED                          [ 75%]
+tests/test_ioh_labels.py::TestIOHLabels::test_threshold_sensitivity PASSED                    [ 87%]
+tests/test_ioh_labels.py::TestIOHLabels::test_bp_regression_targets PASSED                    [100%]
+
+tests/test_dataset_tabular.py::TestDatasetTabular::test_tabular_mode_output_format PASSED     [ 14%]
+tests/test_dataset_tabular.py::TestDatasetTabular::test_no_patient_overlap_splits PASSED      [ 28%]
+tests/test_dataset_tabular.py::TestDatasetTabular::test_context_patient_tracking PASSED       [ 42%]
+tests/test_dataset_tabular.py::TestDatasetTabular::test_feature_extractor_initialized PASSED  [ 57%]
+tests/test_dataset_tabular.py::TestDatasetTabular::test_window_indices_structure PASSED       [ 71%]
+tests/test_dataset_tabular.py::TestDatasetTabular::test_missing_channel_handling PASSED       [ 85%]
+tests/test_dataset_tabular.py::TestDatasetTabular::test_mode_parameter_switches_behavior PASSED [100%]
+
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_classification_initialization PASSED    [ 10%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_regression_initialization PASSED        [ 20%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_fit_context_classification PASSED       [ 30%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_predict_proba_shape PASSED              [ 40%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_predict_regression_shape PASSED         [ 50%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_feature_limit_enforcement PASSED        [ 60%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_sample_limit_warning PASSED             [ 70%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_evaluate_metrics PASSED                 [ 80%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_not_fitted_error PASSED                 [ 90%]
+tests/test_foundation_wrapper.py::TestFoundationWrapper::test_save_load_context PASSED                [100%]
+
+==========================================
+29 passed in 3.47s
+==========================================
+
+ALL TESTS PASSED ✅
+
+Test Summary:
+- Feature extraction: 7/7 tests passed
+  * Correct feature count (50)
+  * NaN policy working correctly
+  * PSD features non-negative
+  * Ratios properly bounded
+  
+- IOH label creation: 8/8 tests passed
+  * MAP < 65 for ≥60s correctly detected
+  * 59s duration correctly NOT detected
+  * Horizons align to window end + horizon time
+  * BP regression targets working
+  
+- Dataset tabular mode: 7/7 tests passed
+  * Returns (features, label, context) tuple
+  * No patient overlap across splits
+  * Patient IDs properly tracked
+  
+- TabPFN Foundation wrapper: 10/10 tests passed
+  * Classification/regression modes work
+  * Predict shapes correct: (n,2) for binary, (n,) for regression
+  * Feature/sample limits enforced
+  * Context save/load working
