@@ -1,0 +1,84 @@
+# TabPFN v2 Configuration for VitalDB
+# Default settings for tabular mode with IOH prediction
+
+# Dataset settings
+dataset:
+  type: vitaldb
+  mode: tabular  # 'timeseries' | 'tabular'
+  feature_set: v1_basic  # 50 features
+  window_sec: 10.0
+  overlap: 0.5
+  cache_dir: data/vitaldb_cache
+  feature_cache_dir: data/feature_cache
+
+# Task settings
+task:
+  target: ioh  # 'ioh' | 'bp'
+  horizon_min: 5  # Prediction horizon in minutes
+  
+  # IOH specific
+  ioh:
+    horizons: [5, 10, 15]  # Multiple horizons
+    map_threshold: 65  # mmHg
+    min_duration: 60  # seconds
+  
+  # BP regression specific  
+  bp:
+    targets: [SBP, DBP, MAP]
+    horizon_min: 5
+
+# TabPFN model settings
+model:
+  type: TabPFNFoundation
+  task_type: classification  # 'classification' | 'regression'
+  device: cuda
+  N_ensemble_configurations: 4
+  max_features: 500
+  use_auto_optimizer: false
+
+# Training settings
+training:
+  context_size: 1000  # In-context learning samples
+  query_size: 500  # Query/test samples
+  class_balance: true  # Balance classes in context
+  patient_aware_split: true  # No patient leakage
+  
+  # Context selection strategy
+  context_selection:
+    method: stratified  # 'random' | 'stratified' | 'diverse'
+    min_samples_per_class: 100
+    max_samples_per_patient: 10
+
+# Evaluation settings
+evaluation:
+  metrics:
+    - accuracy
+    - roc_auc
+    - f1_score
+    - confusion_matrix
+  cross_validation:
+    enabled: false
+    n_folds: 5
+
+# Data splits
+splits:
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+
+# Logging
+logging:
+  output_dir: out/tabpfn_vitaldb
+  save_predictions: true
+  save_context: true
+  verbose: true
+
+# Feature engineering
+features:
+  v1_basic:
+    statistical: 15
+    frequency: 12
+    morphological: 13
+    cross_modal: 1
+    temporal_complexity: 9
+    total: 50

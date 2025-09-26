@@ -22,6 +22,14 @@ import threading
 
 from config_loader import get_config
 
+# Import TabPFN modules if in tabular mode
+try:
+    from data.features_vitaldb import VitalDBFeatureExtractor, FeatureConfig
+    from data.labels_vitaldb import VitalDBLabelCreator, LabelConfig
+    TABPFN_AVAILABLE = True
+except ImportError:
+    TABPFN_AVAILABLE = False
+
 warnings.filterwarnings('ignore')
 
 
@@ -136,7 +144,15 @@ class VitalDBDataset(BaseSignalDataset):
             cache_size: int = 500,
             return_labels: bool = False,  # Enable demographics
             return_participant_id: bool = False,  # Enable case ID return
-
+            # TabPFN tabular mode additions
+            mode: str = 'timeseries',  # 'timeseries' | 'tabular'
+            feature_set: str = 'v1_basic',
+            window_sec: float = 10.0,
+            hop_sec: float = 5.0,
+            overlap: float = 0.5,
+            target_task: str = 'ioh',  # 'ioh' | 'bp'
+            horizon_min: float = 5.0,
+            feature_cache_dir: Optional[str] = None,
             **kwargs
     ):
         # Load config
@@ -144,6 +160,15 @@ class VitalDBDataset(BaseSignalDataset):
         vitaldb_config = self.config.config.get('vitaldb', {})
         self.return_labels = return_labels
         self.return_participant_id = return_participant_id
+        
+        # TabPFN mode settings
+        self.mode = mode
+        self.feature_set = feature_set
+        self.window_sec = window_sec
+        self.hop_sec = hop_sec if hop_sec else window_sec * (1 - overlap)
+        self.target_task = target_task
+        self.horizon_min = horizon_min
+        self.feature_cache_dir = Path(feature_cache_dir) if feature_cache_dir else None
 
 
 
@@ -252,19 +277,27 @@ class VitalDBDataset(BaseSignalDataset):
         else:
             self.cases = self.cases[val_end:]
 
-        # Build SAME-PATIENT pairs
-        self.segment_pairs = self._build_same_patient_pairs()
-
-        # Shuffle pairs
-        if self.random_seed is not None:
-            np.random.seed(self.random_seed)
-            np.random.shuffle(self.segment_pairs)
+        # Build SAME-PATIENT pairs or window indices based on mode
+        if self.mode == 'tabular':
+            self._init_tabular_mode()
+        else:
+            self.segment_pairs = self._build_same_patient_pairs()
+            # Shuffle pairs
+            if self.random_seed is not None:
+                np.random.seed(self.random_seed)
+                np.random.shuffle(self.segment_pairs)
 
         print(f"\nVitalDB Dataset initialized for {split}:")
+        print(f"  Mode: {self.mode}")
         print(f"  Modality: {modality} (track: {self.track_name})")
         print(f"  Cases: {len(self.cases)}")
-        print(f"  Pairs: {len(self.segment_pairs)}")
-        print(f"  Segment: {self.segment_length_sec}s @ {self.target_fs}Hz = {self.segment_length} samples")
+        if self.mode == 'tabular':
+            print(f"  Feature set: {self.feature_set}")
+            print(f"  Window: {self.window_sec}s, Hop: {self.hop_sec}s")
+            print(f"  Target: {self.target_task} @ {self.horizon_min}min")
+        else:
+            print(f"  Pairs: {len(self.segment_pairs)}")
+            print(f"  Segment: {self.segment_length_sec}s @ {self.target_fs}Hz = {self.segment_length} samples")
         print(f"  Cache: {self.cache_dir}")
 
     # Add this method to VitalDBDataset class
@@ -408,11 +441,138 @@ class VitalDBDataset(BaseSignalDataset):
 
         return pairs
 
+    def _init_tabular_mode(self):
+        """Initialize components for tabular mode."""
+        if not TABPFN_AVAILABLE:
+            raise ImportError("TabPFN modules not available. Check data/features_vitaldb.py and data/labels_vitaldb.py")
+        
+        # Feature extractor
+        feature_config = FeatureConfig(
+            window_sec=self.window_sec,
+            hop_sec=self.hop_sec,
+            feature_set=self.feature_set,
+            sampling_rates={'ppg': 25, 'ecg': 125, 'abp': 100},
+            cache_dir=self.feature_cache_dir
+        )
+        self.feature_extractor = VitalDBFeatureExtractor(feature_config)
+        
+        # Label creator
+        label_config = LabelConfig(
+            target_task=self.target_task,
+            horizon_min=self.horizon_min,
+            ioh_threshold_map=65.0,
+            ioh_duration_sec=60.0
+        )
+        self.label_creator = VitalDBLabelCreator(label_config)
+        
+        # Build window indices instead of pairs
+        self.window_indices = []
+        for case_id in self.cases:
+            # We'll determine actual windows when loading
+            self.window_indices.append({'case_id': case_id})
+    
     def __len__(self):
+        if self.mode == 'tabular':
+            # Estimate based on cases and typical windows per case
+            return len(self.cases) * 100  # Approximate
         return len(self.segment_pairs) if self.segment_pairs else 1
 
     def __getitem__(self, idx):
-        """Get TWO segments from SAME patient - with optional demographics."""
+        """Get item based on mode (timeseries pairs or tabular features)."""
+        
+        if self.mode == 'tabular':
+            return self._getitem_tabular(idx)
+        else:
+            return self._getitem_timeseries(idx)
+    
+    def _getitem_tabular(self, idx):
+        """Get tabular features and labels for TabPFN."""
+        # Get case
+        case_idx = idx % len(self.cases)
+        case_id = self.cases[case_idx]
+        
+        # Load signals
+        signals = {}
+        
+        # Load PPG if available
+        if self.track_name == 'PLETH' or self.modality == 'ppg':
+            ppg_signal = self.vitaldb.load_case(case_id, ['PLETH'])
+            if ppg_signal is not None and len(ppg_signal) > 0:
+                if isinstance(ppg_signal, np.ndarray):
+                    if ppg_signal.ndim == 2:
+                        ppg_signal = ppg_signal[:, 0]
+                    signals['ppg'] = ppg_signal[~np.isnan(ppg_signal)]
+        
+        # Load ECG if available
+        if self.modality == 'ecg' or self.modality == 'multi':
+            ecg_signal = self.vitaldb.load_case(case_id, ['ECG_II'])
+            if ecg_signal is not None and len(ecg_signal) > 0:
+                if isinstance(ecg_signal, np.ndarray):
+                    if ecg_signal.ndim == 2:
+                        ecg_signal = ecg_signal[:, 0]
+                    signals['ecg'] = ecg_signal[~np.isnan(ecg_signal)]
+        
+        # Load ABP for labels
+        abp_signal = self.vitaldb.load_case(case_id, ['ABP'])
+        if abp_signal is not None and len(abp_signal) > 0:
+            if isinstance(abp_signal, np.ndarray):
+                if abp_signal.ndim == 2:
+                    abp_signal = abp_signal[:, 0]
+                abp_signal = abp_signal[~np.isnan(abp_signal)]
+        else:
+            abp_signal = None
+        
+        # Extract features
+        if signals:
+            features_array, window_times, _ = self.feature_extractor.extract_windows(
+                signals, patient_id=str(case_id)
+            )
+            
+            # Create labels
+            if abp_signal is not None and len(window_times) > 0:
+                if self.target_task == 'ioh':
+                    labels_array, _ = self.label_creator.create_ioh_labels(
+                        abp_signal, window_times, fs_abp=100
+                    )
+                elif self.target_task == 'bp':
+                    labels_array, _ = self.label_creator.create_bp_targets(
+                        abp_signal, window_times, fs_abp=100
+                    )
+                else:
+                    labels_array = np.zeros(len(window_times))
+            else:
+                labels_array = np.zeros(len(window_times)) if len(window_times) > 0 else np.array([0])
+            
+            # Get specific window (cycling through available windows)
+            if len(features_array) > 0:
+                window_idx = idx % len(features_array)
+                features = features_array[window_idx]
+                label = labels_array[window_idx] if window_idx < len(labels_array) else 0
+            else:
+                features = np.zeros(50)  # v1_basic has 50 features
+                label = 0
+        else:
+            features = np.zeros(50)
+            label = 0
+        
+        # Convert to tensors
+        features = torch.FloatTensor(features)
+        if self.target_task == 'bp' and hasattr(label, '__len__'):
+            label = torch.FloatTensor(label)  # Multi-target for BP
+        else:
+            label = torch.FloatTensor([label])  # Single target for IOH
+        
+        # Context information
+        context = {
+            'patient_id': case_id,
+            'window_idx': idx % 100,  # Approximate window index
+            'split': self.split
+        }
+        
+        return features, label, context
+    
+    def _getitem_timeseries(self, idx):
+        """Original timeseries mode - get TWO segments from SAME patient."""
 
         # Helper function to create standardized empty demographics
         def get_empty_demographics():

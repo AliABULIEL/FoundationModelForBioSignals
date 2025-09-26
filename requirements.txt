@@ -60,3 +60,7 @@ tabulate>=0.8.9  # Table formatting
 wfdb>=4.3.0
 vitaldb>=1.5.6
 
+# ============= TabPFN Foundation Model =============
+tabpfn>=1.0.0  # TabPFN v2 for tabular learning
+# tabpfn_extensions>=0.1.0  # Optional: AutoTabPFN for hyperparameter optimization
+
