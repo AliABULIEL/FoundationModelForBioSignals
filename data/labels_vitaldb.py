@@ -90,11 +90,25 @@ class VitalDBLabelCreator:
         for horizon_min in horizons:
             horizon_samples = int(horizon_min * 60 * self.sample_rate)
             
-            # Get future window
+            # Get future window (starts at END of current window)
             future_start = window_start_idx + int(window_sec * self.sample_rate)
             future_end = future_start + horizon_samples
             
-            if future_end <= len(map_signal):
+            # Check if we have enough future data
+            if future_end > len(map_signal):
+                # Not enough future data for full horizon
+                # Try to use what we have if it's at least min_duration
+                available_samples = len(map_signal) - future_start
+                if available_samples >= int(min_duration * self.sample_rate):
+                    # Use partial horizon
+                    future_map = map_signal[future_start:]
+                    ioh_label = self._detect_ioh_event(future_map, map_thresh, min_duration)
+                    labels[f'ioh_{horizon_min}min'] = int(ioh_label)
+                else:
+                    # Not enough data even for minimum duration
+                    labels[f'ioh_{horizon_min}min'] = np.nan
+            else:
+                # Full horizon available
                 future_map = map_signal[future_start:future_end]
                 
                 # Check for IOH event (MAP < threshold for >= min_duration)
@@ -112,9 +126,6 @@ class VitalDBLabelCreator:
                         future_map, map_thresh
                     )
                 }
-            else:
-                # Not enough future data
-                labels[f'ioh_{horizon_min}min'] = np.nan
         
         metadata['has_abp'] = True
         return {'labels': labels, 'metadata': metadata}

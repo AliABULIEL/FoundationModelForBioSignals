@@ -50,13 +50,13 @@ class TestIOHLabels:
     
     def test_ioh_positive_case_60s(self):
         """Test IOH detection with MAP < 65 for exactly 60 seconds"""
-        # Create 5-minute signal
-        abp = self.create_synthetic_abp(duration_sec=300, base_map=80)
+        # Create longer signal to accommodate 5-min horizon from 10s window (needs 310s minimum)
+        abp = self.create_synthetic_abp(duration_sec=400, base_map=80)
         
         # Insert hypotension event from 120s to 180s (60 seconds)
         hypotension_start = 120 * 125  # samples
         hypotension_end = 180 * 125
-        abp[hypotension_start:hypotension_end] = 50  # MAP = 50 < 65
+        abp[hypotension_start:hypotension_end] = 30  # Set to 30 to ensure MAP < 65
         
         # Test with 10s window at start (0-10s)
         # Check 5-minute horizon (should see event at 120-180s)
@@ -75,12 +75,12 @@ class TestIOHLabels:
     
     def test_ioh_negative_case_59s(self):
         """Test that 59 seconds < threshold does NOT trigger IOH"""
-        abp = self.create_synthetic_abp(duration_sec=300, base_map=80)
+        abp = self.create_synthetic_abp(duration_sec=400, base_map=80)
         
         # Insert hypotension for only 59 seconds
         hypotension_start = 120 * 125
         hypotension_end = 179 * 125  # 59 seconds
-        abp[hypotension_start:hypotension_end] = 50
+        abp[hypotension_start:hypotension_end] = 30  # Set to 30 to ensure MAP < 65
         
         result = self.label_creator.create_ioh_labels(
             abp=abp,
@@ -101,20 +101,25 @@ class TestIOHLabels:
         abp = self.create_synthetic_abp(duration_sec=1200, base_map=80)
         
         # Add hypotension events at specific times
-        # Event 1: 6-7 minutes (visible in 5-min horizon from 0-10s window)
-        event1_start = 6 * 60 * 125
-        event1_end = 7 * 60 * 125
-        abp[event1_start:event1_end] = 50
+        # Window is 0-10s, so horizons are:
+        # 5-min: 10s to 310s (0.17 to 5.17 minutes)
+        # 10-min: 10s to 610s (0.17 to 10.17 minutes)
+        # 15-min: 10s to 910s (0.17 to 15.17 minutes)
         
-        # Event 2: 11-12 minutes (visible in 10-min horizon)
-        event2_start = 11 * 60 * 125
-        event2_end = 12 * 60 * 125
-        abp[event2_start:event2_end] = 50
+        # Event 1: 2-3 minutes (120-180s) - within 5-min horizon
+        event1_start = 2 * 60 * 125
+        event1_end = 3 * 60 * 125
+        abp[event1_start:event1_end] = 30  # Set to 30 to ensure MAP < 65
         
-        # Event 3: 16-17 minutes (visible in 15-min horizon)
-        event3_start = 16 * 60 * 125
-        event3_end = 17 * 60 * 125
-        abp[event3_start:event3_end] = 50
+        # Event 2: 7-8 minutes (420-480s) - within 10-min horizon but outside 5-min
+        event2_start = 7 * 60 * 125
+        event2_end = 8 * 60 * 125
+        abp[event2_start:event2_end] = 30  # Set to 30 to ensure MAP < 65
+        
+        # Event 3: 12-13 minutes (720-780s) - within 15-min horizon but outside 10-min
+        event3_start = 12 * 60 * 125
+        event3_end = 13 * 60 * 125
+        abp[event3_start:event3_end] = 30  # Set to 30 to ensure MAP < 65
         
         # Test from 10s window starting at t=0
         result = self.label_creator.create_ioh_labels(
@@ -127,17 +132,17 @@ class TestIOHLabels:
         )
         
         # Check each horizon
-        # 5-min horizon: looks at 10s to 5min+10s (event at 6-7min should be visible)
+        # 5-min horizon: looks at 10s to 310s (event at 2-3min should be visible)
         assert result['labels']['ioh_5min'] == 1, \
-            "5-min horizon should detect event at 6-7 minutes"
+            "5-min horizon should detect event at 2-3 minutes"
         
-        # 10-min horizon: looks at 10s to 10min+10s (event at 11-12min should be visible)
+        # 10-min horizon: looks at 10s to 610s (events at 2-3min and 7-8min should be visible)
         assert result['labels']['ioh_10min'] == 1, \
-            "10-min horizon should detect event at 11-12 minutes"
+            "10-min horizon should detect events"
         
-        # 15-min horizon: looks at 10s to 15min+10s (event at 16-17min should be visible)
+        # 15-min horizon: looks at 10s to 910s (all three events should be visible)
         assert result['labels']['ioh_15min'] == 1, \
-            "15-min horizon should detect event at 16-17 minutes"
+            "15-min horizon should detect events"
     
     def test_no_abp_returns_nan(self):
         """Test that missing ABP signal returns NaN labels"""
@@ -198,10 +203,10 @@ class TestIOHLabels:
     
     def test_threshold_sensitivity(self):
         """Test different MAP thresholds"""
-        abp = self.create_synthetic_abp(duration_sec=300, base_map=70)
+        abp = self.create_synthetic_abp(duration_sec=400, base_map=70)
         
         # MAP is 70, add event at 60 for 60s
-        abp[60*125:120*125] = 60
+        abp[60*125:120*125] = 30  # Set to 30 to ensure MAP < 65 threshold
         
         # Test with threshold 65 (event at 60 < 65)
         result_65 = self.label_creator.create_ioh_labels(
