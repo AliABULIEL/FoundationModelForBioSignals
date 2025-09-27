@@ -1,0 +1,9 @@
+{
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_feature_count_complete": true,
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_missing_channel_nan_policy": true,
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_psd_powers_non_negative": true,
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_ratios_bounded": true,
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_feature_names_match_count": true,
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_window_extraction": true,
+  "test_v1_basic_features.py::TestV1BasicFeatures::test_nan_propagation": true
+}

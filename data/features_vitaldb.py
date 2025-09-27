@@ -78,8 +78,8 @@ class VitalDBFeatureExtractor:
             names.extend([
                 f'{ch}_mean', f'{ch}_std', f'{ch}_var',
                 f'{ch}_skew', f'{ch}_kurt', f'{ch}_iqr',
-                f'{ch}_p25', f'{ch}_p75'
-            ])[:7]  # 7 per channel
+                f'{ch}_p25'
+            ])  # exactly 7 per channel
         names.append('cross_correlation')
         
         # Frequency features (12)
@@ -215,7 +215,7 @@ class VitalDBFeatureExtractor:
                     stats.kurtosis(sig),
                     np.percentile(sig, 75) - np.percentile(sig, 25),  # IQR
                     np.percentile(sig, 25),
-                ])[:7]
+                ][:7])
             else:
                 features.extend([np.nan] * 7)
         
