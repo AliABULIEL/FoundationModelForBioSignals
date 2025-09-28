@@ -1,0 +1,39 @@
+# VitalDB Configuration
+vitaldb:
+  cache_dir: data/vitaldb_cache
+  cases_limit: null
+  segments_per_case: 20
+  train_ratio: 0.8
+  val_ratio: 0.1
+  
+  # Track mapping for different modalities
+  track_mapping:
+    ppg: PLETH
+    ecg: ECG_II
+    abp: ABP
+    eeg: BIS/BIS
+  
+  # Original sampling rates from VitalDB
+  sampling_rates:
+    ppg: 100
+    ecg: 500
+    abp: 100
+    eeg: 128
+
+# Training configuration
+training:
+  batch_size: 64
+  num_workers: 4
+  learning_rate: 0.001
+  epochs: 100
+
+# Model configuration  
+model:
+  encoder_type: resnet
+  embedding_dim: 256
+  dropout: 0.3
+
+# SSL configuration
+ssl:
+  temperature: 0.5
+  projection_dim: 128

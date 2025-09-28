@@ -16,7 +16,7 @@ from sklearn.metrics import (
     roc_auc_score, roc_curve, accuracy_score, f1_score,
     mean_absolute_error, mean_squared_error, r2_score, auc
 )
-from sklearn.model_selection import StratifiedKFold, KFold, LeaveOneOut, train_test_split
+from sklearn.model_selection import StratifiedKFold, KFold, LeaveOneOut
 from tqdm import tqdm
 import json
 import pickle
@@ -26,7 +26,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from data import BUTPPGDataset, BaseSignalDataset
-from model import EfficientNet1D
+from deprecated.model import EfficientNet1D
 from device import DeviceManager, get_device_manager
 from config_loader import get_config  # Added ConfigLoader
 
@@ -378,7 +378,6 @@ class DownstreamEvaluator:
         import matplotlib.pyplot as plt
         from sklearn.decomposition import PCA
         from sklearn.manifold import TSNE
-        import seaborn as sns
 
         # Extract embeddings if not cached
         embeddings, labels_list, participant_ids = self.extract_embeddings(
@@ -1764,7 +1763,7 @@ def test_evaluation():
     y_tiny_reg = np.random.randn(5)
 
     # Create evaluator
-    from model import EfficientNet1D
+    from deprecated.model import EfficientNet1D
     encoder = EfficientNet1D(in_channels=1, embedding_dim=config.get('model.embedding_dim', 256))
     encoder_path = Path('data/outputs/test_encoder.pt')
     encoder_path.parent.mkdir(parents=True, exist_ok=True)

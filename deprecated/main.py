@@ -19,13 +19,13 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import device manager first
-from device import DeviceManager, get_device_manager
+from device import get_device_manager
 
 # Import other modules
-from train import Trainer
-from evaluate import DownstreamEvaluator
+from deprecated.train import Trainer
+from deprecated.evaluate import DownstreamEvaluator
 from compare import ResultsComparator
-from data import BUTPPGDataset, create_dataloaders
+from data import BUTPPGDataset
 from config_loader import get_config
 
 # Setup logging
@@ -716,8 +716,8 @@ def run_eval_supervised(args, device_manager):
         return None
 
     # Load model
-    from ssl_model import create_ssl_model
-    from model import EfficientNet1D, ProjectionHead
+    from deprecated.ssl_model import create_ssl_model
+    from deprecated.model import EfficientNet1D, ProjectionHead
     from config_loader import get_config
 
     config = get_config()
@@ -793,7 +793,7 @@ def run_eval_supervised(args, device_manager):
     )
 
     # Create evaluator
-    from evaluate import DownstreamEvaluator
+    from deprecated.evaluate import DownstreamEvaluator
     evaluator = DownstreamEvaluator(
         encoder_path='dummy',  # Not used, we pass model directly
         device_manager=device_manager

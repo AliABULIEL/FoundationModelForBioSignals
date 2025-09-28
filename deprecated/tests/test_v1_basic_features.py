@@ -10,7 +10,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.features_vitaldb import VitalDBFeatureExtractor
+from features_vitaldb import VitalDBFeatureExtractor
 
 
 class TestV1BasicFeatures:

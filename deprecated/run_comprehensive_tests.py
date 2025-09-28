@@ -4,7 +4,6 @@ Run all tests and create pilot results
 """
 
 import sys
-import os
 import json
 import numpy as np
 import pandas as pd
@@ -21,7 +20,7 @@ def run_all_tests():
     print("TEST 1: Feature Extraction (v1_basic)")
     print("="*60)
     try:
-        from data.features_vitaldb import VitalDBFeatureExtractor
+        from features_vitaldb import VitalDBFeatureExtractor
         
         extractor = VitalDBFeatureExtractor(feature_set='v1_basic', sample_rate=125)
         
@@ -59,7 +58,7 @@ def run_all_tests():
     print("TEST 2: IOH Label Creation")
     print("="*60)
     try:
-        from data.labels_vitaldb import VitalDBLabelCreator
+        from labels_vitaldb import VitalDBLabelCreator
         
         creator = VitalDBLabelCreator(sample_rate=125)
         

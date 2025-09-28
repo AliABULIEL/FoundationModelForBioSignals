@@ -22,7 +22,7 @@ class TestDatasetTabular:
     @patch('vitaldb.load_case')
     def test_tabular_mode_output_format(self, mock_load, mock_find, mock_label, mock_feature):
         """Test that dataset in tabular mode returns correct format"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         # Mock VitalDB API
         mock_find.return_value = [1, 2, 3, 4, 5]  # 5 cases
@@ -77,7 +77,7 @@ class TestDatasetTabular:
     @patch('vitaldb.find_cases')
     def test_no_patient_overlap_splits(self, mock_find):
         """Test that there's no patient overlap across train/val/test splits"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         # Mock 100 cases
         all_cases = list(range(100))
@@ -130,7 +130,7 @@ class TestDatasetTabular:
     @patch('vitaldb.find_cases')
     def test_context_patient_tracking(self, mock_find):
         """Test that context properly tracks patient IDs"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         # Mock cases
         mock_find.return_value = [101, 102, 103]
@@ -164,7 +164,7 @@ class TestDatasetTabular:
     
     def test_feature_extractor_initialized(self):
         """Test that feature extractor is properly initialized in tabular mode"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         with patch('vitaldb.find_cases') as mock_find:
             mock_find.return_value = [1, 2, 3]
@@ -187,7 +187,7 @@ class TestDatasetTabular:
     
     def test_window_indices_structure(self):
         """Test window indices structure in tabular mode"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         with patch('vitaldb.find_cases') as mock_find:
             cases = [201, 202, 203, 204, 205]
@@ -211,7 +211,7 @@ class TestDatasetTabular:
     @patch('vitaldb.load_case')
     def test_missing_channel_handling(self, mock_load, mock_find):
         """Test handling of missing channels"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         mock_find.return_value = [1]
         
@@ -248,7 +248,7 @@ class TestDatasetTabular:
     
     def test_mode_parameter_switches_behavior(self):
         """Test that mode parameter correctly switches dataset behavior"""
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         
         with patch('vitaldb.find_cases') as mock_find:
             mock_find.return_value = [1, 2, 3]

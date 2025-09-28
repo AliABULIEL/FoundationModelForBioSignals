@@ -29,7 +29,7 @@ class ConfigLoader:
             cls._instance = super(ConfigLoader, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self, config_path: str = 'configs/config.yaml'):
+    def __init__(self, config_path: str = 'configs/tabpfn_vitaldb.yaml'):
         """
         Initialize the ConfigLoader with a config file path.
 
@@ -48,19 +48,70 @@ class ConfigLoader:
         config_path = Path(self._config_path)
 
         if not config_path.exists():
-            # Try relative to project root
-            project_root = Path(__file__).parent.parent
-            config_path = project_root / self._config_path
+            # Try relative to current file
+            config_path = Path(__file__).parent / self._config_path
+        
+        if not config_path.exists():
+            # Try from parent directory (when running from tests/)
+            config_path = Path(__file__).parent.parent / self._config_path
+            
+        if not config_path.exists():
+            # Try absolute path from project root
+            possible_roots = [
+                Path.cwd(),
+                Path.cwd().parent,
+                Path('/Users/aliab/Desktop/FoundationModelForBioSignals'),
+            ]
+            for root in possible_roots:
+                potential_path = root / self._config_path
+                if potential_path.exists():
+                    config_path = potential_path
+                    break
 
         if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {self._config_path}")
+            raise FileNotFoundError(f"Configuration file not found: {self._config_path}. Searched in {Path.cwd()} and parent directories")
 
         try:
             with open(config_path, 'r') as f:
                 self._config = yaml.safe_load(f)
             logger.info(f"Configuration loaded from {config_path}")
+            
+            # No strict mode validation - let config determine mode
+            # self._validate_tabular_mode()
+            
         except Exception as e:
             raise RuntimeError(f"Failed to load configuration: {e}")
+    
+    def _validate_tabular_mode(self):
+        """
+        Validate that configuration is set to tabular mode only.
+        Raises RuntimeError if SSL mode is detected.
+        """
+        # Check dataset mode
+        dataset_mode = self.get('dataset.mode', default='tabular')
+        if dataset_mode != 'tabular':
+            raise RuntimeError(
+                f"Only tabular mode is supported. Got mode='{dataset_mode}'. "
+                "SSL training has been deprecated. "
+                "Please set dataset.mode='tabular' in your config. "
+                "Legacy SSL code has been moved to deprecated/ssl/"
+            )
+        
+        # Check for SSL-specific configurations that shouldn't be used
+        if 'ssl' in self._config and self._config['ssl'].get('enabled', False):
+            raise RuntimeError(
+                "SSL configuration detected but SSL is deprecated. "
+                "Remove or disable SSL settings from config. "
+                "Use dataset.mode='tabular' with TabPFN."
+            )
+        
+        # Check for simsiam or infonce configurations
+        if any(key in self._config for key in ['simsiam', 'infonce']):
+            logger.warning(
+                "SSL method configurations (simsiam/infonce) found in config. "
+                "These are deprecated and will be ignored. "
+                "Using TabPFN with tabular mode instead."
+            )
 
     def reload(self, config_path: Optional[str] = None):
         """
@@ -76,7 +127,7 @@ class ConfigLoader:
     @property
     def data_dir(self) -> str:
         """Get data directory path."""
-        return self.get('dataset.data_dir', default='data/but_ppg/dataset')
+        return self.get('dataset.data', default='data/but_ppg/dataset')
 
     @property
     def seed(self) -> int:
@@ -286,7 +337,7 @@ class ConfigLoader:
     @property
     def data_dir(self) -> str:
         """Get data directory path."""
-        return self.get('dataset.data_dir', default='data/but_ppg/dataset')
+        return self.get('dataset.data', default='data/but_ppg/dataset')
 
     def __repr__(self) -> str:
         return f"ConfigLoader(config_path='{self._config_path}')"
@@ -331,7 +382,7 @@ def get_config() -> ConfigLoader:
 
 
 # Convenience function for direct access
-def load_config(config_path: str = 'configs/config.yaml') -> ConfigLoader:
+def load_config(config_path: str = 'configs/tabpfn_vitaldb.yaml') -> ConfigLoader:
     """
     Load configuration from a specific file.
 

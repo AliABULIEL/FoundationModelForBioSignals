@@ -13,8 +13,8 @@ import tempfile
 
 # Import the modules to test
 import sys
-sys.path.append('..')
-from data import (
+sys.path.append('../..')
+from deprecated.data import (
     WaveformQualityControl,
     VitalDBClinicalExtractor,
     VitalDBDataset,
@@ -249,7 +249,7 @@ class TestVitalDBDatasetSPEC:
         )
         
         # Apply filter using the actual method
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         filtered = VitalDBDataset._apply_spec_filter(dataset, signal, fs)
         
         # Check that high frequency is attenuated
@@ -275,7 +275,7 @@ class TestVitalDBDatasetSPEC:
         dataset.enable_qc = True
         dataset.min_valid_ratio = 0.7
         
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         key1 = VitalDBDataset._generate_cache_key(dataset, case_id=123)
         key2 = VitalDBDataset._generate_cache_key(dataset, case_id=123)
         key3 = VitalDBDataset._generate_cache_key(dataset, case_id=456)
@@ -346,7 +346,7 @@ class TestVitalDBDatasetSPEC:
             'demographics': {'age': 65, 'sex': 1}
         }
         
-        from data import VitalDBDataset
+        from deprecated.data import VitalDBDataset
         window_data = VitalDBDataset._extract_window_with_clinical(dataset, case_id=1, window_idx=0)
         
         assert window_data['signal'] is not None
@@ -361,7 +361,7 @@ class TestDeprecation:
     
     def test_deprecated_preprocessing(self):
         """Test that old preprocessing raises deprecation warning."""
-        from data import _preprocess_signal_deprecated
+        from deprecated.data import _preprocess_signal_deprecated
         
         with pytest.warns(DeprecationWarning):
             signal = np.random.randn(1000)

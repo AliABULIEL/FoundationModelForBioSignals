@@ -125,7 +125,7 @@ def verify_dataset(data_dir: Path) -> dict:
     print("\n✅ Verifying dataset...")
 
     stats = {
-        'data_dir': str(data_dir),
+        'data': str(data_dir),
         'total_records': 0,
         'has_ppg': 0,
         'has_ecg': 0,
@@ -252,7 +252,7 @@ def main():
 
         # Step 4: Create index files
         # print(f"\n📝 Step 4: Creating index files...")
-        # create_index_files(data_dir, stats)
+        # create_index_files(data, stats)
 
         # Calculate time
         elapsed = time.time() - start_time
